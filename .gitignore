@@ -1,0 +1,60 @@
+# ------------------------------------------------------------------------------
+# WalletCoreFFI .gitignore
+# ------------------------------------------------------------------------------
+
+# General OS/Misc
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+*~
+.TemporaryItems
+
+# ------------------------------------------------------------------------------
+# Swift / SwiftPM
+# ------------------------------------------------------------------------------
+# Swift Package Manager build artifacts
+.build/
+.swiftpm/
+
+# Xcode (harmless if not present, but ignore if generated)
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# ------------------------------------------------------------------------------
+# Rust (crate under monero-oxide-output)
+# ------------------------------------------------------------------------------
+# Rust build artifacts
+monero-oxide-output/target/
+
+# Local tooling/IDE metadata
+monero-oxide-output/.idea/
+monero-oxide-output/.vscode/
+
+# Cargo incremental/target temp (rarely present in repo)
+monero-oxide-output/**/.fingerprint/
+monero-oxide-output/**/.cargo-lock
+
+# ------------------------------------------------------------------------------
+# Editors/IDEs (root)
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+
+# ------------------------------------------------------------------------------
+# CI / Packaging outputs
+# ------------------------------------------------------------------------------
+# Local packaging/output bundles produced by scripts or CI
+dist/
+
+# Zipped artifacts (keep the xcframework directory; ignore transient zips)
+Artifacts/*.zip
+
+# Note:
+# - Do NOT ignore Artifacts/WalletCore.xcframework (commit this if you want SPM
+#   to "just work" on Apple platforms).
+# - Linux servers should install libwalletcore.so via Scripts/install_linux.sh
+#   rather than committing .so files into app repos.
