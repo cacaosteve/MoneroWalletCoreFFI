@@ -1,0 +1,5 @@
+module CLibWalletCore [system] {
+  header "walletcore.h"
+  link "walletcore"
+  export *
+}

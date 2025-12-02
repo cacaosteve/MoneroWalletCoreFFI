@@ -1,0 +1,2654 @@
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    convert::TryInto,
+    ffi::{CStr, CString},
+    future::Future,
+    io::Read,
+    os::raw::{c_char, c_int},
+    ptr, slice,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use bincode;
+use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+use futures::executor::block_on;
+use monero_address::{
+    AddressType as MoneroAddressType, MoneroAddress, Network as MoneroNetwork, SubaddressIndex,
+};
+use monero_ed25519::{Point as EdPoint, Scalar as EdScalar};
+use monero_seed::{Language as MoneroSeedLanguage, Seed as MoneroSeed};
+use monero_wallet::{
+    rpc::{Rpc, RpcError},
+    transaction::Timelock,
+    Scanner, ViewPair,
+};
+use serde::{Deserialize, Serialize};
+// Keccak256 is used via EdScalar::hash(), no direct import needed
+use once_cell::sync::Lazy;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use ureq::serde_json;
+use zeroize::Zeroizing;
+
+const DEFAULT_LOCK_WINDOW: u64 = 10;
+const COINBASE_LOCK_WINDOW: u64 = 60;
+
+static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+fn set_last_error<S: Into<String>>(message: S) {
+    if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
+        *slot = Some(message.into());
+    }
+}
+
+fn clear_last_error() {
+    if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
+        *slot = None;
+    }
+}
+
+fn record_error(code: c_int, message: impl Into<String>) -> c_int {
+    set_last_error(message);
+    code
+}
+
+#[no_mangle]
+pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
+    let snapshot = LAST_ERROR_MESSAGE
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or(None);
+    match snapshot {
+        Some(text) => CString::new(text)
+            .unwrap_or_else(|_| CString::new("error message encoding failure").unwrap())
+            .into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+struct MasterKeys {
+    entropy: Zeroizing<[u8; 32]>,
+    spend_scalar: curve25519_dalek::Scalar,
+    view_scalar_dalek: curve25519_dalek::Scalar,
+    view_scalar_ed: EdScalar,
+}
+
+impl MasterKeys {
+    fn new(entropy: Zeroizing<[u8; 32]>) -> Result<Self, c_int> {
+        let spend_scalar = curve25519_dalek::Scalar::from_canonical_bytes(*entropy)
+            .into_option()
+            .ok_or(-10)?;
+        let view_scalar_ed = EdScalar::hash(entropy.as_ref());
+        let view_scalar_dalek: curve25519_dalek::Scalar = view_scalar_ed.clone().into();
+        Ok(Self {
+            entropy,
+            spend_scalar,
+            view_scalar_dalek,
+            view_scalar_ed,
+        })
+    }
+
+    fn to_view_pair(&self) -> Result<ViewPair, c_int> {
+        let spend_point = EdPoint::from(ED25519_BASEPOINT_POINT * self.spend_scalar);
+        let view_scalar = Zeroizing::new(self.view_scalar_ed.clone());
+        ViewPair::new(spend_point, view_scalar).map_err(|_| -16)
+    }
+}
+
+fn zero_outputs(out_buf: *mut c_char, out_buf_len: usize, out_written: *mut usize) {
+    unsafe {
+        if !out_written.is_null() {
+            *out_written = 0;
+        }
+        if !out_buf.is_null() && out_buf_len > 0 {
+            *out_buf = 0;
+        }
+    }
+}
+
+fn write_address_to_buf(
+    address: &str,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    let addr_bytes = address.as_bytes();
+    let needed = addr_bytes.len();
+    if out_buf.is_null() || out_buf_len == 0 || needed + 1 > out_buf_len {
+        zero_outputs(out_buf, out_buf_len, out_written);
+        return -12;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(addr_bytes.as_ptr() as *const c_char, out_buf, needed);
+        *out_buf.add(needed) = 0;
+        if !out_written.is_null() {
+            *out_written = needed;
+        }
+    }
+    0
+}
+
+fn master_keys_from_seed_bytes(seed_ptr: *const u8, seed_len: usize) -> Result<MasterKeys, c_int> {
+    if seed_ptr.is_null() {
+        return Err(-11);
+    }
+    if seed_len != 32 {
+        return Err(-10);
+    }
+
+    let seed_slice = unsafe { slice::from_raw_parts(seed_ptr, seed_len) };
+    let entropy: [u8; 32] = seed_slice.try_into().map_err(|_| -10)?;
+    MasterKeys::new(Zeroizing::new(entropy))
+}
+
+fn master_keys_from_mnemonic_str(mnemonic: &str) -> Result<MasterKeys, c_int> {
+    let phrase = mnemonic.trim();
+    if phrase.is_empty() {
+        return Err(-10);
+    }
+
+    let seed = MoneroSeed::from_string(
+        MoneroSeedLanguage::English,
+        Zeroizing::new(phrase.to_string()),
+    )
+    .map_err(|_| -10)?;
+
+    MasterKeys::new(seed.entropy())
+}
+
+fn master_keys_from_mnemonic_ptr(mnemonic_ptr: *const c_char) -> Result<MasterKeys, c_int> {
+    if mnemonic_ptr.is_null() {
+        return Err(-11);
+    }
+
+    let mnemonic = unsafe { CStr::from_ptr(mnemonic_ptr) }
+        .to_str()
+        .map_err(|_| -10)?;
+
+    master_keys_from_mnemonic_str(mnemonic)
+}
+
+fn network_from_flag(is_mainnet: u8) -> MoneroNetwork {
+    if is_mainnet != 0 {
+        MoneroNetwork::Mainnet
+    } else {
+        MoneroNetwork::Stagenet
+    }
+}
+
+#[derive(Clone)]
+struct BlockingRpcTransport {
+    agent: Arc<ureq::Agent>,
+    base_url: String,
+    auth_header: Option<String>,
+}
+
+impl BlockingRpcTransport {
+    fn new(raw_url: &str) -> Result<Self, c_int> {
+        let base_url = raw_url.trim_end_matches('/').to_string();
+        if base_url.is_empty() {
+            return Err(-14);
+        }
+        let agent = Arc::new(
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(30))
+                .build(),
+        );
+        Ok(Self {
+            agent,
+            base_url,
+            auth_header: None,
+        })
+    }
+
+    fn request_for(&self, route: &str) -> ureq::Request {
+        let path = route.trim_start_matches('/');
+        let url = format!("{}/{}", self.base_url, path);
+        let mut request = self
+            .agent
+            .post(&url)
+            .set("Content-Type", "application/json");
+        if let Some(header) = &self.auth_header {
+            request = request.set("Authorization", header);
+        }
+        request
+    }
+
+    fn post_bytes(&self, route: &str, body: Vec<u8>) -> Result<Vec<u8>, RpcError> {
+        let response = self
+            .request_for(route)
+            .send_bytes(&body)
+            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+        let mut reader = response.into_reader();
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+        Ok(buf)
+    }
+
+    fn json_rpc_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, (c_int, String)> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "method": method,
+            "params": params
+        });
+        let response = self
+            .request_for("json_rpc")
+            .send_json(payload)
+            .map_err(|err| {
+                let detail = match &err {
+                    ureq::Error::Status(code, resp) => {
+                        format!("HTTP {code} {}", resp.status_text())
+                    }
+                    ureq::Error::Transport(transport) => transport.to_string(),
+                };
+                (-15, format!("json_rpc {method}: {detail}"))
+            })?;
+        let value: serde_json::Value = response
+            .into_json()
+            .map_err(|err| (-15, format!("json decode for {method}: {err}")))?;
+        if let Some(error_obj) = value.get("error") {
+            let msg = error_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("daemon returned error");
+            let code = error_obj.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            return Err((
+                -15,
+                format!("json_rpc {method} returned error {code}: {msg}"),
+            ));
+        }
+        Ok(value)
+    }
+}
+
+impl Rpc for BlockingRpcTransport {
+    fn post(
+        &self,
+        route: &str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + Send {
+        let client = self.clone();
+        let route_string = route.to_string();
+        async move { client.post_bytes(&route_string, body) }
+    }
+}
+struct DaemonStatus {
+    height: u64,
+    top_block_timestamp: u64,
+}
+
+fn fetch_daemon_status(client: &BlockingRpcTransport) -> Result<DaemonStatus, (c_int, String)> {
+    let info_err = match client.json_rpc_call("get_info", serde_json::json!({})) {
+        Ok(info) => {
+            if let Some(result) = info.get("result") {
+                if let (Some(height), Some(ts)) = (
+                    result.get("height").and_then(|h| h.as_u64()),
+                    result.get("top_block_timestamp").and_then(|t| t.as_u64()),
+                ) {
+                    return Ok(DaemonStatus {
+                        height,
+                        top_block_timestamp: ts,
+                    });
+                }
+                Some((
+                    -15,
+                    "daemon get_info response missing height/top_block_timestamp".to_string(),
+                ))
+            } else {
+                Some((
+                    -15,
+                    "daemon get_info response missing result/error".to_string(),
+                ))
+            }
+        }
+        Err(err) => Some(err),
+    };
+
+    let block_count_status = match client.json_rpc_call("get_block_count", serde_json::json!({})) {
+        Ok(response) => {
+            if let Some(result) = response.get("result") {
+                if let Some(height) = result.get("count").and_then(|h| h.as_u64()) {
+                    Ok(DaemonStatus {
+                        height,
+                        top_block_timestamp: 0,
+                    })
+                } else {
+                    Err((
+                        -15,
+                        "daemon get_block_count response missing count".to_string(),
+                    ))
+                }
+            } else {
+                Err((
+                    -15,
+                    "daemon get_block_count response missing result/error".to_string(),
+                ))
+            }
+        }
+        Err(err) => Err(err),
+    };
+
+    match block_count_status {
+        Ok(status) => Ok(status),
+        Err((code, message)) => {
+            if let Some((_, first_message)) = info_err {
+                Err((
+                    code,
+                    format!("{message}; initial get_info attempt also failed: {first_message}"),
+                ))
+            } else {
+                Err((code, message))
+            }
+        }
+    }
+}
+
+fn map_rpc_error(err: RpcError) -> c_int {
+    match err {
+        RpcError::ConnectionError(_) => -15,
+        RpcError::InternalError(_) => -16,
+        RpcError::InvalidNode(_) => -16,
+        RpcError::TransactionsNotFound(_) => -16,
+        RpcError::InvalidTransaction(_) => -16,
+        _ => -16,
+    }
+}
+
+fn derive_address_string(
+    keys: &MasterKeys,
+    account_index: u32,
+    subaddress_index: u32,
+    network: MoneroNetwork,
+) -> String {
+    if account_index == 0 && subaddress_index == 0 {
+        let spend_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.spend_scalar);
+        let view_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.view_scalar_dalek);
+        MoneroAddress::new(network, MoneroAddressType::Legacy, spend_pub, view_pub).to_string()
+    } else {
+        let b_point = ED25519_BASEPOINT_POINT * keys.view_scalar_dalek;
+        let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+        data.extend_from_slice(b"SubAddr\0");
+        data.extend_from_slice(keys.entropy.as_ref());
+        data.extend_from_slice(&account_index.to_le_bytes());
+        data.extend_from_slice(&subaddress_index.to_le_bytes());
+        let m_scalar: curve25519_dalek::Scalar = EdScalar::hash(&data).into();
+        let d_dalek = b_point + (ED25519_BASEPOINT_POINT * m_scalar);
+        let c_dalek = d_dalek * keys.spend_scalar;
+
+        let d_point = EdPoint::from(d_dalek);
+        let c_point = EdPoint::from(c_dalek);
+        MoneroAddress::new(network, MoneroAddressType::Subaddress, d_point, c_point).to_string()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn walletcore_version() -> *mut c_char {
+    CString::new("walletcore 0.1.0").unwrap().into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn walletcore_free_cstr(ptr: *mut c_char) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    unsafe {
+        let _ = CString::from_raw(ptr);
+    }
+    0
+}
+
+/// Derive a Monero address from a canonical 32-byte seed.
+/// ABI contract:
+/// - seed_ptr/seed_len: 32-byte seed (secret spend key).
+/// - is_mainnet: 1 for mainnet, 0 for stagenet/testnet.
+/// - account_index/subaddress_index: which account/subaddress to derive.
+/// - out_buf/out_buf_len: caller-provided buffer for the ASCII address.
+/// - out_written: number of bytes written (excluding NUL) if non-null.
+/// Returns:
+/// - 0 on success,
+/// - negative error codes for invalid pointers, lengths, or insufficient buffers.
+#[no_mangle]
+pub extern "C" fn wallet_derive_address_from_seed(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    is_mainnet: u8,
+    account_index: u32,
+    subaddress_index: u32,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    let keys = match master_keys_from_seed_bytes(seed_ptr, seed_len) {
+        Ok(k) => k,
+        Err(code) => {
+            zero_outputs(out_buf, out_buf_len, out_written);
+            return code;
+        }
+    };
+
+    let network = network_from_flag(is_mainnet);
+    let address = derive_address_string(&keys, account_index, subaddress_index, network);
+    write_address_to_buf(&address, out_buf, out_buf_len, out_written)
+}
+
+/// Scaffold: Derive the primary address (account 0, subaddress 0) from a seed (not implemented yet).
+#[no_mangle]
+pub extern "C" fn wallet_primary_address_from_seed(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    wallet_derive_address_from_seed(
+        seed_ptr,
+        seed_len,
+        is_mainnet,
+        0,
+        0,
+        out_buf,
+        out_buf_len,
+        out_written,
+    )
+}
+
+/// Derive the primary address (account 0, subaddress 0) from a 25-word mnemonic.
+/// Validates the mnemonic, derives master keys, and writes the resulting address
+/// to the supplied buffer.
+#[no_mangle]
+pub extern "C" fn wallet_primary_address_from_mnemonic(
+    mnemonic_ptr: *const c_char,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    let keys = match master_keys_from_mnemonic_ptr(mnemonic_ptr) {
+        Ok(k) => k,
+        Err(code) => {
+            zero_outputs(out_buf, out_buf_len, out_written);
+            return code;
+        }
+    };
+
+    let network = network_from_flag(is_mainnet);
+    let address = derive_address_string(&keys, 0, 0, network);
+    write_address_to_buf(&address, out_buf, out_buf_len, out_written)
+}
+
+/// Derive a subaddress (account_index, subaddress_index) from a 25-word mnemonic.
+/// Returns the derived base58 subaddress or a negative error code on validation failures.
+#[no_mangle]
+pub extern "C" fn wallet_derive_subaddress_from_mnemonic(
+    mnemonic_ptr: *const c_char,
+    account_index: u32,
+    subaddress_index: u32,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    let keys = match master_keys_from_mnemonic_ptr(mnemonic_ptr) {
+        Ok(k) => k,
+        Err(code) => {
+            zero_outputs(out_buf, out_buf_len, out_written);
+            return code;
+        }
+    };
+
+    let network = network_from_flag(is_mainnet);
+    let address = derive_address_string(&keys, account_index, subaddress_index, network);
+    write_address_to_buf(&address, out_buf, out_buf_len, out_written)
+}
+
+// =========================
+// In-memory wallet registry
+// =========================
+
+#[derive(Clone, Debug)]
+struct TrackedOutput {
+    tx_hash: [u8; 32],
+    index_in_tx: u64,
+    amount: u64,
+    block_height: u64,
+    additional_timelock: Timelock,
+    is_coinbase: bool,
+    subaddress_major: u32,
+    subaddress_minor: u32,
+    spent: bool,
+}
+
+impl TrackedOutput {
+    fn is_unlocked(&self, chain_height: u64, chain_time: u64) -> bool {
+        let base_lock = if self.is_coinbase {
+            COINBASE_LOCK_WINDOW
+        } else {
+            DEFAULT_LOCK_WINDOW
+        };
+        let mut required_height = self.block_height.saturating_add(base_lock);
+        match self.additional_timelock {
+            Timelock::None => {}
+            Timelock::Block(height) => {
+                required_height = required_height.max(height as u64);
+            }
+            Timelock::Time(timestamp) => {
+                if chain_time < timestamp {
+                    return false;
+                }
+            }
+        }
+        chain_height >= required_height
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ObservedTimelock {
+    None,
+    Block { height: u64 },
+    Time { timestamp: u64 },
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ObservedOutput {
+    tx_hash: String,
+    index_in_tx: u64,
+    amount: u64,
+    block_height: u64,
+    subaddress_major: u32,
+    subaddress_minor: u32,
+    is_coinbase: bool,
+    spent: bool,
+    confirmations: u64,
+    timelock: ObservedTimelock,
+    unlock_height: u64,
+    unlocked: bool,
+    unlock_time: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ObservedOutputsEnvelope {
+    wallet_id: String,
+    restore_height: u64,
+    last_scanned_height: u64,
+    chain_height: u64,
+    chain_time: u64,
+    outputs: Vec<ObservedOutput>,
+}
+
+fn hex_lowercase(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut s, "{:02x}", byte).expect("hex_lowercase formatting failed");
+    }
+    s
+}
+
+impl ObservedTimelock {
+    fn from_timelock(value: &Timelock) -> Self {
+        match value {
+            Timelock::None => ObservedTimelock::None,
+            Timelock::Block(height) => ObservedTimelock::Block {
+                height: *height as u64,
+            },
+            Timelock::Time(timestamp) => ObservedTimelock::Time {
+                timestamp: *timestamp,
+            },
+        }
+    }
+}
+
+impl ObservedOutput {
+    fn from_tracked(output: &TrackedOutput, chain_height: u64, chain_time: u64) -> Self {
+        let confirmations = if output.block_height == 0 {
+            0
+        } else {
+            chain_height
+                .saturating_sub(output.block_height)
+                .saturating_add(1)
+        };
+        let base_lock = if output.is_coinbase {
+            COINBASE_LOCK_WINDOW
+        } else {
+            DEFAULT_LOCK_WINDOW
+        };
+        let mut unlock_height = output.block_height.saturating_add(base_lock);
+        let mut unlock_time: Option<u64> = None;
+        let timelock = match output.additional_timelock {
+            Timelock::None => ObservedTimelock::None,
+            Timelock::Block(height) => {
+                let h = height as u64;
+                unlock_height = unlock_height.max(h);
+                ObservedTimelock::Block { height: h }
+            }
+            Timelock::Time(timestamp) => {
+                unlock_time = Some(timestamp);
+                ObservedTimelock::Time { timestamp }
+            }
+        };
+        let tx_hash = hex_lowercase(&output.tx_hash);
+        let unlocked = output.is_unlocked(chain_height, chain_time);
+        Self {
+            tx_hash,
+            index_in_tx: output.index_in_tx,
+            amount: output.amount,
+            block_height: output.block_height,
+            subaddress_major: output.subaddress_major,
+            subaddress_minor: output.subaddress_minor,
+            is_coinbase: output.is_coinbase,
+            spent: output.spent,
+            confirmations,
+            timelock,
+            unlock_height,
+            unlocked,
+            unlock_time,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StoredWallet {
+    mnemonic: String,
+    restore_height: u64,
+    network: MoneroNetwork,
+    last_scanned: u64,
+    total: u64,
+    unlocked: u64,
+    chain_height: u64,
+    chain_time: u64,
+    gap_limit: u32,
+    tracked_outputs: Vec<TrackedOutput>,
+    seen_outpoints: HashSet<([u8; 32], u64)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum PersistedTimelock {
+    None,
+    Block(u64),
+    Time(u64),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedOutput {
+    tx_hash: [u8; 32],
+    index_in_tx: u64,
+    amount: u64,
+    block_height: u64,
+    timelock: PersistedTimelock,
+    is_coinbase: bool,
+    subaddress_major: u32,
+    subaddress_minor: u32,
+    spent: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum PersistedNetwork {
+    Mainnet,
+    Stagenet,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedWallet {
+    network: PersistedNetwork,
+    restore_height: u64,
+    last_scanned: u64,
+    total: u64,
+    unlocked: u64,
+    chain_height: u64,
+    chain_time: u64,
+    gap_limit: u32,
+    tracked_outputs: Vec<PersistedOutput>,
+    seen_outpoints: Vec<([u8; 32], u64)>,
+}
+
+impl From<&Timelock> for PersistedTimelock {
+    fn from(value: &Timelock) -> Self {
+        match value {
+            Timelock::None => PersistedTimelock::None,
+            Timelock::Block(height) => PersistedTimelock::Block(*height as u64),
+            Timelock::Time(timestamp) => PersistedTimelock::Time(*timestamp),
+        }
+    }
+}
+
+impl From<PersistedTimelock> for Timelock {
+    fn from(value: PersistedTimelock) -> Self {
+        match value {
+            PersistedTimelock::None => Timelock::None,
+            PersistedTimelock::Block(height) => {
+                let block_height: usize = height.try_into().unwrap_or(usize::MAX);
+                Timelock::Block(block_height)
+            }
+            PersistedTimelock::Time(timestamp) => Timelock::Time(timestamp),
+        }
+    }
+}
+
+impl From<&TrackedOutput> for PersistedOutput {
+    fn from(output: &TrackedOutput) -> Self {
+        Self {
+            tx_hash: output.tx_hash,
+            index_in_tx: output.index_in_tx,
+            amount: output.amount,
+            block_height: output.block_height,
+            timelock: PersistedTimelock::from(&output.additional_timelock),
+            is_coinbase: output.is_coinbase,
+            subaddress_major: output.subaddress_major,
+            subaddress_minor: output.subaddress_minor,
+            spent: output.spent,
+        }
+    }
+}
+
+impl From<PersistedOutput> for TrackedOutput {
+    fn from(output: PersistedOutput) -> Self {
+        Self {
+            tx_hash: output.tx_hash,
+            index_in_tx: output.index_in_tx,
+            amount: output.amount,
+            block_height: output.block_height,
+            additional_timelock: output.timelock.into(),
+            is_coinbase: output.is_coinbase,
+            subaddress_major: output.subaddress_major,
+            subaddress_minor: output.subaddress_minor,
+            spent: output.spent,
+        }
+    }
+}
+
+impl From<MoneroNetwork> for PersistedNetwork {
+    fn from(network: MoneroNetwork) -> Self {
+        match network {
+            MoneroNetwork::Mainnet => PersistedNetwork::Mainnet,
+            MoneroNetwork::Stagenet | MoneroNetwork::Testnet => PersistedNetwork::Stagenet,
+        }
+    }
+}
+
+impl From<&PersistedNetwork> for MoneroNetwork {
+    fn from(network: &PersistedNetwork) -> Self {
+        match network {
+            PersistedNetwork::Mainnet => MoneroNetwork::Mainnet,
+            PersistedNetwork::Stagenet => MoneroNetwork::Stagenet,
+        }
+    }
+}
+
+impl From<&StoredWallet> for PersistedWallet {
+    fn from(wallet: &StoredWallet) -> Self {
+        Self {
+            network: wallet.network.into(),
+            restore_height: wallet.restore_height,
+            last_scanned: wallet.last_scanned,
+            total: wallet.total,
+            unlocked: wallet.unlocked,
+            chain_height: wallet.chain_height,
+            chain_time: wallet.chain_time,
+            gap_limit: wallet.gap_limit,
+            tracked_outputs: wallet
+                .tracked_outputs
+                .iter()
+                .map(PersistedOutput::from)
+                .collect(),
+            seen_outpoints: wallet.seen_outpoints.iter().cloned().collect(),
+        }
+    }
+}
+
+impl PersistedWallet {
+    fn apply_to_state(self, state: &mut StoredWallet) {
+        state.last_scanned = self.last_scanned.max(state.restore_height);
+        state.total = self.total;
+        state.unlocked = self.unlocked;
+        state.chain_height = self.chain_height;
+        state.chain_time = self.chain_time;
+        state.gap_limit = self.gap_limit;
+        state.tracked_outputs = self
+            .tracked_outputs
+            .into_iter()
+            .map(TrackedOutput::from)
+            .collect();
+        state.seen_outpoints = self.seen_outpoints.into_iter().collect();
+    }
+}
+
+static WALLET_STORE: Lazy<Mutex<HashMap<String, StoredWallet>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Open (or register) a wallet from a 25-word mnemonic and initial restore height.
+/// Stores basic state in-memory for subsequent refresh/balance calls.
+/// Returns:
+/// - 0 on success
+/// - -10 invalid mnemonic encoding/empty
+/// - -11 invalid argument (null pointers)
+#[no_mangle]
+pub extern "C" fn wallet_open_from_mnemonic(
+    wallet_id: *const c_char,
+    mnemonic_ptr: *const c_char,
+    restore_height: u64,
+    is_mainnet: u8,
+) -> c_int {
+    if wallet_id.is_null() || mnemonic_ptr.is_null() {
+        return -11;
+    }
+
+    // Convert inputs
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return -10,
+    };
+    let mnemonic = match unsafe { CStr::from_ptr(mnemonic_ptr) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return -10,
+    };
+    if id.is_empty() || mnemonic.is_empty() {
+        return -10;
+    }
+
+    // Basic validation: attempt to parse mnemonic (English) so obviously bad inputs fail fast
+    if MoneroSeed::from_string(
+        MoneroSeedLanguage::English,
+        Zeroizing::new(mnemonic.to_string()),
+    )
+    .is_err()
+    {
+        return -10;
+    }
+
+    let network = if is_mainnet != 0 {
+        MoneroNetwork::Mainnet
+    } else {
+        MoneroNetwork::Stagenet
+    };
+
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    match map.entry(id.to_string()) {
+        Entry::Occupied(mut slot) => {
+            let state = slot.get_mut();
+            state.mnemonic = mnemonic.to_string();
+            state.network = network;
+            if restore_height < state.restore_height {
+                state.restore_height = restore_height;
+            }
+            if state.last_scanned < state.restore_height {
+                state.last_scanned = state.restore_height;
+            }
+            if state.gap_limit == 0 {
+                state.gap_limit = 50;
+            }
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(StoredWallet {
+                mnemonic: mnemonic.to_string(),
+                restore_height,
+                network,
+                last_scanned: restore_height,
+                total: 0,
+                unlocked: 0,
+                chain_height: restore_height,
+                chain_time: 0,
+                gap_limit: 50,
+                tracked_outputs: Vec::new(),
+                seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
+            });
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_refresh(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    out_last_scanned: *mut u64,
+) -> c_int {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        return record_error(-11, "wallet_refresh: wallet_id pointer was null");
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return record_error(-11, "wallet_refresh: wallet_id contained invalid UTF-8"),
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            return record_error(
+                code,
+                format!("wallet_refresh: invalid daemon url '{base_url}'"),
+            );
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            return record_error(
+                code,
+                format!("wallet_refresh: failed to query daemon '{base_url}': {message}"),
+            );
+        }
+    };
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                return record_error(-13, format!("wallet_refresh: wallet '{id}' not registered"))
+            }
+        }
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            return record_error(
+                code,
+                format!("wallet_refresh: unable to parse mnemonic ({code})"),
+            )
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            return record_error(
+                code,
+                format!("wallet_refresh: failed to construct view pair ({code})"),
+            )
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair);
+    let gap_limit = snapshot.gap_limit.max(1);
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    let mut working_outputs = snapshot.tracked_outputs.clone();
+    let mut seen_outpoints = snapshot.seen_outpoints.clone();
+    let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
+
+    if scan_cursor < daemon.height {
+        while scan_cursor < daemon.height {
+            let block_number = match usize::try_from(scan_cursor) {
+                Ok(value) => value,
+                Err(_) => {
+                    return record_error(-16, "wallet_refresh: block number conversion overflow")
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    return record_error(
+                        code,
+                        format!(
+                            "wallet_refresh: RPC block fetch failed at height {}",
+                            scan_cursor
+                        ),
+                    );
+                }
+            };
+            let miner_hash = scannable.block.miner_transaction().hash();
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    return record_error(
+                        -16,
+                        format!("wallet_refresh: scanner failed at height {}", scan_cursor),
+                    );
+                }
+            };
+
+            for output in outputs {
+                let key = (output.transaction(), output.index_in_transaction());
+                if !seen_outpoints.insert(key) {
+                    continue;
+                }
+
+                let (major, minor) = output
+                    .subaddress()
+                    .map(|idx| (idx.account(), idx.address()))
+                    .unwrap_or((0, 0));
+
+                working_outputs.push(TrackedOutput {
+                    tx_hash: output.transaction(),
+                    index_in_tx: output.index_in_transaction(),
+                    amount: output.commitment().amount,
+                    block_height: scan_cursor,
+                    additional_timelock: output.additional_timelock(),
+                    is_coinbase: output.transaction() == miner_hash,
+                    subaddress_major: major,
+                    subaddress_minor: minor,
+                    spent: false,
+                });
+            }
+
+            scan_cursor += 1;
+        }
+        scan_cursor = daemon.height;
+    }
+
+    working_outputs.retain(|output| !output.spent);
+    let mut total = 0u64;
+    let mut unlocked = 0u64;
+    for output in &working_outputs {
+        total = total.saturating_add(output.amount);
+        if output.is_unlocked(daemon.height, daemon.top_block_timestamp) {
+            unlocked = unlocked.saturating_add(output.amount);
+        }
+    }
+
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        let Some(state) = map.get_mut(id) else {
+            return -13;
+        };
+        state.last_scanned = scan_cursor.max(state.restore_height);
+        state.total = total;
+        state.unlocked = unlocked;
+        state.chain_height = daemon.height;
+        state.chain_time = daemon.top_block_timestamp;
+        state.tracked_outputs = working_outputs;
+        state.seen_outpoints = seen_outpoints;
+    }
+
+    if !out_last_scanned.is_null() {
+        unsafe {
+            *out_last_scanned = scan_cursor.max(snapshot.restore_height);
+        }
+    }
+    clear_last_error();
+    0
+}
+
+/// Get wallet balance (stub).
+/// Writes total and unlocked balances from in-memory state (both 0 by default in this stub).
+/// Returns:
+/// - 0 on success
+/// - -11 invalid argument
+/// - -13 not found
+#[no_mangle]
+pub extern "C" fn wallet_get_balance(
+    wallet_id: *const c_char,
+    out_total_piconero: *mut u64,
+    out_unlocked_piconero: *mut u64,
+) -> c_int {
+    if wallet_id.is_null() || out_total_piconero.is_null() || out_unlocked_piconero.is_null() {
+        return -11;
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return -11,
+    };
+    let map = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(state) = map.get(id) else {
+        return -13;
+    };
+
+    unsafe {
+        *out_total_piconero = state.total;
+        *out_unlocked_piconero = state.unlocked;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_import_cache(
+    wallet_id: *const c_char,
+    cache_ptr: *const u8,
+    cache_len: usize,
+) -> c_int {
+    clear_last_error();
+    if wallet_id.is_null() || cache_ptr.is_null() || cache_len == 0 {
+        return record_error(-11, "wallet_import_cache: invalid arguments");
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return record_error(-10, "wallet_import_cache: invalid wallet_id utf8"),
+    };
+    let data = unsafe { slice::from_raw_parts(cache_ptr, cache_len) };
+    let persisted: PersistedWallet = match bincode::deserialize(data) {
+        Ok(p) => p,
+        Err(err) => {
+            return record_error(
+                -16,
+                format!("wallet_import_cache: deserialize failed ({err})"),
+            )
+        }
+    };
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    match map.get_mut(id) {
+        Some(state) => {
+            persisted.apply_to_state(state);
+            clear_last_error();
+            0
+        }
+        None => record_error(
+            -13,
+            format!("wallet_import_cache: wallet '{id}' not opened"),
+        ),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_export_cache(
+    wallet_id: *const c_char,
+    out_buf: *mut u8,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    clear_last_error();
+    if wallet_id.is_null() {
+        if !out_written.is_null() {
+            unsafe { *out_written = 0 };
+        }
+        return record_error(-11, "wallet_export_cache: invalid wallet_id");
+    }
+    if out_buf.is_null() && out_buf_len > 0 {
+        if !out_written.is_null() {
+            unsafe { *out_written = 0 };
+        }
+        return record_error(
+            -11,
+            "wallet_export_cache: null output buffer with non-zero length",
+        );
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return record_error(-10, "wallet_export_cache: invalid wallet_id utf8"),
+    };
+    let map = WALLET_STORE.lock().expect("wallet store poisoned");
+    let state = match map.get(id) {
+        Some(state) => state,
+        None => {
+            return record_error(
+                -13,
+                format!("wallet_export_cache: wallet '{id}' not opened"),
+            )
+        }
+    };
+    let persisted = PersistedWallet::from(state);
+    let bytes = match bincode::serialize(&persisted) {
+        Ok(b) => b,
+        Err(err) => {
+            return record_error(
+                -16,
+                format!("wallet_export_cache: serialize failed ({err})"),
+            )
+        }
+    };
+    if out_buf.is_null() {
+        if !out_written.is_null() {
+            unsafe { *out_written = bytes.len() };
+        }
+        return -12;
+    }
+    if bytes.len() > out_buf_len {
+        if !out_written.is_null() {
+            unsafe { *out_written = bytes.len() };
+        }
+        return record_error(
+            -12,
+            format!(
+                "wallet_export_cache: buffer too small (need {}, have {})",
+                bytes.len(),
+                out_buf_len
+            ),
+        );
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+        if !out_written.is_null() {
+            *out_written = bytes.len();
+        }
+    }
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_export_outputs_json(wallet_id: *const c_char) -> *mut c_char {
+    clear_last_error();
+    if wallet_id.is_null() {
+        record_error(-11, "wallet_export_outputs_json: invalid wallet_id");
+        return ptr::null_mut();
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_export_outputs_json: invalid wallet_id utf8");
+            return ptr::null_mut();
+        }
+    };
+    let envelope = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        let Some(state) = map.get(id) else {
+            record_error(
+                -13,
+                format!("wallet_export_outputs_json: wallet '{id}' not opened"),
+            );
+            return ptr::null_mut();
+        };
+        let outputs = state
+            .tracked_outputs
+            .iter()
+            .map(|o| ObservedOutput::from_tracked(o, state.chain_height, state.chain_time))
+            .collect();
+        ObservedOutputsEnvelope {
+            wallet_id: id.to_string(),
+            restore_height: state.restore_height,
+            last_scanned_height: state.last_scanned,
+            chain_height: state.chain_height,
+            chain_time: state.chain_time,
+            outputs,
+        }
+    };
+    let json = match serde_json::to_string(&envelope) {
+        Ok(json) => json,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_export_outputs_json: serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_export_outputs_json: JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_send(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    amount_piconero: u64,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_send: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_send: wallet_id contained invalid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    let recipient_str = match unsafe { CStr::from_ptr(to_address) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_send: to_address contained invalid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    // Lookup wallet snapshot
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                record_error(-13, format!("wallet_send: wallet '{id}' not registered"));
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    // Parse recipient address on the same network
+    let recipient_address = match MoneroAddress::from_str(snapshot.network, recipient_str) {
+        Ok(addr) => addr,
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_send: invalid recipient address for wallet network",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    // Build RPC client and fetch daemon status
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            record_error(
+                code,
+                format!("wallet_send: invalid daemon url '{base_url}'"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            record_error(
+                code,
+                format!("wallet_send: failed to query daemon '{base_url}': {message}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    // Construct master keys and view pair
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(code, "wallet_send: unable to parse mnemonic");
+            return ptr::null_mut();
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(code, "wallet_send: failed to construct view pair");
+            return ptr::null_mut();
+        }
+    };
+
+    // Prepare scanner with registered subaddresses up to gap_limit
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    // Choose spendable outputs (unspent and unlocked)
+    let mut spendable = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .collect::<Vec<_>>();
+    // Sort by amount ascending to minimize change fragmentation
+    spendable.sort_by_key(|o| o.amount);
+
+    let mut selected_tracked: Vec<TrackedOutput> = Vec::new();
+    let mut accumulated: u64 = 0;
+
+    for o in spendable {
+        selected_tracked.push(o.clone());
+        accumulated = accumulated.saturating_add(o.amount);
+        if accumulated >= amount_piconero {
+            break;
+        }
+    }
+
+    if accumulated < amount_piconero {
+        record_error(
+            -18,
+            format!(
+                "wallet_send: insufficient unlocked funds (have {}, need {})",
+                accumulated, amount_piconero
+            ),
+        );
+        return ptr::null_mut();
+    }
+
+    // Reconstruct WalletOutput for each selected TrackedOutput by rescanning its block
+    let mut rng = OsRng;
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+    for t in &selected_tracked {
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(-16, "wallet_send: block number conversion overflow");
+                return ptr::null_mut();
+            }
+        };
+        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+            Ok(block) => block,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(
+                    code,
+                    format!(
+                        "wallet_send: RPC block fetch failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!("wallet_send: scanner failed at height {}", t.block_height),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        // Find the exact WalletOutput matching (tx_hash, index)
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_send: failed to reconstruct selected output (not found after scan)",
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            &mut rng,
+            &rpc_client,
+            ring_len_eff,
+            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+            wallet_out,
+        )) {
+            Ok(i) => i,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(code, "wallet_send: decoy selection failed");
+                return ptr::null_mut();
+            }
+        };
+
+        inputs.push(with_decoys);
+    }
+
+    // Fetch fee rate
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_send: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    // Change to primary account (no explicit subaddress)
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+
+    // Outgoing view key seed for RNGs
+    let mut ovk = [0u8; 32];
+    rng.fill_bytes(&mut ovk);
+
+    // Build signable transaction
+    let intent = match monero_wallet::send::SignableTransaction::new(
+        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+        Zeroizing::new(ovk),
+        inputs,
+        vec![(recipient_address, amount_piconero)],
+        change,
+        Vec::new(),
+        fee_rate,
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_send: transaction construction failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let fee_piconero = intent.necessary_fee();
+
+    // Sign
+    let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+    let mut signer_rng = OsRng;
+    let tx = match intent.sign(&mut signer_rng, &spend_key) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(-16, format!("wallet_send: signing failed ({e})"));
+            return ptr::null_mut();
+        }
+    };
+
+    // Broadcast
+    if let Err(err) = block_on(rpc_client.publish_transaction(&tx)) {
+        let code = map_rpc_error(err);
+        record_error(code, "wallet_send: publish_transaction failed");
+        return ptr::null_mut();
+    }
+
+    // Update in-memory wallet store: mark selected outputs as spent and reduce cached totals
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        if let Some(state) = map.get_mut(id) {
+            let spent_sum: u64 = selected_tracked.iter().map(|t| t.amount).sum();
+            for t in &selected_tracked {
+                if let Some(o) = state
+                    .tracked_outputs
+                    .iter_mut()
+                    .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
+                {
+                    o.spent = true;
+                }
+            }
+            // Adjust cached totals; a subsequent refresh will reconcile precisely
+            state.total = state.total.saturating_sub(spent_sum);
+            state.unlocked = state.unlocked.saturating_sub(spent_sum);
+        }
+    }
+
+    // Return result JSON with txid and fee
+    let tx_hash = tx.hash();
+    let hex = hex_lowercase(&tx_hash);
+    let result_json = match serde_json::to_string(&serde_json::json!({
+        "txid": hex,
+        "fee": fee_piconero
+    })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_send: result JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(result_json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_send: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+#[no_mangle]
+pub extern "C" fn wallet_preview_fee(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || destinations_json.is_null() {
+        record_error(-11, "wallet_preview_fee: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_preview_fee: wallet_id contained invalid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    let dests_str = match unsafe { CStr::from_ptr(destinations_json) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_preview_fee: destinations_json invalid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct Pay {
+        address: String,
+        amount: u64,
+    }
+
+    let pays: Vec<Pay> = match serde_json::from_str(dests_str) {
+        Ok(v) => v,
+        Err(err) => {
+            record_error(
+                -11,
+                format!("wallet_preview_fee: invalid destinations JSON ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    if pays.is_empty() {
+        record_error(-11, "wallet_preview_fee: empty destinations");
+        return ptr::null_mut();
+    }
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                record_error(
+                    -13,
+                    format!("wallet_preview_fee: wallet '{id}' not registered"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            record_error(
+                code,
+                format!("wallet_preview_fee: invalid daemon url '{base_url}'"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            record_error(
+                code,
+                format!("wallet_preview_fee: failed to query daemon '{base_url}': {message}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(code, "wallet_preview_fee: unable to parse mnemonic");
+            return ptr::null_mut();
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(code, "wallet_preview_fee: failed to construct view pair");
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    // Parse destinations into monero addresses
+    let mut destinations: Vec<(monero_address::MoneroAddress, u64)> =
+        Vec::with_capacity(pays.len());
+    let mut total_needed: u64 = 0;
+    for p in &pays {
+        let addr = match MoneroAddress::from_str(snapshot.network, &p.address) {
+            Ok(a) => a,
+            Err(_) => {
+                record_error(-10, "wallet_preview_fee: invalid destination address");
+                return ptr::null_mut();
+            }
+        };
+        total_needed = total_needed.saturating_add(p.amount);
+        destinations.push((addr, p.amount));
+    }
+
+    // Gather unlocked, unspent outputs until we cover total_needed (fee will be added later)
+    let mut spendable = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .collect::<Vec<_>>();
+    spendable.sort_by_key(|o| o.amount);
+
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut sum: u64 = 0;
+    for o in spendable {
+        selected.push(o.clone());
+        sum = sum.saturating_add(o.amount);
+        if sum >= total_needed {
+            break;
+        }
+    }
+    if sum < total_needed {
+        record_error(
+            -18,
+            format!(
+                "wallet_preview_fee: insufficient unlocked funds (have {}, need {})",
+                sum, total_needed
+            ),
+        );
+        return ptr::null_mut();
+    }
+
+    // Build inputs with decoys
+    let mut rng = OsRng;
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+    for t in &selected {
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(-16, "wallet_preview_fee: block number conversion overflow");
+                return ptr::null_mut();
+            }
+        };
+        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+            Ok(block) => block,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(
+                    code,
+                    format!(
+                        "wallet_preview_fee: RPC block fetch failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_preview_fee: scanner failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_preview_fee: failed to reconstruct selected output",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            &mut rng,
+            &rpc_client,
+            ring_len_eff,
+            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+            wallet_out,
+        )) {
+            Ok(i) => i,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(code, "wallet_preview_fee: decoy selection failed");
+                return ptr::null_mut();
+            }
+        };
+        inputs.push(with_decoys);
+    }
+
+    // Fetch fee rate
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_preview_fee: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+    let mut ovk = [0u8; 32];
+    rng.fill_bytes(&mut ovk);
+
+    let intent = match monero_wallet::send::SignableTransaction::new(
+        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+        Zeroizing::new(ovk),
+        inputs,
+        destinations,
+        change,
+        Vec::new(),
+        fee_rate,
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_preview_fee: transaction construction failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let fee = intent.necessary_fee();
+
+    let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_preview_fee: result JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_preview_fee: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_send_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || destinations_json.is_null() {
+        record_error(-11, "wallet_send_with_filter: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_send_with_filter: wallet_id contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let dests_str = match unsafe { CStr::from_ptr(destinations_json) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_send_with_filter: destinations_json invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let filt_str_opt = if !filter_json.is_null() {
+        unsafe { CStr::from_ptr(filter_json) }.to_str().ok()
+    } else {
+        None
+    };
+
+    #[derive(Deserialize)]
+    struct Pay {
+        address: String,
+        amount: u64,
+    }
+    #[derive(Deserialize)]
+    struct InputFilter {
+        subaddress_minor: Option<u32>,
+    }
+
+    let pays: Vec<Pay> = match serde_json::from_str(dests_str) {
+        Ok(v) => v,
+        Err(err) => {
+            record_error(
+                -11,
+                format!("wallet_send_with_filter: invalid destinations JSON ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    if pays.is_empty() {
+        record_error(-11, "wallet_send_with_filter: empty destinations");
+        return ptr::null_mut();
+    }
+    let filter: Option<InputFilter> = match filt_str_opt {
+        Some(s) if !s.is_empty() => match serde_json::from_str(s) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                record_error(
+                    -11,
+                    format!("wallet_send_with_filter: invalid filter JSON ({err})"),
+                );
+                return ptr::null_mut();
+            }
+        },
+        _ => None,
+    };
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                record_error(
+                    -13,
+                    format!("wallet_send_with_filter: wallet '{id}' not registered"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            record_error(
+                code,
+                format!("wallet_send_with_filter: invalid daemon url '{base_url}'"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            record_error(
+                code,
+                format!("wallet_send_with_filter: failed to query daemon '{base_url}': {message}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(code, "wallet_send_with_filter: unable to parse mnemonic");
+            return ptr::null_mut();
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_send_with_filter: failed to construct view pair",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    let mut destinations: Vec<(monero_address::MoneroAddress, u64)> =
+        Vec::with_capacity(pays.len());
+    let mut total_needed: u64 = 0;
+    for p in &pays {
+        let addr = match MoneroAddress::from_str(snapshot.network, &p.address) {
+            Ok(a) => a,
+            Err(_) => {
+                record_error(-10, "wallet_send_with_filter: invalid destination address");
+                return ptr::null_mut();
+            }
+        };
+        total_needed = total_needed.saturating_add(p.amount);
+        destinations.push((addr, p.amount));
+    }
+
+    // Filter spendable outputs
+    let mut spendable: Vec<TrackedOutput> = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .collect();
+
+    if let Some(f) = &filter {
+        if let Some(minor) = f.subaddress_minor {
+            spendable.retain(|o| o.subaddress_major == 0 && o.subaddress_minor == minor);
+        }
+    }
+    spendable.sort_by_key(|o| o.amount);
+
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut sum: u64 = 0;
+    for o in spendable {
+        selected.push(o.clone());
+        sum = sum.saturating_add(o.amount);
+        if sum >= total_needed {
+            break;
+        }
+    }
+    if sum < total_needed {
+        record_error(
+            -18,
+            format!(
+                "wallet_send_with_filter: insufficient unlocked funds (have {}, need {})",
+                sum, total_needed
+            ),
+        );
+        return ptr::null_mut();
+    }
+
+    let mut rng = OsRng;
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+    for t in &selected {
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_send_with_filter: block number conversion overflow",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+            Ok(block) => block,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(
+                    code,
+                    format!(
+                        "wallet_send_with_filter: RPC block fetch failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_send_with_filter: scanner failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_send_with_filter: failed to reconstruct selected output",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            &mut rng,
+            &rpc_client,
+            ring_len_eff,
+            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+            wallet_out,
+        )) {
+            Ok(i) => i,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(code, "wallet_send_with_filter: decoy selection failed");
+                return ptr::null_mut();
+            }
+        };
+        inputs.push(with_decoys);
+    }
+
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_send_with_filter: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+    let mut ovk = [0u8; 32];
+    rng.fill_bytes(&mut ovk);
+
+    let intent = match monero_wallet::send::SignableTransaction::new(
+        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+        Zeroizing::new(ovk),
+        inputs,
+        destinations,
+        change,
+        Vec::new(),
+        fee_rate,
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_send_with_filter: transaction construction failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let fee_piconero = intent.necessary_fee();
+
+    let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+    let mut signer_rng = OsRng;
+    let tx = match intent.sign(&mut signer_rng, &spend_key) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_send_with_filter: signing failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    if let Err(err) = block_on(rpc_client.publish_transaction(&tx)) {
+        let code = map_rpc_error(err);
+        record_error(code, "wallet_send_with_filter: publish_transaction failed");
+        return ptr::null_mut();
+    }
+
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        if let Some(state) = map.get_mut(id) {
+            let spent_sum: u64 = selected.iter().map(|t| t.amount).sum();
+            for t in &selected {
+                if let Some(o) = state
+                    .tracked_outputs
+                    .iter_mut()
+                    .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
+                {
+                    o.spent = true;
+                }
+            }
+            state.total = state.total.saturating_sub(spent_sum);
+            state.unlocked = state.unlocked.saturating_sub(spent_sum);
+        }
+    }
+
+    let tx_hash = tx.hash();
+    let hex = hex_lowercase(&tx_hash);
+    let result_json = match serde_json::to_string(&serde_json::json!({
+        "txid": hex,
+        "fee": fee_piconero
+    })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_send_with_filter: result JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(result_json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_send_with_filter: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_preview_fee_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || destinations_json.is_null() {
+        record_error(-11, "wallet_preview_fee_with_filter: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_preview_fee_with_filter: wallet_id contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let dests_str = match unsafe { CStr::from_ptr(destinations_json) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_preview_fee_with_filter: destinations_json invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let filt_str_opt = if !filter_json.is_null() {
+        unsafe { CStr::from_ptr(filter_json) }.to_str().ok()
+    } else {
+        None
+    };
+
+    #[derive(Deserialize)]
+    struct Pay {
+        address: String,
+        amount: u64,
+    }
+    #[derive(Deserialize)]
+    struct InputFilter {
+        subaddress_minor: Option<u32>,
+    }
+
+    let pays: Vec<Pay> = match serde_json::from_str(dests_str) {
+        Ok(v) => v,
+        Err(err) => {
+            record_error(
+                -11,
+                format!("wallet_preview_fee_with_filter: invalid destinations JSON ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    if pays.is_empty() {
+        record_error(-11, "wallet_preview_fee_with_filter: empty destinations");
+        return ptr::null_mut();
+    }
+    let filter: Option<InputFilter> = match filt_str_opt {
+        Some(s) if !s.is_empty() => match serde_json::from_str(s) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                record_error(
+                    -11,
+                    format!("wallet_preview_fee_with_filter: invalid filter JSON ({err})"),
+                );
+                return ptr::null_mut();
+            }
+        },
+        _ => None,
+    };
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                record_error(
+                    -13,
+                    format!("wallet_preview_fee_with_filter: wallet '{id}' not registered"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            record_error(
+                code,
+                format!("wallet_preview_fee_with_filter: invalid daemon url '{base_url}'"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            record_error(
+                code,
+                format!(
+                "wallet_preview_fee_with_filter: failed to query daemon '{base_url}': {message}"
+            ),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_preview_fee_with_filter: unable to parse mnemonic",
+            );
+            return ptr::null_mut();
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_preview_fee_with_filter: failed to construct view pair",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    // Parse destinations
+    let mut destinations: Vec<(monero_address::MoneroAddress, u64)> =
+        Vec::with_capacity(pays.len());
+    let mut total_needed: u64 = 0;
+    for p in &pays {
+        let addr = match MoneroAddress::from_str(snapshot.network, &p.address) {
+            Ok(a) => a,
+            Err(_) => {
+                record_error(
+                    -10,
+                    "wallet_preview_fee_with_filter: invalid destination address",
+                );
+                return ptr::null_mut();
+            }
+        };
+        total_needed = total_needed.saturating_add(p.amount);
+        destinations.push((addr, p.amount));
+    }
+
+    // Filter and collect spendable outputs
+    let mut spendable: Vec<TrackedOutput> = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .collect();
+    if let Some(f) = &filter {
+        if let Some(minor) = f.subaddress_minor {
+            spendable.retain(|o| o.subaddress_major == 0 && o.subaddress_minor == minor);
+        }
+    }
+    spendable.sort_by_key(|o| o.amount);
+
+    // Select enough to cover destination totals
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut sum: u64 = 0;
+    for o in spendable {
+        selected.push(o.clone());
+        sum = sum.saturating_add(o.amount);
+        if sum >= total_needed {
+            break;
+        }
+    }
+    if sum < total_needed {
+        record_error(
+            -18,
+            format!(
+                "wallet_preview_fee_with_filter: insufficient unlocked funds (have {}, need {})",
+                sum, total_needed
+            ),
+        );
+        return ptr::null_mut();
+    }
+
+    // Build decoy-selected inputs
+    let mut rng = OsRng;
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+    for t in &selected {
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_preview_fee_with_filter: block number conversion overflow",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+            Ok(block) => block,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(
+                    code,
+                    format!(
+                        "wallet_preview_fee_with_filter: RPC block fetch failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_preview_fee_with_filter: scanner failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_preview_fee_with_filter: failed to reconstruct selected output",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            &mut rng,
+            &rpc_client,
+            ring_len_eff,
+            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+            wallet_out,
+        )) {
+            Ok(i) => i,
+            Err(err) => {
+                let code = map_rpc_error(err);
+                record_error(
+                    code,
+                    "wallet_preview_fee_with_filter: decoy selection failed",
+                );
+                return ptr::null_mut();
+            }
+        };
+        inputs.push(with_decoys);
+    }
+
+    // Fetch fee rate
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_preview_fee_with_filter: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    // Build intent and compute fee
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+    let mut ovk = [0u8; 32];
+    rng.fill_bytes(&mut ovk);
+
+    let intent = match monero_wallet::send::SignableTransaction::new(
+        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+        Zeroizing::new(ovk),
+        inputs,
+        destinations,
+        change,
+        Vec::new(),
+        fee_rate,
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_preview_fee_with_filter: transaction construction failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let fee = intent.necessary_fee();
+
+    let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_preview_fee_with_filter: result JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_preview_fee_with_filter: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}

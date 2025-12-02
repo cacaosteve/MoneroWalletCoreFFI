@@ -1,0 +1,55 @@
+ // swift-tools-version: 5.9
+ import PackageDescription
+
+ let package = Package(
+     name: "WalletCoreFFI",
+     defaultLocalization: "en",
+     platforms: [
+         .iOS(.v15),
+         .macOS(.v13)
+     ],
+     products: [
+         .library(name: "WalletCoreFFI", targets: ["WalletCoreFFI"])
+     ],
+     targets: [
+         // Apple platforms: prebuilt xcframework
+         .binaryTarget(
+             name: "WalletCore",
+             path: "Artifacts/WalletCore.xcframework"
+         ),
+
+         // Linux: system library target that links against libwalletcore.so
+         // If you package a .pc file, set pkgConfig accordingly; providers are advisory.
+         .systemLibrary(
+             name: "CLibWalletCore",
+             path: "CLibWalletCore",
+             pkgConfig: "walletcore",
+             providers: [
+                 .apt(["libwalletcore-dev"]),
+                 .brew(["walletcore"])
+             ]
+         ),
+
+         // Thin Swift wrapper that conditionally links to the appropriate low-level target
+         .target(
+             name: "WalletCoreFFI",
+             dependencies: [
+                 .target(name: "WalletCore", condition: .when(platforms: [.iOS, .macOS])),
+                 .target(name: "CLibWalletCore", condition: .when(platforms: [.linux]))
+             ],
+             path: "Sources/WalletCoreFFI",
+             swiftSettings: [
+                 .define("WALLETCORE_APPLE", .when(platforms: [.iOS, .macOS])),
+                 .define("WALLETCORE_LINUX", .when(platforms: [.linux]))
+             ],
+
+         ),
+
+         .executableTarget(
+             name: "WalletCoreFFI_Smoke",
+             dependencies: ["WalletCoreFFI"],
+             path: "Utilities/Smoke",
+             sources: ["main.swift"]
+         )
+     ]
+ )
