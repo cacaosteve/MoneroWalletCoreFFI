@@ -986,8 +986,11 @@ pub extern "C" fn wallet_refresh(
         }
     };
 
-    let mut scanner = Scanner::new(view_pair);
+    let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
     for minor in 1..=gap_limit {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
@@ -998,68 +1001,243 @@ pub extern "C" fn wallet_refresh(
     let mut seen_outpoints = snapshot.seen_outpoints.clone();
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
 
+    // Optional performance logging controls
+    let log_perf: bool = std::env::var("WALLETCORE_SCAN_LOG")
+        .ok()
+        .map(|s| s != "0")
+        .unwrap_or(false);
+    let overall_start: Option<std::time::Instant> = if log_perf {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let initial_outputs: usize = working_outputs.len();
+
+    // Optional parallel scan controls
+    let par: usize = std::env::var("WALLETCORE_SCAN_PAR")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let batch: usize = std::env::var("WALLETCORE_SCAN_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200);
+
     if scan_cursor < daemon.height {
-        while scan_cursor < daemon.height {
-            let block_number = match usize::try_from(scan_cursor) {
-                Ok(value) => value,
-                Err(_) => {
-                    return record_error(-16, "wallet_refresh: block number conversion overflow")
-                }
-            };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    return record_error(
-                        code,
-                        format!(
-                            "wallet_refresh: RPC block fetch failed at height {}",
-                            scan_cursor
-                        ),
-                    );
-                }
-            };
-            let miner_hash = scannable.block.miner_transaction().hash();
-            let outputs = match scanner.scan(scannable) {
-                Ok(result) => result.ignore_additional_timelock(),
-                Err(_) => {
-                    return record_error(
-                        -16,
-                        format!("wallet_refresh: scanner failed at height {}", scan_cursor),
-                    );
-                }
-            };
+        if par > 1 && batch > 1 {
+            // Parallel, batched scanning. Each worker uses its own Scanner cloned from the same view_pair.
+            while scan_cursor < daemon.height {
+                let end_exclusive = {
+                    let end = scan_cursor.saturating_add(batch as u64);
+                    if end > daemon.height {
+                        daemon.height
+                    } else {
+                        end
+                    }
+                };
+                let heights: Vec<u64> = (scan_cursor..end_exclusive).collect();
+                let _count = heights.len();
 
-            for output in outputs {
-                let key = (output.transaction(), output.index_in_transaction());
-                if !seen_outpoints.insert(key) {
-                    continue;
+                let (tx, rx) =
+                    std::sync::mpsc::channel::<Result<Vec<TrackedOutput>, (c_int, String)>>();
+
+                // Launch workers in chunks of `par`
+                for chunk in heights.chunks(par) {
+                    for &h in chunk {
+                        let txc = tx.clone();
+                        let client = rpc_client.clone();
+                        let vp = view_pair.clone();
+                        let local_gap = gap_limit;
+                        std::thread::spawn(move || {
+                            // Local scanner per worker
+                            let mut local_scanner = Scanner::new(vp);
+                            if let Some(i0) = SubaddressIndex::new(0, 0) {
+                                local_scanner.register_subaddress(i0);
+                            }
+                            for minor in 1..=local_gap {
+                                if let Some(idx) = SubaddressIndex::new(0, minor) {
+                                    local_scanner.register_subaddress(idx);
+                                }
+                            }
+
+                            let block_number = match usize::try_from(h) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    let _ = txc.send(Err((
+                                        -16,
+                                        "wallet_refresh: block number conversion overflow"
+                                            .to_string(),
+                                    )));
+                                    return;
+                                }
+                            };
+
+                            let scannable = match block_on(
+                                client.get_scannable_block_by_number(block_number),
+                            ) {
+                                Ok(block) => block,
+                                Err(err) => {
+                                    let code = map_rpc_error(err);
+                                    let _ = txc.send(Err((
+                                        code,
+                                        format!(
+                                            "wallet_refresh: RPC block fetch failed at height {}",
+                                            h
+                                        ),
+                                    )));
+                                    return;
+                                }
+                            };
+
+                            let miner_hash = scannable.block.miner_transaction().hash();
+                            let outputs = match local_scanner.scan(scannable) {
+                                Ok(result) => result.ignore_additional_timelock(),
+                                Err(_) => {
+                                    let _ = txc.send(Err((
+                                        -16,
+                                        format!("wallet_refresh: scanner failed at height {}", h),
+                                    )));
+                                    return;
+                                }
+                            };
+
+                            let mut collected: Vec<TrackedOutput> =
+                                Vec::with_capacity(outputs.len());
+                            for output in outputs {
+                                let (major, minor) = output
+                                    .subaddress()
+                                    .map(|idx| (idx.account(), idx.address()))
+                                    .unwrap_or((0, 0));
+                                collected.push(TrackedOutput {
+                                    tx_hash: output.transaction(),
+                                    index_in_tx: output.index_in_transaction(),
+                                    amount: output.commitment().amount,
+                                    block_height: h,
+                                    additional_timelock: output.additional_timelock(),
+                                    is_coinbase: output.transaction() == miner_hash,
+                                    subaddress_major: major,
+                                    subaddress_minor: minor,
+                                    spent: false,
+                                });
+                            }
+
+                            let _ = txc.send(Ok(collected));
+                        });
+                    }
+
+                    // Drain results for this chunk
+                    for _ in 0..chunk.len() {
+                        match rx.recv() {
+                            Ok(Ok(vec_outputs)) => {
+                                for t in vec_outputs {
+                                    let key = (t.tx_hash, t.index_in_tx);
+                                    if !seen_outpoints.insert(key) {
+                                        continue;
+                                    }
+                                    working_outputs.push(t);
+                                }
+                            }
+                            Ok(Err((code, msg))) => {
+                                // Abort on first error
+                                return record_error(code, msg);
+                            }
+                            Err(_) => {
+                                return record_error(
+                                    -16,
+                                    "wallet_refresh: parallel worker channel closed unexpectedly",
+                                );
+                            }
+                        }
+                    }
                 }
 
-                let (major, minor) = output
-                    .subaddress()
-                    .map(|idx| (idx.account(), idx.address()))
-                    .unwrap_or((0, 0));
-
-                working_outputs.push(TrackedOutput {
-                    tx_hash: output.transaction(),
-                    index_in_tx: output.index_in_transaction(),
-                    amount: output.commitment().amount,
-                    block_height: scan_cursor,
-                    additional_timelock: output.additional_timelock(),
-                    is_coinbase: output.transaction() == miner_hash,
-                    subaddress_major: major,
-                    subaddress_minor: minor,
-                    spent: false,
-                });
+                // Advance cursor to end of this batch
+                scan_cursor = end_exclusive;
             }
+            // Ensure we align with daemon height after finishing batches
+            scan_cursor = daemon.height;
+        } else {
+            // Sequential scan (original path)
+            while scan_cursor < daemon.height {
+                let block_number = match usize::try_from(scan_cursor) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return record_error(
+                            -16,
+                            "wallet_refresh: block number conversion overflow",
+                        )
+                    }
+                };
+                let scannable =
+                    match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                        Ok(block) => block,
+                        Err(err) => {
+                            let code = map_rpc_error(err);
+                            return record_error(
+                                code,
+                                format!(
+                                    "wallet_refresh: RPC block fetch failed at height {}",
+                                    scan_cursor
+                                ),
+                            );
+                        }
+                    };
+                let miner_hash = scannable.block.miner_transaction().hash();
+                let outputs = match scanner.scan(scannable) {
+                    Ok(result) => result.ignore_additional_timelock(),
+                    Err(_) => {
+                        return record_error(
+                            -16,
+                            format!("wallet_refresh: scanner failed at height {}", scan_cursor),
+                        );
+                    }
+                };
 
-            scan_cursor += 1;
+                for output in outputs {
+                    let key = (output.transaction(), output.index_in_transaction());
+                    if !seen_outpoints.insert(key) {
+                        continue;
+                    }
+
+                    let (major, minor) = output
+                        .subaddress()
+                        .map(|idx| (idx.account(), idx.address()))
+                        .unwrap_or((0, 0));
+
+                    working_outputs.push(TrackedOutput {
+                        tx_hash: output.transaction(),
+                        index_in_tx: output.index_in_transaction(),
+                        amount: output.commitment().amount,
+                        block_height: scan_cursor,
+                        additional_timelock: output.additional_timelock(),
+                        is_coinbase: output.transaction() == miner_hash,
+                        subaddress_major: major,
+                        subaddress_minor: minor,
+                        spent: false,
+                    });
+                }
+
+                scan_cursor += 1;
+            }
+            scan_cursor = daemon.height;
         }
-        scan_cursor = daemon.height;
     }
 
     working_outputs.retain(|output| !output.spent);
+
+    // Overall performance log for this refresh
+    if log_perf {
+        let blocks_scanned =
+            scan_cursor.saturating_sub(snapshot.last_scanned.max(snapshot.restore_height));
+        let new_outputs = working_outputs.len().saturating_sub(initial_outputs);
+        if let Some(start) = overall_start {
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "wallet_refresh: scanned {} blocks; new_outputs={}; elapsed={:.3}s",
+                blocks_scanned, new_outputs, secs
+            );
+        }
+    }
     let mut total = 0u64;
     let mut unlocked = 0u64;
     for output in &working_outputs {
@@ -1409,6 +1587,9 @@ pub extern "C" fn wallet_send(
     // Prepare scanner with registered subaddresses up to gap_limit
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
     for minor in 1..=gap_limit {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
@@ -1744,6 +1925,9 @@ pub extern "C" fn wallet_preview_fee(
 
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
     for minor in 1..=gap_limit {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
@@ -2074,6 +2258,9 @@ pub extern "C" fn wallet_send_with_filter(
 
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
     for minor in 1..=gap_limit {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
@@ -2457,6 +2644,9 @@ pub extern "C" fn wallet_preview_fee_with_filter(
 
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
     for minor in 1..=gap_limit {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
