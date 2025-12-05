@@ -1,5 +1,0 @@
-module MoneroWalletCore [system] {
-  header "walletcore.h"
-  export *
-  link "walletcore"
-}

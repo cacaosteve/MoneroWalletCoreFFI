@@ -2,9 +2,9 @@
 # install_linux.sh
 #
 # Installs the WalletCore Rust FFI artifacts on Linux:
-# - Installs the shared library (libwalletcore.so) into <prefix>/lib
-# - Installs the public C header (walletcore.h) into <prefix>/include
-# - Generates and installs a pkg-config file (<prefix>/lib/pkgconfig/walletcore.pc)
+# - Installs the shared library (libmonerowalletcore.so) into <prefix>/lib
+# - Installs the public C header (monerowalletcore.h) into <prefix>/include
+# - Generates and installs a pkg-config file (<prefix>/lib/pkgconfig/monerowalletcore.pc)
 #
 # Defaults:
 #   PREFIX=/usr/local
@@ -12,11 +12,11 @@
 #   PROFILE=release
 #
 # You may override:
-#   PREFIX=/opt/walletcore
+#   PREFIX=/opt/monerowalletcore
 #   TARGET=x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | ... (Cargo target triple)
 #   PROFILE=debug | release
-#   LIB_SO=<path/to/libwalletcore.so>
-#   HEADER=<path/to/walletcore.h>
+#   LIB_SO=<path/to/libmonerowalletcore.so>
+#   HEADER=<path/to/monerowalletcore.h>
 #
 # Example:
 #   # Build the Rust library first (outside this script):
@@ -26,7 +26,7 @@
 #
 # After install (optional):
 #   $ sudo ldconfig
-#   $ pkg-config --libs --cflags walletcore
+#   $ pkg-config --libs --cflags monerowalletcore
 #
 # Notes:
 # - This script assumes it resides in MoneroWalletCoreFFI/Scripts/.
@@ -43,7 +43,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
 CRATE_DIR="${REPO_ROOT}/monero-oxide-output"
-HEADER_DEFAULT="${REPO_ROOT}/CLibMoneroWalletCore/walletcore.h"
+HEADER_DEFAULT="${REPO_ROOT}/CLibMoneroWalletCore/monerowalletcore.h"
 
 # ---------------
 # Defaults
@@ -65,7 +65,7 @@ detect_target_triple() {
 }
 TARGET="${TARGET:-$(detect_target_triple)}"
 
-LIB_SO="${LIB_SO:-${CRATE_DIR}/target/${TARGET}/${PROFILE}/libwalletcore.so}"
+LIB_SO="${LIB_SO:-${CRATE_DIR}/target/${TARGET}/${PROFILE}/libmonerowalletcore.so}"
 
 LIBDIR="${PREFIX}/lib"
 INCLUDEDIR="${PREFIX}/include"
@@ -137,8 +137,8 @@ Options:
   --prefix DIR          Install prefix (default: ${PREFIX})
   --target TRIPLE       Cargo target triple (default: ${TARGET})
   --profile NAME        Build profile: release|debug (default: ${PROFILE})
-  --lib PATH            Path to libwalletcore.so (default: derived from target/profile)
-  --header PATH         Path to walletcore.h (default: ${HEADER_DEFAULT})
+  --lib PATH            Path to libmonerowalletcore.so (default: derived from target/profile)
+  --header PATH         Path to monerowalletcore.h (default: ${HEADER_DEFAULT})
   -h, --help            Show this help
 
 Environment variables:
@@ -202,15 +202,15 @@ ensure_dir "${INCLUDEDIR}"
 ensure_dir "${PKGCONFIGDIR}"
 
 # Copy shared library
-log "Installing libwalletcore.so -> ${LIBDIR}/"
-copy_file "${LIB_SO}" "${LIBDIR}/libwalletcore.so"
+log "Installing libmonerowalletcore.so -> ${LIBDIR}/"
+copy_file "${LIB_SO}" "${LIBDIR}/libmonerowalletcore.so"
 
 # Copy public header
-log "Installing walletcore.h -> ${INCLUDEDIR}/"
-copy_file "${HEADER}" "${INCLUDEDIR}/walletcore.h"
+log "Installing monerowalletcore.h -> ${INCLUDEDIR}/"
+copy_file "${HEADER}" "${INCLUDEDIR}/monerowalletcore.h"
 
 # Generate pkg-config file
-PC_PATH="${PKGCONFIGDIR}/walletcore.pc"
+PC_PATH="${PKGCONFIGDIR}/monerowalletcore.pc"
 log "Generating pkg-config: ${PC_PATH}"
 
 PC_CONTENT="$(cat <<EOF
@@ -218,10 +218,10 @@ prefix=${PREFIX}
 libdir=\${prefix}/lib
 includedir=\${prefix}/include
 
-Name: walletcore
+Name: monerowalletcore
 Description: Monero WalletCore FFI
 Version: ${VERSION}
-Libs: -L\${libdir} -lwalletcore
+Libs: -L\${libdir} -lmonerowalletcore
 Cflags: -I\${includedir}
 EOF
 )"
@@ -239,11 +239,11 @@ echo
 log "Install complete."
 echo "Next steps (optional):"
 echo "  • Update the shared library cache (if supported): sudo ldconfig"
-echo "  • Verify pkg-config: pkg-config --libs --cflags walletcore"
+echo "  • Verify pkg-config: pkg-config --libs --cflags monerowalletcore"
 echo
 echo "If your Swift package uses:"
-echo "  .systemLibrary(name: \"CLibMoneroWalletCore\", pkgConfig: \"walletcore\", providers: [...])"
-echo "Then SwiftPM should now be able to find and link libwalletcore on Linux."
+echo "  .systemLibrary(name: \"CLibMoneroWalletCore\", pkgConfig: \"monerowalletcore\", providers: [...])"
+echo "Then SwiftPM should now be able to find and link libmonerowalletcore on Linux."
 echo
 echo "Troubleshooting:"
 echo "  • If your compiler/linker can't find the library, ensure ${LIBDIR} is in your runtime loader path (e.g., /etc/ld.so.conf.d) and run ldconfig."

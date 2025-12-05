@@ -22,7 +22,7 @@
          .systemLibrary(
              name: "CLibMoneroWalletCore",
              path: "CLibMoneroWalletCore",
-             pkgConfig: "walletcore"
+             pkgConfig: "monerowalletcore"
          ),
 
          // Thin Swift wrapper that conditionally links to the appropriate low-level target

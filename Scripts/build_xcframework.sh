@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build_xcframework.sh
-# Build Apple static libraries for the Rust walletcore crate and package them into an .xcframework
+# Build Apple static libraries for the Rust monerowalletcore crate and package them into an .xcframework
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ RUSTUP_BIN="$(command -v rustup || true)"
 CARGO_BIN="$(command -v cargo || true)"
 
 # Header/modulemap
-HEADER_SRC="${REPO_ROOT}/CLibMoneroWalletCore/walletcore.h"
+HEADER_SRC="${REPO_ROOT}/CLibMoneroWalletCore/monerowalletcore.h"
 
 # Targets to build (adjust as needed)
 APPLE_TARGETS=(
@@ -73,13 +73,13 @@ ensure_targets() {
 
 build_target() {
   local triple="$1"
-  echo "• Building walletcore for ${triple} (${PROFILE})"
+  echo "• Building monerowalletcore for ${triple} (${PROFILE})"
   (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} --target "${triple}")
 }
 
 lib_path_for() {
   local triple="$1"
-  echo "${CRATE_DIR}/target/${triple}/${PROFILE}/libwalletcore.a"
+  echo "${CRATE_DIR}/target/${triple}/${PROFILE}/libmonerowalletcore.a"
 }
 
 prepare_headers_dir() {
@@ -87,14 +87,14 @@ prepare_headers_dir() {
   mkdir -p "${hdr_dir}" || die "failed to create headers dir ${hdr_dir}"
 
   # Copy the public header
-  cp -f "${HEADER_SRC}" "${hdr_dir}/walletcore.h" || die "failed to copy walletcore.h"
+  cp -f "${HEADER_SRC}" "${hdr_dir}/monerowalletcore.h" || die "failed to copy monerowalletcore.h"
 
   # Generate a module.modulemap so Swift can import the C module as 'MoneroWalletCore'
   cat > "${hdr_dir}/module.modulemap" <<'EOF'
 module MoneroWalletCore [system] {
-  header "walletcore.h"
+  header "monerowalletcore.h"
   export *
-  link "walletcore"
+  link "monerowalletcore"
 }
 EOF
 }
@@ -166,7 +166,7 @@ LIB_MAC_ARM64="$(lib_path_for aarch64-apple-darwin)"
 LIB_MAC_X86_64="$(lib_path_for x86_64-apple-darwin)"
 
 # Prepare a temporary headers folder
-TMPDIR="$(mktemp -d /tmp/walletcore.xc.XXXXXX)"
+TMPDIR="$(mktemp -d /tmp/monerowalletcore.xc.XXXXXX)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 HDRS="${TMPDIR}/Headers"
 prepare_headers_dir "${HDRS}"
@@ -180,7 +180,7 @@ if [[ -f "${LIB_IOS_ARM64}" ]]; then
 fi
 
 # iOS simulator: if both arm64 and x86_64 exist, lipo to a single universal; otherwise include whichever exists
-SIM_UNIV="${TMPDIR}/libwalletcore_ios_sim_universal.a"
+SIM_UNIV="${TMPDIR}/libmonerowalletcore_ios_sim_universal.a"
 if [[ -f "${LIB_IOS_SIM_ARM64}" && -f "${LIB_IOS_SIM_X86_64}" ]]; then
   echo "• Creating iOS simulator universal lib via lipo"
   lipo -create -output "${SIM_UNIV}" "${LIB_IOS_SIM_ARM64}" "${LIB_IOS_SIM_X86_64}"
@@ -194,7 +194,7 @@ else
 fi
 
 # macOS: combine arm64 + x86_64 into one universal lib
-MAC_UNIV="${TMPDIR}/libwalletcore_macos_universal.a"
+MAC_UNIV="${TMPDIR}/libmonerowalletcore_macos_universal.a"
 if [[ -f "${LIB_MAC_ARM64}" && -f "${LIB_MAC_X86_64}" ]]; then
   echo "• Creating macOS universal lib via lipo"
   lipo -create -output "${MAC_UNIV}" "${LIB_MAC_ARM64}" "${LIB_MAC_X86_64}"

@@ -114,7 +114,7 @@ jobs:
           ROOT="$PWD"
           CRATE_DIR="${CRATE_DIR}"
           OUT_DIR="${ROOT}/dist"
-          HEADER_SRC="${ROOT}/CLibMoneroWalletCore/walletcore.h"
+          HEADER_SRC="${ROOT}/CLibMoneroWalletCore/monerowalletcore.h"
           mkdir -p "${OUT_DIR}"
 
           # Extract version from Cargo.toml (optional)
@@ -135,31 +135,31 @@ jobs:
           libdir=\${prefix}/lib
           includedir=\${prefix}/include
 
-          Name: walletcore
+          Name: monerowalletcore
           Description: Monero WalletCore FFI
           Version: ${VERSION}
-          Libs: -L\${libdir} -lwalletcore
+          Libs: -L\${libdir} -lmonerowalletcore
           Cflags: -I\${includedir}
           EOF
           }
 
           # x86_64 bundle
-          X86_LIB="${CRATE_DIR}/target/x86_64-unknown-linux-gnu/release/libwalletcore.so"
-          X86_DIR="${OUT_DIR}/walletcore-linux-x86_64"
+          X86_LIB="${CRATE_DIR}/target/x86_64-unknown-linux-gnu/release/libmonerowalletcore.so"
+          X86_DIR="${OUT_DIR}/monerowalletcore-linux-x86_64"
           mkdir -p "${X86_DIR}"
-          cp -f "${X86_LIB}" "${X86_DIR}/libwalletcore.so"
-          cp -f "${HEADER_SRC}" "${X86_DIR}/walletcore.h"
-          pc_gen > "${X86_DIR}/walletcore.pc"
-          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/walletcore-linux-x86_64.tar.gz" "walletcore-linux-x86_64"
+          cp -f "${X86_LIB}" "${X86_DIR}/libmonerowalletcore.so"
+          cp -f "${HEADER_SRC}" "${X86_DIR}/monerowalletcore.h"
+          pc_gen > "${X86_DIR}/monerowalletcore.pc"
+          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/monerowalletcore-linux-x86_64.tar.gz" "monerowalletcore-linux-x86_64"
 
           # aarch64 bundle
-          ARM_LIB="${CRATE_DIR}/target/aarch64-unknown-linux-gnu/release/libwalletcore.so"
-          ARM_DIR="${OUT_DIR}/walletcore-linux-aarch64"
+          ARM_LIB="${CRATE_DIR}/target/aarch64-unknown-linux-gnu/release/libmonerowalletcore.so"
+          ARM_DIR="${OUT_DIR}/monerowalletcore-linux-aarch64"
           mkdir -p "${ARM_DIR}"
-          cp -f "${ARM_LIB}" "${ARM_DIR}/libwalletcore.so"
-          cp -f "${HEADER_SRC}" "${ARM_DIR}/walletcore.h"
-          pc_gen > "${ARM_DIR}/walletcore.pc"
-          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/walletcore-linux-aarch64.tar.gz" "walletcore-linux-aarch64"
+          cp -f "${ARM_LIB}" "${ARM_DIR}/libmonerowalletcore.so"
+          cp -f "${HEADER_SRC}" "${ARM_DIR}/monerowalletcore.h"
+          pc_gen > "${ARM_DIR}/monerowalletcore.pc"
+          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/monerowalletcore-linux-aarch64.tar.gz" "monerowalletcore-linux-aarch64"
 
           ls -lah "${OUT_DIR}"
         shell: bash
@@ -167,15 +167,15 @@ jobs:
       - name: Upload artifact (linux-x86_64)
         uses: actions/upload-artifact@v4
         with:
-          name: walletcore-linux-x86_64-${{ github.sha }}
-          path: dist/walletcore-linux-x86_64.tar.gz
+          name: monerowalletcore-linux-x86_64-${{ github.sha }}
+          path: dist/monerowalletcore-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 7
 
       - name: Upload artifact (linux-aarch64)
         uses: actions/upload-artifact@v4
         with:
-          name: walletcore-linux-aarch64-${{ github.sha }}
-          path: dist/walletcore-linux-aarch64.tar.gz
+          name: monerowalletcore-linux-aarch64-${{ github.sha }}
+          path: dist/monerowalletcore-linux-aarch64.tar.gz
           if-no-files-found: error
           retention-days: 7
