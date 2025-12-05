@@ -3,7 +3,7 @@
 A cross‑platform Swift Package that exposes a safe Swift wrapper around a Rust Monero wallet core via a stable C ABI.
 
 - Apple (iOS + macOS): ships a prebuilt `MoneroWalletCore.xcframework` (binary target) so clients do not need Rust.
-- Linux (Vapor): links against a system‑installed `libwalletcore.so` (via `pkg-config`), so servers do not need Rust at build time either.
+- Linux (Vapor): links against a system‑installed `libmonerowalletcore.so` (via `pkg-config monerowalletcore`), so servers do not need Rust at build time either.
 
 This README explains how to add the package with SwiftPM on Apple platforms and how to set up Linux so Vapor apps “just work.”
 
@@ -24,8 +24,8 @@ You have two ways to consume this package:
 - When you add the package, SPM uses that xcframework directly.
 
 2) Linux (Vapor) — System library (no Rust required)
-- The package declares a `systemLibrary` target `CLibMoneroWalletCore` that links against an installed `libwalletcore.so`.
-- At build time, SPM asks `pkg-config` for headers and link flags and links your app against `libwalletcore.so` already installed on the system.
+- The package declares a `systemLibrary` target `CLibMoneroWalletCore` that links against an installed `libmonerowalletcore.so`.
+- At build time, SPM asks `pkg-config` for headers and link flags and links your app against `libmonerowalletcore.so` already installed on the system.
 
 
 ### iOS/macOS (Xcode)
@@ -61,7 +61,7 @@ Replace `<you>/<repo>` and `repo-name` with your actual GitHub org/repo and pack
 
 ## Linux (Vapor) setup
 
-SwiftPM on Linux will not download or build the Rust library for you. It expects a system‑installed `libwalletcore.so` and header, found via `pkg-config walletcore`.
+SwiftPM on Linux will not download or build the Rust library for you. It expects a system‑installed `libmonerowalletcore.so` and header, found via `pkg-config monerowalletcore`.
 
 You have two convenient options:
 
@@ -86,20 +86,20 @@ Steps:
 
 3. Verify:
    ```
-   pkg-config --libs --cflags walletcore
-   # Should print something like: -I/usr/local/include -L/usr/local/lib -lwalletcore
+   pkg-config --libs --cflags monerowalletcore
+   # Should print something like: -I/usr/local/include -L/usr/local/lib -lmonerowalletcore
    ```
 
 4. Build your Vapor app that depends on `MoneroWalletCoreFFI`. SwiftPM will find the library via `pkg-config`.
 
 B) Bake into your Docker image
-- Run the same install script in your Dockerfile (or copy the .so and header to `/usr/local` and write a minimal `walletcore.pc`).
+- Run the same install script in your Dockerfile (or copy the .so and header to `/usr/local` and write a minimal `monerowalletcore.pc`).
 - Example sketch:
    ```
    FROM swift:5.9-amazonlinux2
 
    # Install build tools as needed…
-   # Build & install libwalletcore.so
+   # Build & install libmonerowalletcore.so
    COPY MoneroWalletCoreFFI /opt/MoneroWalletCoreFFI
    RUN cd /opt/MoneroWalletCoreFFI/monero-oxide-output && \
        cargo build --release --target x86_64-unknown-linux-gnu && \
@@ -117,9 +117,9 @@ After this, any Vapor app that adds `MoneroWalletCoreFFI` via SPM will compile a
 
 - On Apple, SPM uses the xcframework committed in this package — seamless.
 - On Linux, SPM’s `systemLibrary` requires the `.so` to be present on the build system. SPM does not fetch `.so` binaries the way it does xcframeworks.
-- The closest to “automatic” on Linux is to bake `libwalletcore.so` (and `walletcore.pc`) into your Docker base image (or AMI), so builds don’t need extra steps. That’s why we provide `Scripts/install_linux.sh`.
+- The closest to “automatic” on Linux is to bake `libmonerowalletcore.so` (and `monerowalletcore.pc`) into your Docker base image (or AMI), so builds don’t need extra steps. That’s why we provide `Scripts/install_linux.sh`.
 
-If you really want to ship `libwalletcore.so` alongside your app (without system install), you still need at build time:
+If you really want to ship `libmonerowalletcore.so` alongside your app (without system install), you still need at build time:
 - Headers and `pkg-config` metadata (or custom SwiftPM flags) so SPM can find and link to the .so.
 - At runtime, you must ensure the loader can find the library (via `LD_LIBRARY_PATH` or `ldconfig` or rpath).
 This approach is more fragile; system install (or a base image with the library pre-installed) is cleaner.
@@ -201,7 +201,7 @@ let address = try WalletCoreFFIClient.deriveAddressFromSeed(
 - `Scripts/build_xcframework.sh`
   - Builds Apple static libs across supported Apple triples and packages `Artifacts/MoneroWalletCore.xcframework`.
 - `Scripts/install_linux.sh`
-  - Installs `libwalletcore.so`, `walletcore.h`, and `walletcore.pc` to a prefix (default `/usr/local`), and can be used in Docker/CI.
+  - Installs `libmonerowalletcore.so`, `monerowalletcore.h`, and `monerowalletcore.pc` to a prefix (default `/usr/local`), and can be used in Docker/CI.
 
 These scripts let you generate/update artifacts without manual Xcode/Rust setup on consumer machines.
 
@@ -214,15 +214,15 @@ These scripts let you generate/update artifacts without manual Xcode/Rust setup 
 
 ## Troubleshooting
 
-- “pkg-config: walletcore not found” (Linux)
-  - Ensure you ran `./Scripts/install_linux.sh` (or installed the library and `walletcore.pc` yourself).
-  - Verify: `pkg-config --libs --cflags walletcore`
+- “pkg-config: monerowalletcore not found” (Linux)
+  - Ensure you ran `./Scripts/install_linux.sh` (or installed the library and `monerowalletcore.pc` yourself).
+  - Verify: `pkg-config --libs --cflags monerowalletcore`
   - If installing to a nonstandard prefix, set `PKG_CONFIG_PATH=/your/prefix/lib/pkgconfig`.
 
-- “cannot find -lwalletcore” at link time (Linux)
+- “cannot find -lmonerowalletcore” at link time (Linux)
   - Make sure the `.so` was installed to a directory known to the linker (e.g., `/usr/local/lib`) and that `pkg-config` emits `-L` pointing there.
 
-- “error while loading shared libraries: libwalletcore.so” at runtime (Linux)
+- “error while loading shared libraries: libmonerowalletcore.so” at runtime (Linux)
   - Ensure the runtime loader can find it: `sudo ldconfig`, or set `LD_LIBRARY_PATH=/usr/local/lib` (or your prefix).
 
 - iOS/mac: “No such module MoneroWalletCoreFFI”

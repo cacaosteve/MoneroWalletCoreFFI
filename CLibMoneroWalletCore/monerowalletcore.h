@@ -1,7 +1,7 @@
 /*
- * walletcore.h
+ * monerowalletcore.h
  *
- * C ABI for the WalletCore Rust library (generated to match Rust cdylib/staticlib).
+ * C ABI for the MoneroWalletCore Rust library (generated to match Rust cdylib/staticlib).
  * All function signatures are aligned with the Rust declarations (usize -> size_t).
  *
  * Ownership notes:
@@ -11,8 +11,8 @@
  *   human-readable string that should also be freed with walletcore_free_cstr().
  */
 
-#ifndef WALLETCORE_H
-#define WALLETCORE_H
+#ifndef MONEROWALLETCORE_H
+#define MONEROWALLETCORE_H
 
 #ifdef __cplusplus
 #  define WALLETCORE_EXTERN_C_BEGIN extern "C" {
@@ -35,7 +35,7 @@ char* walletcore_version(void);
 /* Returns the last error message as a newly-allocated string, or NULL if none; free with walletcore_free_cstr. */
 char* walletcore_last_error_message(void);
 
-/* Frees a C string returned by WalletCore; returns 0 on success. No-op if ptr is NULL. */
+/* Frees a C string returned by MoneroWalletCore; returns 0 on success. No-op if ptr is NULL. */
 int32_t walletcore_free_cstr(char* ptr);
 
 
@@ -204,4 +204,4 @@ char* wallet_preview_fee_with_filter(
 
 WALLETCORE_EXTERN_C_END
 
-#endif /* WALLETCORE_H */
+#endif /* MONEROWALLETCORE_H */
