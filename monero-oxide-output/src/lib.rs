@@ -6,12 +6,14 @@ use std::{
     io::Read,
     os::raw::{c_char, c_int},
     ptr, slice,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, TryRecvError},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
+};
+
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc::{self, TryRecvError},
 };
 
 use bincode;
@@ -34,16 +36,14 @@ use rand::{rngs::OsRng, RngCore};
 
 use ureq::serde_json;
 use zeroize::Zeroizing;
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 use zmq;
-
-#[cfg(target_os = "ios")]
-#[link(name = "c++")]
-extern "C" {}
 
 const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 static ZMQ_RUNTIME: Lazy<Mutex<Option<ZmqRuntime>>> = Lazy::new(|| Mutex::new(None));
 
 fn set_last_error<S: Into<String>>(message: S) {
@@ -84,6 +84,7 @@ struct MasterKeys {
     view_scalar_ed: EdScalar,
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 struct ZmqRuntime {
     endpoint: String,
     sequence: Arc<AtomicU64>,
@@ -92,6 +93,7 @@ struct ZmqRuntime {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 fn stop_zmq_runtime() {
     let runtime_opt = {
         let mut slot = ZMQ_RUNTIME.lock().expect("ZMQ runtime lock poisoned");
@@ -106,6 +108,7 @@ fn stop_zmq_runtime() {
     }
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 fn ensure_zmq_runtime(endpoint: &str) -> Result<Arc<AtomicU64>, (c_int, String)> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
@@ -975,6 +978,7 @@ impl PersistedWallet {
 static WALLET_STORE: Lazy<Mutex<HashMap<String, StoredWallet>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_start_zmq_listener(endpoint: *const c_char) -> c_int {
     clear_last_error();
@@ -999,6 +1003,7 @@ pub extern "C" fn wallet_start_zmq_listener(endpoint: *const c_char) -> c_int {
     }
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
     clear_last_error();
@@ -1006,6 +1011,13 @@ pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
     0
 }
 
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+#[no_mangle]
+pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
+    0
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
     clear_last_error();
@@ -1028,6 +1040,23 @@ pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
     }
     let value = sequence.load(Ordering::Relaxed);
     unsafe { *out_sequence = value };
+    0
+}
+
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+#[no_mangle]
+pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
+    clear_last_error();
+    if !out_sequence.is_null() {
+        unsafe { *out_sequence = 0 };
+    }
+    0
+}
+
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+#[no_mangle]
+pub extern "C" fn wallet_start_zmq_listener(_endpoint: *const c_char) -> c_int {
+    clear_last_error();
     0
 }
 
