@@ -36,6 +36,10 @@ use ureq::serde_json;
 use zeroize::Zeroizing;
 use zmq;
 
+#[cfg(target_os = "ios")]
+#[link(name = "c++")]
+extern "C" {}
+
 const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
 
