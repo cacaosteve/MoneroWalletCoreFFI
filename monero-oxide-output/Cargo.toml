@@ -7,6 +7,8 @@ edition = "2021"
 name = "monerowalletcore"
 crate-type = ["cdylib", "staticlib"]
 
+
+
 [dependencies]
 monero-wallet = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-wallet", features = ["std"] }
 monero-seed = { git = "https://github.com/monero-oxide/monero-wallet-util", package = "monero-seed", features = ["std"] }
@@ -26,6 +28,10 @@ zmq = "0.10"
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+[package.metadata.cargo-xcode]
+link = ["stdc++", "zstd"]
+additional_libraries = ["c++"]
 
 [profile.release]
 overflow-checks = true
