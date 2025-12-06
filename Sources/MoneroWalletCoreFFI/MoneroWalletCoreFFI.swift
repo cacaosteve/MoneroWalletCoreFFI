@@ -98,6 +98,20 @@ public enum WalletCoreFFIClient {
         public let fee: UInt64
     }
 
+    public struct SyncStatus: Equatable {
+        public let chainHeight: UInt64
+        public let chainTime: UInt64
+        public let lastScanned: UInt64
+        public let restoreHeight: UInt64
+
+        public init(chainHeight: UInt64, chainTime: UInt64, lastScanned: UInt64, restoreHeight: UInt64) {
+            self.chainHeight = chainHeight
+            self.chainTime = chainTime
+            self.lastScanned = lastScanned
+            self.restoreHeight = restoreHeight
+        }
+    }
+
     // MARK: - Public API
 
     /// Returns the linked WalletCore version string.
@@ -143,6 +157,35 @@ public enum WalletCoreFFIClient {
 #endif
     }
 
+    public static func startZmqListener(endpoint: String) throws {
+#if canImport(CLibMoneroWalletCore)
+        let rc = endpoint.withCString { cEndpoint in
+            wallet_start_zmq_listener(cEndpoint)
+        }
+        try checkRC(rc, context: "wallet_start_zmq_listener")
+#else
+        _ = endpoint
+#endif
+    }
+
+    public static func stopZmqListener() throws {
+#if canImport(CLibMoneroWalletCore)
+        let rc = wallet_stop_zmq_listener()
+        try checkRC(rc, context: "wallet_stop_zmq_listener")
+#endif
+    }
+
+    public static func zmqSequence() throws -> UInt64 {
+#if canImport(CLibMoneroWalletCore)
+        var value: UInt64 = 0
+        let rc = wallet_zmq_sequence(&value)
+        try checkRC(rc, context: "wallet_zmq_sequence")
+        return value
+#else
+        return 0
+#endif
+    }
+
     /// Refresh the wallet against the daemon (nodeURL). Returns the last scanned height.
     public static func refreshWallet(
         walletId: String,
@@ -160,6 +203,26 @@ public enum WalletCoreFFIClient {
         }
         try checkRC(rc, context: "wallet_refresh")
         return lastScanned
+    }
+
+    /// Retrieve sync status values cached on the core for this wallet.
+    public static func syncStatus(
+        walletId: String
+    ) throws -> SyncStatus {
+        var chainHeight: UInt64 = 0
+        var chainTime: UInt64 = 0
+        var lastScanned: UInt64 = 0
+        var restoreHeight: UInt64 = 0
+        let rc: Int32 = walletId.withCString { cId in
+            wallet_sync_status(cId, &chainHeight, &chainTime, &lastScanned, &restoreHeight)
+        }
+        try checkRC(rc, context: "wallet_sync_status")
+        return SyncStatus(
+            chainHeight: chainHeight,
+            chainTime: chainTime,
+            lastScanned: lastScanned,
+            restoreHeight: restoreHeight
+        )
     }
 
     /// Get total and unlocked balances (piconero).

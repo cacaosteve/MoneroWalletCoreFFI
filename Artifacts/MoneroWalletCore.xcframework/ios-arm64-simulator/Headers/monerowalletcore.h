@@ -130,6 +130,19 @@ int32_t wallet_set_gap_limit(
     uint32_t gap_limit
 );
 
+/* Start a background ZMQ listener for block notifications. */
+int32_t wallet_start_zmq_listener(
+    const char* endpoint
+);
+
+/* Stop the active ZMQ listener, if any. */
+int32_t wallet_stop_zmq_listener(void);
+
+/* Read the most recent ZMQ notification sequence height. */
+int32_t wallet_zmq_sequence(
+    uint64_t* out_sequence
+);
+
 /*
  * Refresh the wallet against the daemon (node_url). On success, writes last_scanned height.
  * node_url may be NULL to use a default (env/localhost).
@@ -138,6 +151,19 @@ int32_t wallet_refresh(
     const char* wallet_id,
     const char* node_url,
     uint64_t* out_last_scanned
+);
+
+/*
+ * Retrieve current sync status for a wallet.
+ * Returns chain height/time, last scanned height, and restore height.
+ * Any output pointer may be NULL if the caller is not interested in that value.
+ */
+int32_t wallet_sync_status(
+    const char* wallet_id,
+    uint64_t* out_chain_height,
+    uint64_t* out_chain_time,
+    uint64_t* out_last_scanned,
+    uint64_t* out_restore_height
 );
 
 /* Get total and unlocked balances (piconero) for wallet_id. */
