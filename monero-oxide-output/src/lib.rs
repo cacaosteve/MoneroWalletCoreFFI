@@ -6,7 +6,11 @@ use std::{
     io::Read,
     os::raw::{c_char, c_int},
     ptr, slice,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, TryRecvError},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -26,15 +30,17 @@ use monero_wallet::{
 use serde::{Deserialize, Serialize};
 // Keccak256 is used via EdScalar::hash(), no direct import needed
 use once_cell::sync::Lazy;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
+
 use ureq::serde_json;
 use zeroize::Zeroizing;
+use zmq;
 
 const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static ZMQ_RUNTIME: Lazy<Mutex<Option<ZmqRuntime>>> = Lazy::new(|| Mutex::new(None));
 
 fn set_last_error<S: Into<String>>(message: S) {
     if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
@@ -72,6 +78,145 @@ struct MasterKeys {
     spend_scalar: curve25519_dalek::Scalar,
     view_scalar_dalek: curve25519_dalek::Scalar,
     view_scalar_ed: EdScalar,
+}
+
+struct ZmqRuntime {
+    endpoint: String,
+    sequence: Arc<AtomicU64>,
+    error: Arc<Mutex<Option<String>>>,
+    stop_tx: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn stop_zmq_runtime() {
+    let runtime_opt = {
+        let mut slot = ZMQ_RUNTIME.lock().expect("ZMQ runtime lock poisoned");
+        slot.take()
+    };
+
+    if let Some(mut runtime) = runtime_opt {
+        let _ = runtime.stop_tx.send(());
+        if let Some(handle) = runtime.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn ensure_zmq_runtime(endpoint: &str) -> Result<Arc<AtomicU64>, (c_int, String)> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        stop_zmq_runtime();
+        return Err((
+            -14,
+            "wallet_start_zmq_listener: endpoint is empty".to_string(),
+        ));
+    }
+
+    {
+        let slot = ZMQ_RUNTIME.lock().expect("ZMQ runtime lock poisoned");
+        if let Some(runtime) = slot.as_ref() {
+            if runtime.endpoint == trimmed {
+                if let Ok(message) = runtime.error.lock() {
+                    if let Some(message) = message.clone() {
+                        return Err((-16, message));
+                    }
+                }
+                return Ok(runtime.sequence.clone());
+            }
+        }
+    }
+
+    stop_zmq_runtime();
+
+    let sequence = Arc::new(AtomicU64::new(0));
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let endpoint_owned = trimmed.to_string();
+    let endpoint_for_thread = endpoint_owned.clone();
+    let sequence_clone = sequence.clone();
+    let error_slot = Arc::new(Mutex::new(None));
+    let error_slot_clone = error_slot.clone();
+
+    let handle = std::thread::spawn(move || {
+        let endpoint = endpoint_for_thread;
+        let context = zmq::Context::new();
+        let socket = match context.socket(zmq::SUB) {
+            Ok(sock) => sock,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!("socket init failed: {err}")));
+                return;
+            }
+        };
+
+        if let Err(err) = socket.connect(&endpoint) {
+            let _ = ready_tx.send(Err(format!("connect failed: {err}")));
+            return;
+        }
+        if let Err(err) = socket.set_subscribe(b"") {
+            let _ = ready_tx.send(Err(format!("subscribe failed: {err}")));
+            return;
+        }
+
+        let _ = ready_tx.send(Ok(()));
+        loop {
+            match stop_rx.try_recv() {
+                Ok(_) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            match socket.recv_multipart(zmq::DONTWAIT) {
+                Ok(frames) => {
+                    if let Some(last) = frames.last() {
+                        if let Ok(text) = std::str::from_utf8(last) {
+                            if let Some(token) = text.split_whitespace().next() {
+                                if let Ok(height) = token.parse::<u64>() {
+                                    sequence_clone.store(height, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    sequence_clone.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => {
+                    let message = format!("wallet_zmq_listener: recv failed ({err})");
+                    if let Ok(mut slot) = error_slot_clone.lock() {
+                        *slot = Some(message.clone());
+                    }
+                    set_last_error(message);
+                    break;
+                }
+            }
+        }
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {
+            let runtime = ZmqRuntime {
+                endpoint: endpoint_owned,
+                sequence: sequence.clone(),
+                error: error_slot,
+                stop_tx,
+                thread: Some(handle),
+            };
+            let mut slot = ZMQ_RUNTIME.lock().expect("ZMQ runtime lock poisoned");
+            *slot = Some(runtime);
+            Ok(sequence)
+        }
+        Ok(Err(message)) => {
+            let _ = stop_tx.send(());
+            let _ = handle.join();
+            Err((-15, message))
+        }
+        Err(_) => {
+            let _ = stop_tx.send(());
+            let _ = handle.join();
+            Err((-15, "timed out waiting for ZMQ subscriber".to_string()))
+        }
+    }
 }
 
 impl MasterKeys {
@@ -826,6 +971,62 @@ impl PersistedWallet {
 static WALLET_STORE: Lazy<Mutex<HashMap<String, StoredWallet>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[no_mangle]
+pub extern "C" fn wallet_start_zmq_listener(endpoint: *const c_char) -> c_int {
+    clear_last_error();
+    if endpoint.is_null() {
+        return record_error(-11, "wallet_start_zmq_listener: endpoint pointer was null");
+    }
+    let endpoint_str = match unsafe { CStr::from_ptr(endpoint) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_start_zmq_listener: endpoint contained invalid UTF-8",
+            );
+        }
+    };
+    match ensure_zmq_runtime(endpoint_str) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err((code, message)) => record_error(code, message),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
+    clear_last_error();
+    stop_zmq_runtime();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
+    clear_last_error();
+    if out_sequence.is_null() {
+        return record_error(-11, "wallet_zmq_sequence: out_sequence pointer was null");
+    }
+    let (sequence, error_slot) = {
+        let slot = ZMQ_RUNTIME.lock().expect("ZMQ runtime lock poisoned");
+        match slot.as_ref() {
+            Some(runtime) => (runtime.sequence.clone(), runtime.error.clone()),
+            None => {
+                return record_error(-13, "wallet_zmq_sequence: ZMQ listener not started");
+            }
+        }
+    };
+    if let Ok(message) = error_slot.lock() {
+        if let Some(message) = message.clone() {
+            return record_error(-16, message);
+        }
+    }
+    let value = sequence.load(Ordering::Relaxed);
+    unsafe { *out_sequence = value };
+    0
+}
+
 /// Open (or register) a wallet from a 25-word mnemonic and initial restore height.
 /// Stores basic state in-memory for subsequent refresh/balance calls.
 /// Returns:
@@ -1300,6 +1501,56 @@ pub extern "C" fn wallet_refresh(
         }
     }
     clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_sync_status(
+    wallet_id: *const c_char,
+    out_chain_height: *mut u64,
+    out_chain_time: *mut u64,
+    out_last_scanned: *mut u64,
+    out_restore_height: *mut u64,
+) -> c_int {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        return record_error(-11, "wallet_sync_status: wallet_id pointer was null");
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(-10, "wallet_sync_status: wallet_id contained invalid UTF-8")
+        }
+    };
+
+    let map = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(state) = map.get(id) else {
+        return record_error(-13, format!("wallet_sync_status: wallet '{id}' not opened"));
+    };
+
+    if !out_chain_height.is_null() {
+        unsafe {
+            *out_chain_height = state.chain_height;
+        }
+    }
+    if !out_chain_time.is_null() {
+        unsafe {
+            *out_chain_time = state.chain_time;
+        }
+    }
+    if !out_last_scanned.is_null() {
+        unsafe {
+            *out_last_scanned = state.last_scanned;
+        }
+    }
+    if !out_restore_height.is_null() {
+        unsafe {
+            *out_restore_height = state.restore_height;
+        }
+    }
+
     0
 }
 
