@@ -101,12 +101,14 @@ public enum WalletCoreFFIClient {
     public struct SyncStatus: Equatable {
         public let chainHeight: UInt64
         public let chainTime: UInt64
+        public let lastRefreshTimestamp: UInt64
         public let lastScanned: UInt64
         public let restoreHeight: UInt64
 
-        public init(chainHeight: UInt64, chainTime: UInt64, lastScanned: UInt64, restoreHeight: UInt64) {
+        public init(chainHeight: UInt64, chainTime: UInt64, lastRefreshTimestamp: UInt64, lastScanned: UInt64, restoreHeight: UInt64) {
             self.chainHeight = chainHeight
             self.chainTime = chainTime
+            self.lastRefreshTimestamp = lastRefreshTimestamp
             self.lastScanned = lastScanned
             self.restoreHeight = restoreHeight
         }
@@ -228,15 +230,17 @@ public enum WalletCoreFFIClient {
     ) throws -> SyncStatus {
         var chainHeight: UInt64 = 0
         var chainTime: UInt64 = 0
+        var lastRefreshTimestamp: UInt64 = 0
         var lastScanned: UInt64 = 0
         var restoreHeight: UInt64 = 0
         let rc: Int32 = walletId.withCString { cId in
-            wallet_sync_status(cId, &chainHeight, &chainTime, &lastScanned, &restoreHeight)
+            wallet_sync_status(cId, &chainHeight, &chainTime, &lastRefreshTimestamp, &lastScanned, &restoreHeight)
         }
         try checkRC(rc, context: "wallet_sync_status")
         return SyncStatus(
             chainHeight: chainHeight,
             chainTime: chainTime,
+            lastRefreshTimestamp: lastRefreshTimestamp,
             lastScanned: lastScanned,
             restoreHeight: restoreHeight
         )

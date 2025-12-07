@@ -76,6 +76,9 @@ fn update_scan_progress(
             state.last_scanned = normalized_scanned;
             state.chain_height = chain_height;
             state.chain_time = chain_time;
+            if chain_time > 0 {
+                state.last_refresh_timestamp = chain_time;
+            }
         }
     }
 }
@@ -836,6 +839,7 @@ struct StoredWallet {
     unlocked: u64,
     chain_height: u64,
     chain_time: u64,
+    last_refresh_timestamp: u64,
     gap_limit: u32,
     tracked_outputs: Vec<TrackedOutput>,
     seen_outpoints: HashSet<([u8; 32], u64)>,
@@ -1149,6 +1153,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
                 unlocked: 0,
                 chain_height: restore_height,
                 chain_time: 0,
+                last_refresh_timestamp: 0,
                 gap_limit: 50,
                 tracked_outputs: Vec::new(),
                 seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
@@ -1562,6 +1567,9 @@ pub extern "C" fn wallet_refresh(
         state.unlocked = unlocked;
         state.chain_height = daemon.height;
         state.chain_time = daemon.top_block_timestamp;
+        if daemon.top_block_timestamp > 0 {
+            state.last_refresh_timestamp = daemon.top_block_timestamp;
+        }
         state.tracked_outputs = working_outputs;
         state.seen_outpoints = seen_outpoints;
     }
@@ -1643,6 +1651,7 @@ pub extern "C" fn wallet_sync_status(
     wallet_id: *const c_char,
     out_chain_height: *mut u64,
     out_chain_time: *mut u64,
+    out_last_refresh_timestamp: *mut u64,
     out_last_scanned: *mut u64,
     out_restore_height: *mut u64,
 ) -> c_int {
@@ -1672,6 +1681,11 @@ pub extern "C" fn wallet_sync_status(
     if !out_chain_time.is_null() {
         unsafe {
             *out_chain_time = state.chain_time;
+        }
+    }
+    if !out_last_refresh_timestamp.is_null() {
+        unsafe {
+            *out_last_refresh_timestamp = state.last_refresh_timestamp;
         }
     }
     if !out_last_scanned.is_null() {
