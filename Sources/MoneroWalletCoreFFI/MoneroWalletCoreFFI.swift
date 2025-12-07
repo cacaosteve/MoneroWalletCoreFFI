@@ -205,6 +205,23 @@ public enum WalletCoreFFIClient {
         return lastScanned
     }
 
+    /// Kick off a wallet refresh on a background worker without blocking the caller.
+    public static func refreshWalletAsync(
+        walletId: String,
+        nodeURL: String? = nil
+    ) throws {
+        let rc: Int32 = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    wallet_refresh_async(cId, cNode)
+                }
+            } else {
+                return wallet_refresh_async(cId, nil)
+            }
+        }
+        try checkRC(rc, context: "wallet_refresh_async")
+    }
+
     /// Retrieve sync status values cached on the core for this wallet.
     public static func syncStatus(
         walletId: String

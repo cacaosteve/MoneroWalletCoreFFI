@@ -153,6 +153,11 @@ int32_t wallet_refresh(
     uint64_t* out_last_scanned
 );
 
+int32_t wallet_refresh_async(
+    const char* wallet_id,
+    const char* node_url
+);
+
 /*
  * Retrieve current sync status for a wallet.
  * Returns chain height/time, last scanned height, and restore height.

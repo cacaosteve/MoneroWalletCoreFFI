@@ -1576,6 +1576,69 @@ pub extern "C" fn wallet_refresh(
 }
 
 #[no_mangle]
+pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *const c_char) -> c_int {
+    clear_last_error();
+    if wallet_id.is_null() {
+        return record_error(-11, "wallet_refresh_async: wallet_id pointer was null");
+    }
+
+    let id_str = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_refresh_async: wallet_id contained invalid UTF-8",
+            )
+        }
+    };
+
+    if id_str.is_empty() {
+        return record_error(-10, "wallet_refresh_async: wallet_id was empty");
+    }
+
+    let id_owned = id_str.to_string();
+
+    let node_owned = if node_url.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(node_url) }.to_str() {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(_) => {
+                return record_error(
+                    -10,
+                    "wallet_refresh_async: node_url contained invalid UTF-8",
+                )
+            }
+        }
+    };
+
+    std::thread::spawn(move || {
+        if let Ok(wallet_cstr) = CString::new(id_owned) {
+            let node_cstr = node_owned.and_then(|url| CString::new(url).ok());
+            let mut last_scanned: u64 = 0;
+            let node_ptr = node_cstr
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null::<c_char>());
+            let _ = wallet_refresh(
+                wallet_cstr.as_ptr(),
+                node_ptr,
+                &mut last_scanned as *mut u64,
+            );
+        }
+    });
+
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn wallet_sync_status(
     wallet_id: *const c_char,
     out_chain_height: *mut u64,
