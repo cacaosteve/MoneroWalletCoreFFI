@@ -167,6 +167,7 @@ int32_t wallet_sync_status(
     const char* wallet_id,
     uint64_t* out_chain_height,
     uint64_t* out_chain_time,
+    uint64_t* out_last_refresh_timestamp,
     uint64_t* out_last_scanned,
     uint64_t* out_restore_height
 );
