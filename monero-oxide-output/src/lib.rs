@@ -1803,6 +1803,57 @@ pub extern "C" fn wallet_get_balance(
 }
 
 #[no_mangle]
+pub extern "C" fn wallet_force_rescan_from_height(
+    wallet_id: *const c_char,
+    new_restore_height: u64,
+) -> c_int {
+    clear_last_error();
+    if wallet_id.is_null() {
+        return record_error(
+            -11,
+            "wallet_force_rescan_from_height: wallet_id pointer was null",
+        );
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_force_rescan_from_height: wallet_id contained invalid UTF-8",
+            );
+        }
+    };
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    match map.get_mut(id) {
+        Some(state) => {
+            // Reset scanning window to the requested restore height
+            state.restore_height = new_restore_height;
+            state.last_scanned = new_restore_height;
+
+            // Clear balances; they will be recomputed on next refresh
+            state.total = 0;
+            state.unlocked = 0;
+
+            // Normalize chain markers; keep at least restore height
+            state.chain_height = state.chain_height.max(new_restore_height);
+            state.chain_time = 0;
+            state.last_refresh_timestamp = 0;
+
+            // Drop tracked outputs and seen outpoints to force a clean rescan
+            state.tracked_outputs.clear();
+            state.seen_outpoints.clear();
+
+            clear_last_error();
+            0
+        }
+        None => record_error(
+            -13,
+            format!("wallet_force_rescan_from_height: wallet '{id}' not opened"),
+        ),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn wallet_import_cache(
     wallet_id: *const c_char,
     cache_ptr: *const u8,
