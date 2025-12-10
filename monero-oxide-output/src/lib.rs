@@ -1329,6 +1329,15 @@ pub extern "C" fn wallet_refresh(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(200);
+    // Bulk mode: allow each worker to scan a small span of consecutive heights
+    let bulk: bool = std::env::var("WALLETCORE_BULK_RPC")
+        .ok()
+        .map(|s| s != "0")
+        .unwrap_or(false);
+    let worker_blocks: usize = std::env::var("WALLETCORE_WORKER_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8);
 
     if scan_cursor < daemon.height {
         if par > 1 && batch > 1 {
@@ -1342,7 +1351,13 @@ pub extern "C" fn wallet_refresh(
                         end
                     }
                 };
-                let heights: Vec<u64> = (scan_cursor..end_exclusive).collect();
+                let heights: Vec<u64> = if bulk {
+                    (scan_cursor..end_exclusive)
+                        .step_by(worker_blocks.max(1))
+                        .collect()
+                } else {
+                    (scan_cursor..end_exclusive).collect()
+                };
                 let _count = heights.len();
 
                 let (tx, rx) =
@@ -1355,6 +1370,10 @@ pub extern "C" fn wallet_refresh(
                         let client = rpc_client.clone();
                         let vp = view_pair.clone();
                         let local_gap = gap_limit;
+                        // Capture bulk parameters for this worker
+                        let end_ex = end_exclusive;
+                        let bulk_mode = bulk;
+                        let worker_span = worker_blocks as u64;
                         std::thread::spawn(move || {
                             // Local scanner per worker
                             let mut local_scanner = Scanner::new(vp);
@@ -1367,65 +1386,77 @@ pub extern "C" fn wallet_refresh(
                                 }
                             }
 
-                            let block_number = match usize::try_from(h) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    let _ = txc.send(Err((
-                                        -16,
-                                        "wallet_refresh: block number conversion overflow"
-                                            .to_string(),
-                                    )));
-                                    return;
-                                }
+                            // Determine span for this worker
+                            let start_height = h;
+                            let end_height_exclusive = if bulk_mode {
+                                start_height.saturating_add(worker_span).min(end_ex)
+                            } else {
+                                start_height.saturating_add(1)
                             };
 
-                            let scannable = match block_on(
-                                client.get_scannable_block_by_number(block_number),
-                            ) {
-                                Ok(block) => block,
-                                Err(err) => {
-                                    let code = map_rpc_error(err);
-                                    let _ = txc.send(Err((
-                                        code,
-                                        format!(
-                                            "wallet_refresh: RPC block fetch failed at height {}",
-                                            h
-                                        ),
-                                    )));
-                                    return;
-                                }
-                            };
+                            let mut collected: Vec<TrackedOutput> = Vec::new();
+                            for th in start_height..end_height_exclusive {
+                                let block_number = match usize::try_from(th) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            "wallet_refresh: block number conversion overflow"
+                                                .to_string(),
+                                        )));
+                                        return;
+                                    }
+                                };
 
-                            let miner_hash = scannable.block.miner_transaction().hash();
-                            let outputs = match local_scanner.scan(scannable) {
-                                Ok(result) => result.ignore_additional_timelock(),
-                                Err(_) => {
-                                    let _ = txc.send(Err((
-                                        -16,
-                                        format!("wallet_refresh: scanner failed at height {}", h),
-                                    )));
-                                    return;
-                                }
-                            };
+                                let scannable = match block_on(
+                                    client.get_scannable_block_by_number(block_number),
+                                ) {
+                                    Ok(block) => block,
+                                    Err(err) => {
+                                        let code = map_rpc_error(err);
+                                        let _ = txc.send(Err((
+                                            code,
+                                            format!(
+                                                "wallet_refresh: RPC block fetch failed at height {}",
+                                                th
+                                            ),
+                                        )));
+                                        return;
+                                    }
+                                };
 
-                            let mut collected: Vec<TrackedOutput> =
-                                Vec::with_capacity(outputs.len());
-                            for output in outputs {
-                                let (major, minor) = output
-                                    .subaddress()
-                                    .map(|idx| (idx.account(), idx.address()))
-                                    .unwrap_or((0, 0));
-                                collected.push(TrackedOutput {
-                                    tx_hash: output.transaction(),
-                                    index_in_tx: output.index_in_transaction(),
-                                    amount: output.commitment().amount,
-                                    block_height: h,
-                                    additional_timelock: output.additional_timelock(),
-                                    is_coinbase: output.transaction() == miner_hash,
-                                    subaddress_major: major,
-                                    subaddress_minor: minor,
-                                    spent: false,
-                                });
+                                let miner_hash = scannable.block.miner_transaction().hash();
+                                let outputs = match local_scanner.scan(scannable) {
+                                    Ok(result) => result.ignore_additional_timelock(),
+                                    Err(_) => {
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            format!(
+                                                "wallet_refresh: scanner failed at height {}",
+                                                th
+                                            ),
+                                        )));
+                                        return;
+                                    }
+                                };
+
+                                for output in outputs {
+                                    let (major, minor) = output
+                                        .subaddress()
+                                        .map(|idx| (idx.account(), idx.address()))
+                                        .unwrap_or((0, 0));
+                                    collected.push(TrackedOutput {
+                                        tx_hash: output.transaction(),
+                                        index_in_tx: output.index_in_transaction(),
+                                        amount: output.commitment().amount,
+                                        block_height: th,
+                                        additional_timelock: output.additional_timelock(),
+                                        is_coinbase: output.transaction() == miner_hash,
+                                        subaddress_major: major,
+                                        subaddress_minor: minor,
+                                        spent: false,
+                                    });
+                                }
                             }
 
                             let _ = txc.send(Ok(collected));
@@ -1469,6 +1500,19 @@ pub extern "C" fn wallet_refresh(
                                 );
                             }
                         }
+                    }
+
+                    // Update progress after draining this chunk to reduce perceived stalls
+                    if let Some(&chunk_last_height) = chunk.last() {
+                        let next_cursor = chunk_last_height.saturating_add(1).min(daemon.height);
+                        scan_cursor = next_cursor;
+                        update_scan_progress(
+                            id,
+                            scan_cursor.min(daemon.height),
+                            daemon.height,
+                            daemon.top_block_timestamp,
+                            snapshot.restore_height,
+                        );
                     }
                 }
 
