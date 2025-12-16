@@ -2101,6 +2101,104 @@ pub extern "C" fn wallet_get_balance(
     0
 }
 
+/// Get wallet balance with an optional input filter (e.g., constrain to a subaddress).
+/// filter_json is a JSON object (or NULL). Currently supported schema:
+///   { "subaddress_minor": 12 }
+///
+/// Returns:
+/// - 0 on success
+/// - -10 invalid UTF-8 / invalid JSON
+/// - -11 invalid argument
+/// - -13 wallet not found
+#[no_mangle]
+pub extern "C" fn wallet_get_balance_with_filter(
+    wallet_id: *const c_char,
+    filter_json: *const c_char,
+    out_total_piconero: *mut u64,
+    out_unlocked_piconero: *mut u64,
+) -> c_int {
+    clear_last_error();
+
+    if wallet_id.is_null() || out_total_piconero.is_null() || out_unlocked_piconero.is_null() {
+        return record_error(-11, "wallet_get_balance_with_filter: null argument(s)");
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_get_balance_with_filter: wallet_id contained invalid UTF-8",
+            );
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct InputFilter {
+        subaddress_minor: Option<u32>,
+    }
+
+    let filt_str_opt = if !filter_json.is_null() {
+        unsafe { CStr::from_ptr(filter_json) }.to_str().ok()
+    } else {
+        None
+    };
+
+    let filter: Option<InputFilter> = match filt_str_opt {
+        Some(s) if !s.trim().is_empty() => match serde_json::from_str(s) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                return record_error(
+                    -10,
+                    format!("wallet_get_balance_with_filter: invalid filter JSON ({err})"),
+                );
+            }
+        },
+        _ => None,
+    };
+
+    let map = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(state) = map.get(id) else {
+        return record_error(
+            -13,
+            format!("wallet_get_balance_with_filter: wallet '{id}' not opened"),
+        );
+    };
+
+    let chain_height = state.chain_height;
+    let chain_time = state.chain_time;
+
+    let mut total: u64 = 0;
+    let mut unlocked: u64 = 0;
+
+    for o in state.tracked_outputs.iter() {
+        // Total/unlocked balances should consider all outputs (including spent if core keeps them),
+        // but tracked_outputs is typically pruned of spent outputs during refresh. Either way, we
+        // preserve existing semantics and only sum what exists in tracked_outputs.
+        if let Some(f) = &filter {
+            if let Some(minor) = f.subaddress_minor {
+                // Account 0 only for now
+                if !(o.subaddress_major == 0 && o.subaddress_minor == minor) {
+                    continue;
+                }
+            }
+        }
+
+        total = total.saturating_add(o.amount);
+        if o.is_unlocked(chain_height, chain_time) {
+            unlocked = unlocked.saturating_add(o.amount);
+        }
+    }
+
+    unsafe {
+        *out_total_piconero = total;
+        *out_unlocked_piconero = unlocked;
+    }
+
+    clear_last_error();
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn wallet_force_rescan_from_height(
     wallet_id: *const c_char,
