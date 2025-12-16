@@ -215,6 +215,23 @@ char* wallet_list_transfers_json(
     const char* wallet_id
 );
 
+/* ===== Balances ===== */
+
+/*
+ * Get total and unlocked balances with an optional input filter (e.g., constrain to a subaddress).
+ *
+ * filter_json is a JSON object (or NULL). Intended for schemas like:
+ *   { "subaddress_minor": 12 }
+ *
+ * Returns 0 on success and writes totals (piconero) to out parameters.
+ */
+int32_t wallet_get_balance_with_filter(
+    const char* wallet_id,
+    const char* filter_json,
+    uint64_t* out_total,
+    uint64_t* out_unlocked
+);
+
 /* ===== Transfers: preview/send ===== */
 
 /*

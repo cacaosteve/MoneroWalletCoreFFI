@@ -312,6 +312,36 @@ public enum WalletCoreFFIClient {
         return (total: total, unlocked: unlocked)
     }
 
+    /// Get total and unlocked balances (piconero) with an optional input filter (e.g., constrain to a subaddress).
+    /// `filter` is passed as a JSON object (e.g., {"subaddress_minor": 12}).
+    public static func getBalanceWithFilter(
+        walletId: String,
+        filter: [String: Any]? = nil
+    ) throws -> (total: UInt64, unlocked: UInt64) {
+        let filterJSON: String? = {
+            guard let filter else { return nil }
+            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
+            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
+            return data.flatMap { String(data: $0, encoding: .utf8) }
+        }()
+
+        var total: UInt64 = 0
+        var unlocked: UInt64 = 0
+
+        let rc: Int32 = walletId.withCString { cId in
+            if let f = filterJSON {
+                return f.withCString { cFilter in
+                    wallet_get_balance_with_filter(cId, cFilter, &total, &unlocked)
+                }
+            } else {
+                return wallet_get_balance_with_filter(cId, nil, &total, &unlocked)
+            }
+        }
+
+        try checkRC(rc, context: "wallet_get_balance_with_filter")
+        return (total: total, unlocked: unlocked)
+    }
+
     /// Preview fee for given destinations (multi-output supported).
     /// - Returns: fee in piconero
     public static func previewFee(
