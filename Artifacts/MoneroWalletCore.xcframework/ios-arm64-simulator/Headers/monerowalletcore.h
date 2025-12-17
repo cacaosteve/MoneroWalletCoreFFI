@@ -159,6 +159,16 @@ int32_t wallet_refresh_async(
 );
 
 /*
+ * Request cancellation of any in-flight refresh.
+ *
+ * NOTE: Currently implemented as a process-global cancel flag in the Rust core.
+ * This cancels the active refresh loop at the next cancellation check.
+ *
+ * Returns 0 on success.
+ */
+int32_t wallet_refresh_cancel(void);
+
+/*
  * Retrieve current sync status for a wallet.
  * Returns chain height/time, last scanned height, and restore height.
  * Any output pointer may be NULL if the caller is not interested in that value.

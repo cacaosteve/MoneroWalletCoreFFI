@@ -277,6 +277,16 @@ public enum WalletCoreFFIClient {
         try checkRC(rc, context: "wallet_refresh_async")
     }
 
+    /// Request cancellation of any in-flight refresh.
+    ///
+    /// Note: the current core implementation is process-global (not per-wallet).
+    public static func refreshCancel() throws {
+#if canImport(CLibMoneroWalletCore)
+        let rc = wallet_refresh_cancel()
+        try checkRC(rc, context: "wallet_refresh_cancel")
+#endif
+    }
+
     /// Retrieve sync status values cached on the core for this wallet.
     public static func syncStatus(
         walletId: String
