@@ -1509,14 +1509,21 @@ pub extern "C" fn wallet_refresh(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(200);
     // Bulk mode: allow each worker to scan a small span of consecutive heights
+    //
+    // Default: ON (1) to reduce per-block RPC overhead (faster on LAN / responsive nodes).
+    // Set WALLETCORE_BULK_RPC=0 to disable and force per-block fetch behavior.
     let bulk: bool = std::env::var("WALLETCORE_BULK_RPC")
         .ok()
         .map(|s| s != "0")
-        .unwrap_or(false);
+        .unwrap_or(true);
+
+    // Bulk worker span (how many consecutive heights a worker scans in one go when bulk is enabled).
+    // Default: 200 blocks. Increase for fewer RPC calls; decrease for more granular progress/cancellation.
     let worker_blocks: usize = std::env::var("WALLETCORE_WORKER_BLOCKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(200);
+    // (moved above) WALLETCORE_WORKER_BLOCKS is now configured alongside WALLETCORE_BULK_RPC.
 
     if scan_cursor < daemon.height {
         if par > 1 && batch > 1 {
