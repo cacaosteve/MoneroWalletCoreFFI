@@ -1651,6 +1651,33 @@ impl BlockingRpcTransport {
 
         Ok(out)
     }
+
+    /// Seed the wallet2-style bounded chain history when it is empty.
+    ///
+    /// We fetch a small contiguous window of block hashes using `on_get_block_hash` so we can build
+    /// `block_ids` for `/getblocks.bin` fast sync even after cache clear / first run.
+    fn seed_recent_block_hashes_for_wallet2(
+        &self,
+        wallet_id: &str,
+        start_h: u64,
+    ) -> Result<(), (c_int, String)> {
+        // Choose a small window ending at start_h-1 (if possible) so the daemon can anchor the chain.
+        // Keep it small to avoid hammering JSON-RPC on first run.
+        const SEED_COUNT: u64 = 64;
+
+        let end_h = start_h.saturating_sub(1);
+        let begin_h = end_h.saturating_sub(SEED_COUNT.saturating_sub(1));
+
+        for h in begin_h..=end_h {
+            let bh = self.get_block_hash_by_height_json(h)?;
+            if let Ok(mut map) = WALLET_STORE.lock() {
+                if let Some(state) = map.get_mut(wallet_id) {
+                    push_recent_block_hash(state, h, bh);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Rpc for BlockingRpcTransport {
@@ -2796,8 +2823,8 @@ pub extern "C" fn wallet_refresh(
                                     }
 
                                     // Build short chain history (block_ids) from the persisted bounded hash window.
-                                    // If the cache is empty, fall back to range mode.
-                                    let block_ids = {
+                                    // If empty, seed it via on_get_block_hash and retry.
+                                    let mut block_ids = {
                                         let mut ids: Vec<[u8; 32]> = Vec::new();
                                         if let Ok(map) = WALLET_STORE.lock() {
                                             if let Some(state) = map.get(&id_owned_for_worker) {
@@ -2808,9 +2835,37 @@ pub extern "C" fn wallet_refresh(
                                     };
 
                                     if block_ids.is_empty() {
+                                        match client.seed_recent_block_hashes_for_wallet2(
+                                            &id_owned_for_worker,
+                                            start_h,
+                                        ) {
+                                            Ok(()) => {
+                                                if let Ok(map) = WALLET_STORE.lock() {
+                                                    if let Some(state) =
+                                                        map.get(&id_owned_for_worker)
+                                                    {
+                                                        block_ids =
+                                                            build_short_chain_history(state);
+                                                    }
+                                                }
+                                            }
+                                            Err((code, msg)) => {
+                                                let _ = txc.send(Err((
+                                                    code,
+                                                    format!(
+                                                        "wallet_refresh: wallet2 bulk seed failed at start_h {}: {}",
+                                                        start_h, msg
+                                                    ),
+                                                )));
+                                                return;
+                                            }
+                                        }
+                                    }
+
+                                    if block_ids.is_empty() {
                                         let _ = txc.send(Err((
                                             -16,
-                                            "wallet_refresh: wallet2 bulk mode has no chain history yet (block_ids empty)".to_string(),
+                                            "wallet_refresh: wallet2 bulk mode has no chain history yet (block_ids empty after seeding)".to_string(),
                                         )));
                                         return;
                                     }
