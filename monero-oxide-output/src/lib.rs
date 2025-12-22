@@ -2586,10 +2586,94 @@ pub extern "C" fn wallet_refresh(
                             }
                         };
 
-                        // Process returned entries sequentially (one per height starting at scan_cursor).
+                        // Process returned entries sequentially (assumed 1-per-height starting at scan_cursor).
+                        // If any specific entry is missing tx blobs, fall back to the existing per-block logic
+                        // for just that height instead of aborting the entire batch.
+                        let mut th = scan_cursor;
                         for entry in resp.blocks {
                             if refresh_cancelled_for_wallet(id) {
                                 return record_error(-30, "wallet_refresh: cancelled");
+                            }
+
+                            // If this entry omitted tx blobs, scan this single height via per-block RPC and continue.
+                            if entry.txs.is_empty() {
+                                if !bulk_fetch_fallback_logged {
+                                    print!(
+                                        "🧱 bulk-fetch(bin:get_blocks) partial fallback: missing tx blobs for some heights; using per-block for those\n"
+                                    );
+                                    bulk_fetch_fallback_logged = true;
+                                }
+
+                                let block_number = match usize::try_from(th) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if !bulk_fetch_fallback_logged {
+                                            print!(
+                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: block number conversion overflow\n"
+                                            );
+                                            bulk_fetch_fallback_logged = true;
+                                        }
+                                        break;
+                                    }
+                                };
+
+                                let scannable = match block_on(
+                                    rpc_client.get_scannable_block_by_number(block_number),
+                                ) {
+                                    Ok(block) => block,
+                                    Err(_) => {
+                                        if !bulk_fetch_fallback_logged {
+                                            print!(
+                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: RPC block fetch failed\n"
+                                            );
+                                            bulk_fetch_fallback_logged = true;
+                                        }
+                                        break;
+                                    }
+                                };
+
+                                let miner_hash = scannable.block.miner_transaction().hash();
+                                let outputs = match scanner.scan(scannable) {
+                                    Ok(result) => result.ignore_additional_timelock(),
+                                    Err(_) => {
+                                        if !bulk_fetch_fallback_logged {
+                                            print!(
+                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: scanner failed\n"
+                                            );
+                                            bulk_fetch_fallback_logged = true;
+                                        }
+                                        break;
+                                    }
+                                };
+
+                                for output in outputs {
+                                    let (major, minor) = output
+                                        .subaddress()
+                                        .map(|idx| (idx.account(), idx.address()))
+                                        .unwrap_or((0, 0));
+                                    working_outputs.push(TrackedOutput {
+                                        tx_hash: output.transaction(),
+                                        index_in_tx: output.index_in_transaction(),
+                                        amount: output.commitment().amount,
+                                        block_height: th,
+                                        additional_timelock: output.additional_timelock(),
+                                        is_coinbase: output.transaction() == miner_hash,
+                                        subaddress_major: major,
+                                        subaddress_minor: minor,
+                                        spent: false,
+                                    });
+                                }
+
+                                th = th.saturating_add(1);
+                                scan_cursor = th;
+                                update_scan_progress(
+                                    id,
+                                    scan_cursor.min(daemon.height),
+                                    daemon.height,
+                                    daemon.top_block_timestamp,
+                                    snapshot.restore_height,
+                                );
+                                continue;
                             }
 
                             // Parse block blob
@@ -2606,17 +2690,6 @@ pub extern "C" fn wallet_refresh(
                                     break;
                                 }
                             };
-
-                            // Require tx blobs (get_blocks.bin should provide them when prune=false).
-                            if entry.txs.is_empty() {
-                                if !bulk_fetch_fallback_logged {
-                                    print!(
-                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: response omitted tx blobs\n"
-                                    );
-                                    bulk_fetch_fallback_logged = true;
-                                }
-                                break;
-                            }
 
                             // Parse tx blobs (pruned)
                             let mut parsed_txs: Vec<Transaction<Pruned>> =
