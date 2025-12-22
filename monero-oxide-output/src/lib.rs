@@ -94,6 +94,29 @@ static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new
 /// We log unknown fields in `block_complete_entry` once so we can learn the actual tx blob field name.
 static BULK_BIN_UNKNOWN_FIELD_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// When enabled, we emit extra diagnostics about the decoded `block_complete_entry` fields
+/// to help debug daemons which omit/rename tx blob fields in `get_blocks.bin`.
+///
+/// Enable in Xcode Scheme env vars:
+/// - WALLETCORE_BULK_BIN_DEBUG=1
+static BULK_BIN_DEBUG: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn bulk_bin_debug_enabled() -> bool {
+    // Cache env var read so we don't hit std::env on hot paths repeatedly.
+    if BULK_BIN_DEBUG.load(Ordering::Relaxed) {
+        return true;
+    }
+    let enabled = std::env::var("WALLETCORE_BULK_BIN_DEBUG")
+        .ok()
+        .map(|s| s != "0")
+        .unwrap_or(false);
+    if enabled {
+        BULK_BIN_DEBUG.store(true, Ordering::Relaxed);
+    }
+    enabled
+}
+
 /// Per-wallet cancellation flags for `wallet_refresh` / `wallet_refresh_async`.
 /// This is best-effort: the refresh loop checks it frequently and aborts promptly.
 ///
@@ -627,17 +650,43 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "block" => {
+                if bulk_bin_debug_enabled() {
+                    println!("🧩 get_blocks(.bin) block_complete_entry: field='block'");
+                }
                 self.block = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
             "txs" => {
+                if bulk_bin_debug_enabled() {
+                    println!("🧩 get_blocks(.bin) block_complete_entry: field='txs'");
+                }
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
+
+            // Be permissive with common field name variants observed across daemons / implementations.
+            // We normalize them into our internal `txs` list.
+            "txs_blob" | "txs_blobs" | "txs_bytes" | "txs_byte" | "txs_data" | "transactions" => {
+                if bulk_bin_debug_enabled() {
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field={:?} (normalized to 'txs')",
+                        name
+                    );
+                }
+                self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+
             _ => {
                 // Schema discovery: log unknown fields once (they may include tx blob fields like
-                // "txs_blob", "txs_blobs", etc.). We only log once to avoid spam.
-                if !BULK_BIN_UNKNOWN_FIELD_LOGGED.swap(true, Ordering::Relaxed) {
-                    print!(
-                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')\n",
+                // "txs_blob", "txs_blobs", etc.). We log at least once, and we also optionally
+                // log every unknown field when debug is enabled.
+                if bulk_bin_debug_enabled() {
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')",
+                        name
+                    );
+                } else if !BULK_BIN_UNKNOWN_FIELD_LOGGED.swap(true, Ordering::Relaxed) {
+                    // Use println! (not print!) to ensure it reliably shows up in iOS log collectors.
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')",
                         name
                     );
                 }
@@ -648,12 +697,21 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
     }
 
     fn finish(self) -> cuprate_epee_encoding::error::Result<BlockCompleteEntry> {
-        Ok(BlockCompleteEntry {
-            block: self.block.ok_or_else(|| {
-                cuprate_epee_encoding::error::Error::Format("block_complete_entry missing 'block'")
-            })?,
-            txs: self.txs.unwrap_or_default(),
-        })
+        let block = self.block.ok_or_else(|| {
+            cuprate_epee_encoding::error::Error::Format("block_complete_entry missing 'block'")
+        })?;
+
+        let txs = self.txs.unwrap_or_default();
+
+        if bulk_bin_debug_enabled() {
+            println!(
+                "🧩 get_blocks(.bin) block_complete_entry: decoded block_bytes={} tx_blobs={}",
+                block.len(),
+                txs.len()
+            );
+        }
+
+        Ok(BlockCompleteEntry { block, txs })
     }
 }
 
