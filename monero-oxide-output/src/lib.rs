@@ -1027,30 +1027,81 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
         name: &str,
         r: &mut B,
     ) -> cuprate_epee_encoding::error::Result<bool> {
+        // Targeted schema debugging for `/getblocks.bin` response decoding.
+        // This lets us pinpoint which specific field triggers the EPEE marker mismatch.
+        if bulk_bin_debug_enabled() {
+            println!("🧩 getblocks.bin response: decoding field={:?}", name);
+        }
+
         match name {
             "blocks" => {
-                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'blocks': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
             }
             "start_height" => {
-                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.start_height =
+                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'start_height': {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?);
             }
             "current_height" => {
-                self.current_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.current_height =
+                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'current_height': {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?);
             }
             "output_indices" => {
-                self.output_indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.output_indices =
+                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'output_indices': {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?);
             }
             "daemon_time" => {
-                self.daemon_time = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.daemon_time =
+                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'daemon_time': {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?);
             }
             "pool_info_extent" => {
-                self.pool_info_extent = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.pool_info_extent =
+                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'pool_info_extent': {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?);
             }
             "status" => {
-                self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.status = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'status': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
             }
             "untrusted" => {
-                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'untrusted': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
             }
             _ => return Ok(false),
         }
