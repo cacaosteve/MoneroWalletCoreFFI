@@ -1246,12 +1246,16 @@ struct BlockCompleteEntry {
     // Some daemons (or prune modes) omit tx blobs in certain responses.
     // When omitted, we treat it as an empty list and let the caller decide whether to fall back.
     txs: Vec<Vec<u8>>,
+    // In Monero `block_complete_entry`, daemons include whether the entry is pruned.
+    // Wallet2 `/getblocks.bin` responses commonly include this field.
+    pruned: bool,
 }
 
 #[derive(Default)]
 struct BlockCompleteEntryBuilder {
     block: Option<Vec<u8>>,
     txs: Option<Vec<Vec<u8>>>,
+    pruned: Option<bool>,
 }
 
 impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompleteEntryBuilder {
@@ -1272,6 +1276,12 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     println!("🧩 get_blocks(.bin) block_complete_entry: field='txs'");
                 }
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "pruned" => {
+                if bulk_bin_debug_enabled() {
+                    println!("🧩 get_blocks(.bin) block_complete_entry: field='pruned'");
+                }
+                self.pruned = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
 
             // Be permissive with common field name variants observed across daemons / implementations.
@@ -1314,16 +1324,18 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
         })?;
 
         let txs = self.txs.unwrap_or_default();
+        let pruned = self.pruned.unwrap_or(false);
 
         if bulk_bin_debug_enabled() {
             println!(
-                "🧩 get_blocks(.bin) block_complete_entry: decoded block_bytes={} tx_blobs={}",
+                "🧩 get_blocks(.bin) block_complete_entry: decoded block_bytes={} tx_blobs={} pruned={}",
                 block.len(),
-                txs.len()
+                txs.len(),
+                pruned
             );
         }
 
-        Ok(BlockCompleteEntry { block, txs })
+        Ok(BlockCompleteEntry { block, txs, pruned })
     }
 }
 
@@ -1331,12 +1343,13 @@ impl EpeeObject for BlockCompleteEntry {
     type Builder = BlockCompleteEntryBuilder;
 
     fn number_of_fields(&self) -> u64 {
-        2
+        3
     }
 
     fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
         write_field(self.block, "block", w)?;
         write_field(self.txs, "txs", w)?;
+        write_field(self.pruned, "pruned", w)?;
         Ok(())
     }
 }
