@@ -1566,15 +1566,63 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
         match name {
             "block" => {
                 if bulk_bin_debug_enabled() {
-                    println!("🧩 get_blocks(.bin) block_complete_entry: field='block'");
+                    let rem_before = r.remaining();
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='block' remaining_before={}",
+                        rem_before
+                    );
                 }
+
                 self.block = Some(cuprate_epee_encoding::read_epee_value(r)?);
+
+                if bulk_bin_debug_enabled() {
+                    let rem_after = r.remaining();
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='block' remaining_after={}",
+                        rem_after
+                    );
+                }
             }
             "txs" => {
                 if bulk_bin_debug_enabled() {
-                    println!("🧩 get_blocks(.bin) block_complete_entry: field='txs'");
+                    let rem_before = r.remaining();
+                    let peek_marker = if rem_before > 0 {
+                        let chunk = r.chunk();
+                        if !chunk.is_empty() {
+                            format!("0x{:02x}", chunk[0])
+                        } else {
+                            "(unavailable)".to_string()
+                        }
+                    } else {
+                        "(eof)".to_string()
+                    };
+
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='txs' remaining_before={} next_marker={}",
+                        rem_before, peek_marker
+                    );
                 }
+
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
+
+                if bulk_bin_debug_enabled() {
+                    let rem_after = r.remaining();
+                    let peek_marker = if rem_after > 0 {
+                        let chunk = r.chunk();
+                        if !chunk.is_empty() {
+                            format!("0x{:02x}", chunk[0])
+                        } else {
+                            "(unavailable)".to_string()
+                        }
+                    } else {
+                        "(eof)".to_string()
+                    };
+
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='txs' remaining_after={} next_marker={}",
+                        rem_after, peek_marker
+                    );
+                }
             }
 
             // Be permissive with common field name variants observed across daemons / implementations.
@@ -1591,9 +1639,44 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
 
             "pruned" => {
                 if bulk_bin_debug_enabled() {
-                    println!("🧩 get_blocks(.bin) block_complete_entry: field='pruned'");
+                    let rem_before = r.remaining();
+                    let peek_marker = if rem_before > 0 {
+                        let chunk = r.chunk();
+                        if !chunk.is_empty() {
+                            format!("0x{:02x}", chunk[0])
+                        } else {
+                            "(unavailable)".to_string()
+                        }
+                    } else {
+                        "(eof)".to_string()
+                    };
+
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='pruned' remaining_before={} next_marker={}",
+                        rem_before, peek_marker
+                    );
                 }
+
                 self.pruned = Some(cuprate_epee_encoding::read_epee_value(r)?);
+
+                if bulk_bin_debug_enabled() {
+                    let rem_after = r.remaining();
+                    let peek_marker = if rem_after > 0 {
+                        let chunk = r.chunk();
+                        if !chunk.is_empty() {
+                            format!("0x{:02x}", chunk[0])
+                        } else {
+                            "(unavailable)".to_string()
+                        }
+                    } else {
+                        "(eof)".to_string()
+                    };
+
+                    println!(
+                        "🧩 get_blocks(.bin) block_complete_entry: field='pruned' remaining_after={} next_marker={}",
+                        rem_after, peek_marker
+                    );
+                }
             }
 
             _ => {
@@ -1604,15 +1687,34 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 // "Marker does not match expected Marker".
                 //
                 // Therefore: read and discard unknown field values to keep decoding aligned.
+                //
+                // Additional diagnostics:
+                // - Log the *next marker byte* (peek) and remaining buffer size BEFORE skipping.
+                //   This helps identify which portable_storage marker type we failed to handle.
+                let rem_before = r.remaining();
+                let peek_marker = if rem_before > 0 {
+                    // We can't peek without consuming; read then immediately re-insert is not possible with Buf.
+                    // So we log the first byte via a best-effort: if the Buf implementation supports chunk(),
+                    // use it; otherwise log "(unavailable)".
+                    let chunk = r.chunk();
+                    if !chunk.is_empty() {
+                        format!("0x{:02x}", chunk[0])
+                    } else {
+                        "(unavailable)".to_string()
+                    }
+                } else {
+                    "(eof)".to_string()
+                };
+
                 if bulk_bin_debug_enabled() {
                     println!(
-                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?}",
-                        name
+                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?} (next_marker={} remaining_before_skip={})",
+                        name, peek_marker, rem_before
                     );
                 } else if !BULK_BIN_UNKNOWN_FIELD_LOGGED.swap(true, Ordering::Relaxed) {
                     println!(
-                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?}",
-                        name
+                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?} (next_marker={} remaining_before_skip={})",
+                        name, peek_marker, rem_before
                     );
                 }
 
