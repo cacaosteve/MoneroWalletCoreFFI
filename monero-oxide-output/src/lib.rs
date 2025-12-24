@@ -25,10 +25,10 @@ enum BulkFetchMode {
     RangeBlocks,
 }
 
+const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v4";
+
 fn build_stamp() -> &'static str {
     // Prefer a compile-time stamp if provided by the build system.
-    // You can set this from Xcode/SPM via Rust flags or build scripts, e.g.
-    // RUSTFLAGS="--cfg walletcore_build_stamp=\\"...\\""
     //
     // Fallback: "unknown" (still useful to prove whether you're running a build that includes this log).
     option_env!("WALLETCORE_BUILD_STAMP").unwrap_or("unknown")
@@ -1589,16 +1589,32 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
             "txs" => {
                 if bulk_bin_debug_enabled() {
                     let rem_before = r.remaining();
-                    let peek_marker = if rem_before > 0 {
-                        let chunk = r.chunk();
-                        if !chunk.is_empty() {
-                            format!("0x{:02x}", chunk[0])
-                        } else {
-                            "(unavailable)".to_string()
-                        }
+                    let chunk = r.chunk();
+
+                    let peek_marker = if rem_before > 0 && !chunk.is_empty() {
+                        format!("0x{:02x}", chunk[0])
+                    } else if rem_before > 0 {
+                        "(unavailable)".to_string()
                     } else {
                         "(eof)".to_string()
                     };
+
+                    // Dump leading bytes when we see the observed txs marker (0x8c) so we can
+                    // reverse-engineer the actual container encoding on this daemon.
+                    if rem_before > 0 && !chunk.is_empty() && chunk[0] == 0x8c {
+                        let dump_len = std::cmp::min(16, chunk.len());
+                        let mut hex = String::new();
+                        for (i, b) in chunk[..dump_len].iter().enumerate() {
+                            if i > 0 {
+                                hex.push(' ');
+                            }
+                            hex.push_str(&format!("{:02x}", b));
+                        }
+                        println!(
+                            "🧩 get_blocks(.bin) block_complete_entry: field='txs' marker=0x8c leading_bytes[0..{}]={}",
+                            dump_len, hex
+                        );
+                    }
 
                     println!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='txs' remaining_before={} next_marker={}",
@@ -1610,13 +1626,11 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
 
                 if bulk_bin_debug_enabled() {
                     let rem_after = r.remaining();
-                    let peek_marker = if rem_after > 0 {
-                        let chunk = r.chunk();
-                        if !chunk.is_empty() {
-                            format!("0x{:02x}", chunk[0])
-                        } else {
-                            "(unavailable)".to_string()
-                        }
+                    let chunk = r.chunk();
+                    let peek_marker = if rem_after > 0 && !chunk.is_empty() {
+                        format!("0x{:02x}", chunk[0])
+                    } else if rem_after > 0 {
+                        "(unavailable)".to_string()
                     } else {
                         "(eof)".to_string()
                     };
@@ -3111,7 +3125,8 @@ pub extern "C" fn wallet_refresh(
         .unwrap_or_else(|| "(default=200)".to_string());
 
     print!(
-        "🧩 walletcore refresh entry: build={} wallet_id={} node_url={} env{{scan_par={} scan_batch={} bulk_fetch={} bulk_mode={} bulk_fetch_batch={}}}\n",
+        "🧩 walletcore refresh entry: version={} build={} wallet_id={} node_url={} env{{scan_par={} scan_batch={} bulk_fetch={} bulk_mode={} bulk_fetch_batch={}}}\n",
+        WALLETCORE_LOG_VERSION,
         build_stamp(),
         id,
         base_url,
