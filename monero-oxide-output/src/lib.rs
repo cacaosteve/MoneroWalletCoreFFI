@@ -526,7 +526,7 @@ fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()
 
     // Most primitive markers are followed by a fixed-size payload.
     // NOTE: These marker values are not guaranteed stable across implementations; this is best-effort.
-    // If we hit an unknown marker in practice, we'll log it via the caller debug paths and extend this.
+    // If we hit an unknown marker in practice, we'll fail fast and extend this.
     match marker {
         // Booleans are encoded as 1 byte
         0x01 => {
@@ -592,7 +592,10 @@ fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()
         }
 
         // Array: marker for element type + varint length + elements.
-        0x0d => {
+        //
+        // Observed in the wild (monerod `/getblocks.bin`): `txs` can start with marker 0x8c.
+        // Treat it as an "array-like" container marker and skip identically to 0x0d.
+        0x0d | 0x8c => {
             if !r.has_remaining() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
                     "skip_epee_value: EOF reading array element marker",
@@ -679,7 +682,7 @@ fn skip_epee_value_with_known_marker<B: Buf>(
             }
             Ok(())
         }
-        0x0d => {
+        0x0d | 0x8c => {
             // Nested array: marker + length + elements
             if !r.has_remaining() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
