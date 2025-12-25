@@ -1878,10 +1878,50 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                         if len_usize > MAX_BLOCK_BYTES {
                             // Some daemons encode typed-array `blocks` with empty elem_type in a packed / non-length-prefixed form.
-                            // If we try to interpret it as markerless length-prefixed bytes, we can read a nonsensical "length"
-                            // and stall in a retry loop. Since you don't care about the fallback right now, bail out cleanly so
-                            // the caller can fall back to per-block scanning without repeated stall retries.
+                            //
+                            // Before we give up, probe for a very common packed representation: a contiguous list of block IDs (hashes),
+                            // where each element is exactly 32 bytes and the stream is just `n * 32` bytes of entropy (no varints/markers).
+                            //
+                            // This is NOT a complete decoder; it's a detection/probing aid so we can confirm what this variant represents.
                             if matches!(typed_elem_type.as_deref(), Some("")) && !has_marker {
+                                let need = (n as usize).saturating_mul(32);
+                                let rem_now = r.remaining();
+                                if rem_now >= need {
+                                    let prefix = r.chunk();
+                                    if !prefix.is_empty() {
+                                        let dump_len = std::cmp::min(32, prefix.len());
+                                        let mut hex = String::new();
+                                        for (j, b) in prefix[..dump_len].iter().enumerate() {
+                                            if j > 0 {
+                                                hex.push(' ');
+                                            }
+                                            hex.push_str(&format!("{:02x}", b));
+                                        }
+                                        if bulk_bin_debug_enabled() {
+                                            println!(
+                                                "🧩 getblocks.bin blocks typed-array elem_type empty: hash-list probe matched (n={} need_bytes={} remaining={}); first32={}",
+                                                n, need, rem_now, hex
+                                            );
+                                        } else {
+                                            println!(
+                                                "🧩 getblocks.bin blocks typed-array elem_type empty: hash-list probe matched (n={} need_bytes={} remaining={})",
+                                                n, need, rem_now
+                                            );
+                                        }
+                                    } else if bulk_bin_debug_enabled() {
+                                        println!(
+                                            "🧩 getblocks.bin blocks typed-array elem_type empty: hash-list probe matched (n={} need_bytes={} remaining={}); (no chunk available)",
+                                            n, need, rem_now
+                                        );
+                                    }
+
+                                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                        format!("getblocks.bin decode failed in field 'blocks': typed-array elem_type empty appears to be packed hash-list (n={n}, need={need}); forcing fallback")
+                                            .into_boxed_str(),
+                                    )));
+                                }
+
+                                // Default: bail out cleanly so the caller can fall back to per-block scanning without repeated stall retries.
                                 return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
                                     format!("getblocks.bin decode failed in field 'blocks': typed-array elem_type empty appears packed/unsupported (first markerless len={len_usize} > {MAX_BLOCK_BYTES}); forcing fallback")
                                         .into_boxed_str(),
