@@ -2801,18 +2801,39 @@ impl BlockingRpcTransport {
         // IMPORTANT: `block_ids` must be encoded as KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids),
         // i.e. as a single packed blob of 32-byte hashes.
         let mut block_ids_blob: Vec<u8> = Vec::with_capacity(block_ids.len().saturating_mul(32));
-        for h in block_ids {
-            block_ids_blob.extend_from_slice(&h);
+        for h in &block_ids {
+            block_ids_blob.extend_from_slice(h);
+        }
+
+        // Make the request more explicit in debug mode to encourage daemons to return block entries
+        // rather than a packed hash-list variant in `blocks`.
+        let (requested_info, max_block_count) = if bulk_bin_debug_enabled() {
+            // Empirical: try a "stronger" requested_info and a non-zero max_block_count.
+            // We can iterate on requested_info values based on daemon behavior.
+            (1u8, block_ids.len() as u64)
+        } else {
+            (0u8, 0u64)
+        };
+
+        if bulk_bin_debug_enabled() {
+            println!(
+                "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={}",
+                requested_info,
+                start_height,
+                prune,
+                max_block_count,
+                block_ids_blob.len()
+            );
         }
 
         let req = GetBlocksFastBinRequest {
-            requested_info: 0,
+            requested_info,
             block_ids: block_ids_blob,
             start_height,
             prune,
             no_miner_tx: false,
             pool_info_since: 0,
-            max_block_count: 0,
+            max_block_count,
         };
         let body = to_bytes(req)
             .map(|b| b.to_vec())
