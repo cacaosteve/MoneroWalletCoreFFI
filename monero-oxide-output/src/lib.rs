@@ -219,62 +219,63 @@ fn read_txs_typed_array_0x8c<B: Buf>(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
 
     if elem_type == "blob" {
+        // IMPORTANT (wallet2-like):
+        // The element type is already declared by the typed-array header ("blob"), so elements are expected
+        // to be encoded as markerless length-prefixed byte sequences:
+        //
+        //   [varint_len][bytes] repeated N times
+        //
+        // The element stream dump you captured starts with `0a 91 05 ...`, which is consistent with an
+        // EPEE "blob/string" marker (0x0a) preceding the length. We support both forms:
+        //   - markerless:        [varint_len][bytes]
+        //   - marker + length:   [marker][varint_len][bytes]  (marker may be 0x0a/0x0b; others are treated as invalid)
+        //
+        // Crucially: we DO NOT try to treat arbitrary bytes as "unknown element markers", because that
+        // quickly desynchronizes and produces absurd lengths (as seen in logs).
         for _ in 0..n {
             if !r.has_remaining() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
-                    "read_txs_typed_array_0x8c: EOF reading element",
+                    "read_txs_typed_array_0x8c(blob): EOF reading element",
                 ));
             }
 
             let chunk = r.chunk();
             if chunk.is_empty() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
-                    "read_txs_typed_array_0x8c: unable to peek element bytes",
+                    "read_txs_typed_array_0x8c(blob): unable to peek element bytes",
                 ));
             }
 
-            // Schema-driven decoding:
-            // Try marker-present form: [marker][varint_len][bytes]
-            // Then no-marker form: [varint_len][bytes]
+            // If element begins with a known blob marker, consume it.
             let first = chunk[0];
-
-            if chunk.len() >= 2 {
-                if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
-                    let rem_after_marker = r.remaining().saturating_sub(1);
-                    if (used as u64) <= rem_after_marker as u64
-                        && len <= rem_after_marker.saturating_sub(used) as u64
-                    {
-                        let _ = r.get_u8();
-
-                        if bulk_bin_debug_enabled() && first != 0x0a && first != 0x0b {
-                            println!(
-                                "🧩 read_txs_typed_array_0x8c(blob): treating unknown element marker=0x{:02x} as blob (len={})",
-                                first, len
-                            );
-                        }
-
-                        let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob)")?;
-                        out.push(b);
-                        continue;
-                    }
-                }
+            if first == 0x0a || first == 0x0b {
+                let _ = r.get_u8();
+                let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob,marker)")?;
+                out.push(b);
+                continue;
             }
 
+            // Otherwise, require markerless varint length at the start.
             if let Some((len, used)) = peek_epee_varint_u64(chunk) {
                 let rem = r.remaining();
                 if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
                     let b = read_epee_len_prefixed_bytes(
                         r,
-                        "read_txs_typed_array_0x8c(blob,no_marker)",
+                        "read_txs_typed_array_0x8c(blob,markerless)",
                     )?;
                     out.push(b);
                     continue;
                 }
             }
 
-            let _ = r.get_u8();
-            skip_epee_value_with_known_marker(r, first)?;
-            out.push(Vec::new());
+            // If neither matches, fail fast (do not desync). This will force bulk fallback to per-block.
+            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                format!(
+                    "read_txs_typed_array_0x8c(blob): unrecognized element encoding (next_byte=0x{:02x})",
+                    first
+                )
+                .into_boxed_str(),
+            )));
         }
     } else {
         for _ in 0..n {
