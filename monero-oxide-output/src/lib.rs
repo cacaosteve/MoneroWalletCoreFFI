@@ -214,6 +214,71 @@ fn read_txs_typed_array_0x8c<B: Buf>(
         }
     }
 
+    // Instrumentation: treat the element stream as a *single packed blob* candidate.
+    //
+    // Some daemons appear to encode txs(0x8c,"blob") such that the post-header stream begins with a
+    // blob/string marker + length, followed by packed bytes (not N independent EPEE values).
+    // We log the first blob's marker, length, and a prefix of its bytes without committing to a full unpacking yet.
+    if bulk_bin_debug_enabled() && elem_type == "blob" {
+        let chunk = r.chunk();
+        if !chunk.is_empty() {
+            let first = chunk[0];
+            let mut logged = false;
+
+            // Try marker + varint_len form: [marker][varint_len][bytes...]
+            if chunk.len() >= 2 {
+                if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
+                    let rem_after_marker = r.remaining().saturating_sub(1);
+                    if (used as u64) <= rem_after_marker as u64
+                        && len <= rem_after_marker.saturating_sub(used) as u64
+                    {
+                        println!(
+                            "🧩 txs(0x8c) packed-blob candidate: marker=0x{:02x} len={} (count={})",
+                            first, len, n
+                        );
+
+                        // Prefix of payload (best-effort, from current chunk). This is purely diagnostic.
+                        let payload_offset = 1 + used;
+                        if chunk.len() > payload_offset {
+                            let payload = &chunk[payload_offset..];
+                            let hex = hex_dump_prefix(payload, 64);
+                            println!(
+                                "🧩 txs(0x8c) packed-blob candidate: payload_prefix bytes[0..{}]={}",
+                                std::cmp::min(64, payload.len()),
+                                hex
+                            );
+                        }
+
+                        logged = true;
+                    }
+                }
+            }
+
+            // Try markerless varint_len form: [varint_len][bytes...]
+            if !logged {
+                if let Some((len, used)) = peek_epee_varint_u64(chunk) {
+                    let rem = r.remaining();
+                    if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
+                        println!(
+                            "🧩 txs(0x8c) packed-blob candidate (markerless): len={} (count={})",
+                            len, n
+                        );
+
+                        if chunk.len() > used {
+                            let payload = &chunk[used..];
+                            let hex = hex_dump_prefix(payload, 64);
+                            println!(
+                                "🧩 txs(0x8c) packed-blob candidate (markerless): payload_prefix bytes[0..{}]={}",
+                                std::cmp::min(64, payload.len()),
+                                hex
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 3) Decode elements.
     // For elem_type == "blob": parse each element as a length-prefixed byte array.
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
