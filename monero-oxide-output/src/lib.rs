@@ -247,8 +247,12 @@ fn read_txs_typed_array_0x8c<B: Buf>(
             }
 
             // If element begins with a known blob marker, consume it.
+            //
+            // We already observed element stream entries starting with 0x0a (blob/string marker).
+            // Some daemons appear to use additional marker variants (e.g. 0x99/0x9a). Treat them
+            // as equivalent "blob marker + varint_len + bytes" prefixes here.
             let first = chunk[0];
-            if first == 0x0a || first == 0x0b {
+            if first == 0x0a || first == 0x0b || first == 0x99 || first == 0x9a {
                 let _ = r.get_u8();
                 let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob,marker)")?;
                 out.push(b);
