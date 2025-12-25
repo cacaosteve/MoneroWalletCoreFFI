@@ -1651,12 +1651,121 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
         match name {
             "blocks" => {
-                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                // Manual parse of the `blocks` array so we can log the failing entry index.
+                //
+                // `read_epee_value::<Vec<BlockCompleteEntry>>` fails without telling us which element
+                // caused the failure. We decode the array header ourselves, then decode each
+                // `BlockCompleteEntry` one-by-one and annotate errors with `blocks[i]`.
+                //
+                // NOTE: This assumes the standard EPEE array marker (0x0d). If your daemon uses a
+                // different array marker here, we'll log and fail with a clear message so we can extend it.
+                if !r.has_remaining() {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'blocks': EOF (missing array marker)",
+                    ));
+                }
+
+                let arr_marker = r.get_u8();
+                if arr_marker != 0x0d {
+                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!(
+                            "getblocks.bin decode failed in field 'blocks': unexpected array marker=0x{arr_marker:02x} (expected 0x0d)"
+                        )
+                        .into_boxed_str(),
+                    )));
+                }
+
+                if !r.has_remaining() {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'blocks': EOF (missing element marker)",
+                    ));
+                }
+                let elem_marker = r.get_u8();
+
+                // `blocks` should be an array of objects; tolerate both the canonical object marker (0x0c)
+                // and the observed container variants if any appear.
+                if elem_marker != 0x0c {
+                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!(
+                            "getblocks.bin decode failed in field 'blocks': unexpected element marker=0x{elem_marker:02x} (expected object marker 0x0c)"
+                        )
+                        .into_boxed_str(),
+                    )));
+                }
+
+                let n = skip_epee_varint_u64(r).map_err(|e| {
                     cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'blocks': {e}")
+                        format!("getblocks.bin decode failed in field 'blocks': failed to read array length: {e}")
                             .into_boxed_str(),
                     ))
-                })?);
+                })?;
+
+                if bulk_bin_debug_enabled() {
+                    println!(
+                        "🧩 getblocks.bin blocks array: element_marker=0x{:02x} len={}",
+                        elem_marker, n
+                    );
+                }
+
+                let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    if bulk_bin_debug_enabled() {
+                        println!(
+                            "🧩 getblocks.bin blocks[{}]: decode start (remaining={})",
+                            i,
+                            r.remaining()
+                        );
+                    }
+
+                    // For EPEE arrays, elements do not repeat their marker; we must decode the object payload.
+                    // Object payload begins with varint field count, then repeated (name,value) pairs.
+                    let fields = skip_epee_varint_u64(r).map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] failed to read object field count: {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?;
+
+                    // Build `BlockCompleteEntry` by emulating the EpeeObjectBuilder loop:
+                    // for each field, read name string then dispatch to builder.add_field(name,...).
+                    let mut builder = BlockCompleteEntryBuilder::default();
+                    for _ in 0..fields {
+                        let name = read_epee_field_name(r).map_err(|e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] failed to read field name: {e}")
+                                    .into_boxed_str(),
+                            ))
+                        })?;
+
+                        builder.add_field(&name, r).map_err(|e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] add_field({name:?}) failed: {e}")
+                                    .into_boxed_str(),
+                            ))
+                        })?;
+                    }
+
+                    let entry = builder.finish().map_err(|e| {
+                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] finish failed: {e}")
+                                .into_boxed_str(),
+                        ))
+                    })?;
+
+                    if bulk_bin_debug_enabled() {
+                        println!(
+                            "🧩 getblocks.bin blocks[{}]: decode ok (block_bytes={} tx_blobs={} pruned={})",
+                            i,
+                            entry.block.len(),
+                            entry.txs.len(),
+                            entry.pruned
+                        );
+                    }
+
+                    out.push(entry);
+                }
+
+                self.blocks = Some(out);
             }
             "start_height" => {
                 self.start_height =
