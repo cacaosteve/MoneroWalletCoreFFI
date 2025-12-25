@@ -2044,46 +2044,45 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         )));
                     }
 
-                    // Elements are typically markerless: [varint_len][payload...]
+                    // Typed-array `blocks` on some daemons is NOT a clean "vector of elements" in portable_storage terms.
+                    // It can be a packed stream where the "element marker" in the typed-array header is informational,
+                    // and what follows is a sequence of already-delimited payloads.
+                    //
+                    // Based on observed data, treat each element as a raw length-prefixed payload and avoid any
+                    // pre-validation pass that can desync the cursor when the stream isn't actually element-aligned.
+                    //
+                    // Elements are usually markerless: [varint_len][payload...]
                     // Some daemons may redundantly include the blob marker before each element; accept it if present.
                     if !reader_blob.is_empty() && reader_blob[0] == blocks_elem_marker {
                         reader_blob = &reader_blob[1..];
-                    }
-
-                    // Validate length prefix bounds before allocating.
-                    if let Some((len_u64, used)) = peek_epee_varint_u64(reader_blob) {
-                        let len_usize = usize::try_from(len_u64).map_err(|_| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] length overflow ({len_u64})")
-                                    .into_boxed_str(),
-                            ))
-                        })?;
-
-                        if len_usize > MAX_BLOCK_BYTES {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={len_usize} > {MAX_BLOCK_BYTES})")
-                                    .into_boxed_str(),
-                            )));
-                        }
-
-                        let rem = reader_blob.len();
-                        if rem < used + len_usize {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element length out of bounds (len={len_usize}, overhead={used}, remaining={rem})")
-                                    .into_boxed_str(),
-                            )));
-                        }
-                    } else {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length after blob marker (shared marker)")
-                                .into_boxed_str(),
-                        )));
                     }
 
                     let blob_payload = read_epee_len_prefixed_bytes(
                         &mut reader_blob,
                         "getblocks.bin blocks(blob_payload/shared_marker)",
                     )?;
+
+                    if blob_payload.len() > MAX_BLOCK_BYTES {
+                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={} > {MAX_BLOCK_BYTES})", blob_payload.len())
+                                .into_boxed_str(),
+                        )));
+                    }
+
+                    if bulk_bin_debug_enabled() {
+                        // After decoding one element, log the next element prefix so we can see whether we're aligned.
+                        if !reader_blob.is_empty() {
+                            let hex = hex_dump_prefix(reader_blob, 16);
+                            println!(
+                                "🧩 getblocks.bin blocks[{}]: next_element_prefix bytes[0..{}]={}",
+                                i,
+                                std::cmp::min(16, reader_blob.len()),
+                                hex
+                            );
+                        } else {
+                            println!("🧩 getblocks.bin blocks[{}]: next_element_prefix: (EOF)", i);
+                        }
+                    }
 
                     if bulk_bin_debug_enabled() {
                         println!(
