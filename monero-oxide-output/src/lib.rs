@@ -1651,60 +1651,115 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
         match name {
             "blocks" => {
-                // Manual parse of the `blocks` array so we can log the failing entry index.
+                // Manual parse of the `blocks` container so we can log the failing entry index.
                 //
-                // `read_epee_value::<Vec<BlockCompleteEntry>>` fails without telling us which element
-                // caused the failure. We decode the array header ourselves, then decode each
-                // `BlockCompleteEntry` one-by-one and annotate errors with `blocks[i]`.
+                // Daemons may encode `blocks` either as:
+                // - plain array marker 0x0d, or
+                // - typed array marker 0x8c (portable_storage typed array; includes an embedded type name)
                 //
-                // NOTE: This assumes the standard EPEE array marker (0x0d). If your daemon uses a
-                // different array marker here, we'll log and fail with a clear message so we can extend it.
+                // We decode the container header ourselves, then decode each `BlockCompleteEntry` one-by-one
+                // and annotate errors with `blocks[i]`.
                 if !r.has_remaining() {
                     return Err(cuprate_epee_encoding::error::Error::Format(
-                        "getblocks.bin decode failed in field 'blocks': EOF (missing array marker)",
+                        "getblocks.bin decode failed in field 'blocks': EOF (missing container marker)",
                     ));
                 }
 
-                let arr_marker = r.get_u8();
-                if arr_marker != 0x0d {
-                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!(
-                            "getblocks.bin decode failed in field 'blocks': unexpected array marker=0x{arr_marker:02x} (expected 0x0d)"
-                        )
-                        .into_boxed_str(),
-                    )));
-                }
+                let container_marker = r.get_u8();
 
-                if !r.has_remaining() {
-                    return Err(cuprate_epee_encoding::error::Error::Format(
-                        "getblocks.bin decode failed in field 'blocks': EOF (missing element marker)",
-                    ));
-                }
-                let elem_marker = r.get_u8();
+                // Determine element count and (optional) typed-array element type name.
+                let (n, typed_elem_type): (u64, Option<String>) = match container_marker {
+                    // Plain array: [0x0d][elem_marker][len][elements...]
+                    0x0d => {
+                        if !r.has_remaining() {
+                            return Err(cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'blocks': EOF (missing element marker)",
+                            ));
+                        }
+                        let elem_marker = r.get_u8();
+                        if elem_marker != 0x0c {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!(
+                                    "getblocks.bin decode failed in field 'blocks': unexpected element marker=0x{elem_marker:02x} (expected object marker 0x0c)"
+                                )
+                                .into_boxed_str(),
+                            )));
+                        }
 
-                // `blocks` should be an array of objects; tolerate both the canonical object marker (0x0c)
-                // and the observed container variants if any appear.
-                if elem_marker != 0x0c {
-                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!(
-                            "getblocks.bin decode failed in field 'blocks': unexpected element marker=0x{elem_marker:02x} (expected object marker 0x0c)"
-                        )
-                        .into_boxed_str(),
-                    )));
-                }
+                        let n = skip_epee_varint_u64(r).map_err(|e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': failed to read array length: {e}")
+                                    .into_boxed_str(),
+                            ))
+                        })?;
 
-                let n = skip_epee_varint_u64(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'blocks': failed to read array length: {e}")
+                        (n, None)
+                    }
+
+                    // Typed array: [0x8c][len][schema_marker][type_name_len][type_name_bytes][element_stream...]
+                    // For object typed arrays, elements do not repeat their marker; each element begins with
+                    // the object payload (field count + name/value pairs).
+                    0x8c => {
+                        let n = skip_epee_varint_u64(r).map_err(|e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': failed to read typed-array length: {e}")
+                                    .into_boxed_str(),
+                            ))
+                        })?;
+
+                        if !r.has_remaining() {
+                            return Err(cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'blocks': EOF (missing typed-array schema marker)",
+                            ));
+                        }
+                        let _schema_marker = r.get_u8();
+
+                        let type_name_len = skip_epee_varint_u64(r).map_err(|e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': failed to read typed-array type name length: {e}")
+                                    .into_boxed_str(),
+                            ))
+                        })?;
+                        let type_name_len_usize = usize::try_from(type_name_len).map_err(|_| {
+                            cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'blocks': typed-array type name length overflow",
+                            )
+                        })?;
+                        if r.remaining() < type_name_len_usize {
+                            return Err(cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'blocks': EOF reading typed-array type name",
+                            ));
+                        }
+                        let type_name_bytes = r.copy_to_bytes(type_name_len_usize);
+                        let type_name = std::str::from_utf8(&type_name_bytes)
+                            .unwrap_or("")
+                            .to_string();
+
+                        (n, Some(type_name))
+                    }
+
+                    _ => {
+                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!(
+                                "getblocks.bin decode failed in field 'blocks': unexpected container marker=0x{container_marker:02x} (expected 0x0d or 0x8c)"
+                            )
                             .into_boxed_str(),
-                    ))
-                })?;
+                        )));
+                    }
+                };
 
                 if bulk_bin_debug_enabled() {
-                    println!(
-                        "🧩 getblocks.bin blocks array: element_marker=0x{:02x} len={}",
-                        elem_marker, n
-                    );
+                    if let Some(ref ty) = typed_elem_type {
+                        println!(
+                            "🧩 getblocks.bin blocks container: typed_array marker=0x8c elem_type={:?} len={}",
+                            ty, n
+                        );
+                    } else {
+                        println!(
+                            "🧩 getblocks.bin blocks container: plain_array marker=0x0d len={}",
+                            n
+                        );
+                    }
                 }
 
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
@@ -1717,8 +1772,8 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         );
                     }
 
-                    // For EPEE arrays, elements do not repeat their marker; we must decode the object payload.
-                    // Object payload begins with varint field count, then repeated (name,value) pairs.
+                    // Each element is an EPEE object payload:
+                    // [field_count varint] then repeated [field_name][field_value]
                     let fields = skip_epee_varint_u64(r).map_err(|e| {
                         cuprate_epee_encoding::error::Error::Format(Box::leak(
                             format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] failed to read object field count: {e}")
@@ -1726,8 +1781,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         ))
                     })?;
 
-                    // Build `BlockCompleteEntry` by emulating the EpeeObjectBuilder loop:
-                    // for each field, read name string then dispatch to builder.add_field(name,...).
                     let mut builder = BlockCompleteEntryBuilder::default();
                     for _ in 0..fields {
                         let name = read_epee_field_name(r).map_err(|e| {
