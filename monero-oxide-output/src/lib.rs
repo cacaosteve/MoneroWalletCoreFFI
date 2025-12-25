@@ -108,6 +108,18 @@ fn peek_epee_varint_u64(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+fn hex_dump_prefix(bytes: &[u8], max_len: usize) -> String {
+    let dump_len = std::cmp::min(max_len, bytes.len());
+    let mut hex = String::new();
+    for (i, b) in bytes[..dump_len].iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
 /// Spec-driven typed-array parser for the observed `txs` encoding in wallet2 `/getblocks.bin`.
 ///
 /// Observed on your daemon:
@@ -123,6 +135,21 @@ fn peek_epee_varint_u64(bytes: &[u8]) -> Option<(u64, usize)> {
 fn read_txs_typed_array_0x8c<B: Buf>(
     r: &mut B,
 ) -> cuprate_epee_encoding::error::Result<Vec<Vec<u8>>> {
+    // Dump 1: container start (includes 0x8c marker) – helps reverse-engineer the full container layout.
+    if bulk_bin_debug_enabled() {
+        let chunk0 = r.chunk();
+        if !chunk0.is_empty() {
+            let hex = hex_dump_prefix(chunk0, 64);
+            println!(
+                "🧩 txs(0x8c) dump@container_start bytes[0..{}]={}",
+                std::cmp::min(64, chunk0.len()),
+                hex
+            );
+        } else {
+            println!("🧩 txs(0x8c) dump@container_start: (unavailable)");
+        }
+    }
+
     if !r.has_remaining() {
         return Err(cuprate_epee_encoding::error::Error::Format(
             "read_txs_typed_array_0x8c: EOF (missing marker)",
@@ -166,11 +193,29 @@ fn read_txs_typed_array_0x8c<B: Buf>(
         .unwrap_or("")
         .to_string();
 
+    // Dump 2: element stream start (right after marker + count + schema header).
+    // This is the most important dump for implementing a correct parser.
+    if bulk_bin_debug_enabled() {
+        let chunk1 = r.chunk();
+        if !chunk1.is_empty() {
+            let hex = hex_dump_prefix(chunk1, 64);
+            println!(
+                "🧩 txs(0x8c) dump@element_stream_start elem_type={:?} count={} bytes[0..{}]={}",
+                elem_type,
+                n,
+                std::cmp::min(64, chunk1.len()),
+                hex
+            );
+        } else {
+            println!(
+                "🧩 txs(0x8c) dump@element_stream_start elem_type={:?} count={}: (unavailable)",
+                elem_type, n
+            );
+        }
+    }
+
     // 3) Decode elements.
     // For elem_type == "blob": parse each element as a length-prefixed byte array.
-    // The element itself may still be prefixed by a marker; if so, handle it conservatively:
-    // - if it's a known byte/blob/string marker, consume it and then read len+bytes
-    // - otherwise fall back to generic skipping, inserting an empty blob as a placeholder
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
 
     if elem_type == "blob" {
@@ -189,26 +234,16 @@ fn read_txs_typed_array_0x8c<B: Buf>(
             }
 
             // Schema-driven decoding:
-            // For element_type="blob", treat elements as length-prefixed bytes.
-            //
-            // Some daemons prefix each element with a marker byte (which can vary: 0x0a/0x0b/0xba/0xcf/...).
-            // Instead of enumerating marker bytes, we:
-            // - if the next byte *looks like* a marker, peek the following varint length and validate it
-            // - otherwise, treat the element as "no per-element marker" and parse varint length directly
+            // Try marker-present form: [marker][varint_len][bytes]
+            // Then no-marker form: [varint_len][bytes]
             let first = chunk[0];
 
-            // Attempt "marker-present" form:
-            // [marker][varint_len][bytes...]
-            //
-            // We only consume the marker if the bytes after it contain a plausible varint length that fits
-            // within remaining buffer (prevents mis-parsing unknown structures).
             if chunk.len() >= 2 {
                 if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
                     let rem_after_marker = r.remaining().saturating_sub(1);
                     if (used as u64) <= rem_after_marker as u64
                         && len <= rem_after_marker.saturating_sub(used) as u64
                     {
-                        // Looks like a marker + length-prefixed blob; consume marker and read bytes.
                         let _ = r.get_u8();
 
                         if bulk_bin_debug_enabled() && first != 0x0a && first != 0x0b {
@@ -225,8 +260,6 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 }
             }
 
-            // Attempt "no per-element marker" form:
-            // [varint_len][bytes...]
             if let Some((len, used)) = peek_epee_varint_u64(chunk) {
                 let rem = r.remaining();
                 if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
@@ -239,15 +272,11 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 }
             }
 
-            // If neither form looks valid, skip one marker byte + its associated value (best-effort)
-            // and record an empty element so higher layers can fall back.
             let _ = r.get_u8();
             skip_epee_value_with_known_marker(r, first)?;
             out.push(Vec::new());
         }
     } else {
-        // Unknown element type: skip elements conservatively.
-        // We keep alignment and return empty blobs so caller can fall back if needed.
         for _ in 0..n {
             if !r.has_remaining() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
