@@ -246,20 +246,37 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 ));
             }
 
-            // If element begins with a known blob marker, consume it.
+            // Marker-agnostic blob decoding (wallet2-like):
             //
-            // We already observed element stream entries starting with 0x0a (blob/string marker).
-            // Some daemons appear to use additional marker variants (e.g. 0x99/0x9a). Treat them
-            // as equivalent "blob marker + varint_len + bytes" prefixes here.
+            // The typed-array header already declares elem_type="blob". Daemons may choose different
+            // legal blob/string marker bytes per element, so we do NOT enumerate marker values.
+            //
+            // We accept either:
+            //   A) marker + varint_len + bytes  (marker can be any u8, as long as the following varint is plausible)
+            //   B) markerless varint_len + bytes
+            //
+            // We validate lengths against the remaining buffer to avoid desync.
             let first = chunk[0];
-            if first == 0x0a || first == 0x0b || first == 0x99 || first == 0x9a {
-                let _ = r.get_u8();
-                let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob,marker)")?;
-                out.push(b);
-                continue;
+
+            // A) marker-present: [marker][varint_len][bytes...]
+            if chunk.len() >= 2 {
+                if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
+                    let rem_after_marker = r.remaining().saturating_sub(1);
+                    if (used as u64) <= rem_after_marker as u64
+                        && len <= rem_after_marker.saturating_sub(used) as u64
+                    {
+                        let _ = r.get_u8(); // consume marker (whatever it is)
+                        let b = read_epee_len_prefixed_bytes(
+                            r,
+                            "read_txs_typed_array_0x8c(blob,marker_any)",
+                        )?;
+                        out.push(b);
+                        continue;
+                    }
+                }
             }
 
-            // Otherwise, require markerless varint length at the start.
+            // B) markerless: [varint_len][bytes...]
             if let Some((len, used)) = peek_epee_varint_u64(chunk) {
                 let rem = r.remaining();
                 if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
