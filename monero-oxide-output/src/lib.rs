@@ -1864,6 +1864,17 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         };
 
                         if len_usize > MAX_BLOCK_BYTES {
+                            // Some daemons encode typed-array `blocks` with empty elem_type in a packed / non-length-prefixed form.
+                            // If we try to interpret it as markerless length-prefixed bytes, we can read a nonsensical "length"
+                            // and stall in a retry loop. Since you don't care about the fallback right now, bail out cleanly so
+                            // the caller can fall back to per-block scanning without repeated stall retries.
+                            if matches!(typed_elem_type.as_deref(), Some("")) && !has_marker {
+                                return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                    format!("getblocks.bin decode failed in field 'blocks': typed-array elem_type empty appears packed/unsupported (first markerless len={len_usize} > {MAX_BLOCK_BYTES}); forcing fallback")
+                                        .into_boxed_str(),
+                                )));
+                            }
+
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
                                 format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={len_usize} > {MAX_BLOCK_BYTES})")
                                     .into_boxed_str(),
