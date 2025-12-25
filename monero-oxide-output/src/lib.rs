@@ -25,7 +25,7 @@ enum BulkFetchMode {
     RangeBlocks,
 }
 
-const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v4";
+const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v5";
 
 fn build_stamp() -> &'static str {
     // Prefer a compile-time stamp if provided by the build system.
@@ -1754,6 +1754,20 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             "🧩 getblocks.bin blocks container: typed_array marker=0x8c elem_type={:?} len={}",
                             ty, n
                         );
+
+                        // Dump the element stream start right after the typed-array header so we can
+                        // determine whether elements are object payloads, blobs, or another encoding.
+                        let chunk = r.chunk();
+                        if !chunk.is_empty() {
+                            let hex = hex_dump_prefix(chunk, 64);
+                            println!(
+                                "🧩 getblocks.bin blocks element_stream_start bytes[0..{}]={}",
+                                std::cmp::min(64, chunk.len()),
+                                hex
+                            );
+                        } else {
+                            println!("🧩 getblocks.bin blocks element_stream_start: (unavailable)");
+                        }
                     } else {
                         println!(
                             "🧩 getblocks.bin blocks container: plain_array marker=0x0d len={}",
