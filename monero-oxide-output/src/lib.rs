@@ -1657,8 +1657,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 // - plain array marker 0x0d, or
                 // - typed array marker 0x8c (portable_storage typed array; includes an embedded type name)
                 //
-                // We decode the container header ourselves, then decode each `BlockCompleteEntry` one-by-one
-                // and annotate errors with `blocks[i]`.
+                // We decode the container header ourselves, then decode each element and annotate errors with `blocks[i]`.
                 if !r.has_remaining() {
                     return Err(cuprate_epee_encoding::error::Error::Format(
                         "getblocks.bin decode failed in field 'blocks': EOF (missing container marker)",
@@ -1697,8 +1696,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     }
 
                     // Typed array: [0x8c][len][schema_marker][type_name_len][type_name_bytes][element_stream...]
-                    // For object typed arrays, elements do not repeat their marker; each element begins with
-                    // the object payload (field count + name/value pairs).
                     0x8c => {
                         let n = skip_epee_varint_u64(r).map_err(|e| {
                             cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -1776,6 +1773,62 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     }
                 }
 
+                // Decode elements.
+                //
+                // If typed_elem_type is "block", the element stream is a sequence of length-prefixed block blobs
+                // (EPEE blob/string markers). Map each into a `BlockCompleteEntry` with empty `txs` so the
+                // scanner can proceed (and optionally fall back to per-block tx fetch later).
+                if matches!(typed_elem_type.as_deref(), Some("block")) {
+                    let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+
+                    for i in 0..n {
+                        if bulk_bin_debug_enabled() {
+                            println!(
+                                "🧩 getblocks.bin blocks[{}]: decode block-blob start (remaining={})",
+                                i,
+                                r.remaining()
+                            );
+                        }
+
+                        if !r.has_remaining() {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing blob marker)")
+                                    .into_boxed_str(),
+                            )));
+                        }
+
+                        let m = r.get_u8();
+                        // Treat common blob/string markers uniformly.
+                        if m != 0x0a && m != 0x0b {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] unexpected blob marker=0x{m:02x} (expected 0x0a/0x0b)")
+                                    .into_boxed_str(),
+                            )));
+                        }
+
+                        let block_bytes =
+                            read_epee_len_prefixed_bytes(r, "getblocks.bin blocks(block_blob)")?;
+
+                        if bulk_bin_debug_enabled() {
+                            println!(
+                                "🧩 getblocks.bin blocks[{}]: decode block-blob ok (block_bytes={})",
+                                i,
+                                block_bytes.len()
+                            );
+                        }
+
+                        out.push(BlockCompleteEntry {
+                            block: block_bytes,
+                            txs: Vec::new(),
+                            pruned: true,
+                        });
+                    }
+
+                    self.blocks = Some(out);
+                    return Ok(true);
+                }
+
+                // Default: decode as `BlockCompleteEntry` objects (object payloads with field names).
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
                 for i in 0..n {
                     if bulk_bin_debug_enabled() {
