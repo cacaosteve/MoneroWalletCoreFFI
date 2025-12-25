@@ -1997,10 +1997,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 // For a typed array, `blocks_elem_marker` applies to ALL elements, and elements do NOT include
                 // a per-element marker.
                 //
-                // IMPORTANT: the typed-array header already consumed `blocks_elem_marker`, and the element stream
-                // starts immediately after it. However, the element values are still encoded as blob-like values
-                // in portable_storage, so each element begins with the blob marker byte. We must therefore
-                // skip the per-element marker before reading the varint length + payload.
+                // IMPORTANT: for this daemon variant, the typed-array header includes a blob-like element marker,
+                // but the element stream itself is markerless (each element begins with the varint length).
+                //
+                // To be compatible with multiple daemon encodings, we:
+                // - treat `blocks_elem_marker` as the declared element *type* (blob-like), not a required byte prefix
+                // - if the marker byte happens to be present before an element, we skip it
+                // - otherwise we decode markerless: [varint_len][payload...]
                 const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024; // 10 MiB cap (defensive)
 
                 if !is_supported_blob_marker(blocks_elem_marker) {
@@ -2041,20 +2044,11 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         )));
                     }
 
-                    // Each element is encoded as: [marker][varint_len][payload...]
-                    // The marker should match the shared typed-array element marker.
-                    let marker = reader_blob[0];
-                    if marker != blocks_elem_marker {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "getblocks.bin decode failed in field 'blocks': blocks[{i}] unexpected blob marker=0x{marker:02x} (expected 0x{blocks_elem_marker:02x})"
-                            )
-                            .into_boxed_str(),
-                        )));
+                    // Elements are typically markerless: [varint_len][payload...]
+                    // Some daemons may redundantly include the blob marker before each element; accept it if present.
+                    if !reader_blob.is_empty() && reader_blob[0] == blocks_elem_marker {
+                        reader_blob = &reader_blob[1..];
                     }
-
-                    // Skip marker, then parse length-prefixed payload.
-                    reader_blob = &reader_blob[1..];
 
                     // Validate length prefix bounds before allocating.
                     if let Some((len_u64, used)) = peek_epee_varint_u64(reader_blob) {
