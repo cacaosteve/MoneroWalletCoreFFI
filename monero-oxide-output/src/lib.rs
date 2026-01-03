@@ -1735,13 +1735,41 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
         match name {
             "blocks" => {
-                // Manual parse of the `blocks` container so we can log the failing entry index.
+                // Prefer generic, schema-driven EPEE decoding first (wallet2-like),
+                // and only fall back to the existing manual instrumentation if that fails.
+                //
+                // Rationale:
+                // - Our manual typed-array parsing has proven brittle across daemon variants.
+                // - A changing "elem_marker" across runs is a strong sign we may be misaligned.
+                // - The generic decoder is the best chance to correctly interpret portable_storage.
+                match cuprate_epee_encoding::read_epee_value::<Vec<BlockCompleteEntry>, _>(r) {
+                    Ok(v) => {
+                        if bulk_bin_debug_enabled() {
+                            println!(
+                                "🧩 getblocks.bin blocks: generic decode ok (count={})",
+                                v.len()
+                            );
+                        }
+                        self.blocks = Some(v);
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        if bulk_bin_debug_enabled() {
+                            println!(
+                                "🧩 getblocks.bin blocks: generic decode failed; falling back to manual parser: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // ---- Manual instrumentation / legacy fallback path ----
+                // Manual parse of the `blocks` container so we can log the failing entry index and
+                // attempt to keep cursor alignment for debugging.
                 //
                 // Daemons may encode `blocks` either as:
                 // - plain array marker 0x0d, or
                 // - typed array marker 0x8c (portable_storage typed array; includes an embedded type name)
-                //
-                // We decode the container header ourselves, then decode each element and annotate errors with `blocks[i]`.
                 if !r.has_remaining() {
                     return Err(cuprate_epee_encoding::error::Error::Format(
                         "getblocks.bin decode failed in field 'blocks': EOF (missing container marker)",
@@ -1780,9 +1808,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     }
 
                     // Typed array: [0x8c][len][schema_marker][type_name_len][type_name_bytes][elem_marker][elements...]
-                    //
-                    // IMPORTANT: In Monero portable_storage, arrays provide the element marker once, and elements
-                    // are then encoded WITHOUT their own markers.
                     0x8c => {
                         let n = skip_epee_varint_u64(r).map_err(|e| {
                             cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -1826,8 +1851,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                         let elem_marker = r.get_u8();
 
-                        // Pass the element marker to the decoder by appending it to the type name in a stable way.
-                        // This avoids widening the match tuple and keeps changes localized.
                         (
                             n,
                             Some(format!("{type_name}|elem_marker=0x{elem_marker:02x}")),
@@ -1851,8 +1874,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             ty, n
                         );
 
-                        // Dump the element stream start right after the typed-array header so we can
-                        // determine whether elements are object payloads, blobs, or another encoding.
                         let chunk = r.chunk();
                         if !chunk.is_empty() {
                             let hex = hex_dump_prefix(chunk, 64);
@@ -1872,21 +1893,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     }
                 }
 
-                // Decode elements.
-                //
-                // For typed arrays, Monero portable_storage supplies the element marker ONCE in the header.
-                // Elements are then encoded WITHOUT per-element markers.
-                //
-                // We therefore:
-                // - extract the shared element marker from `typed_elem_type` (encoded as `|elem_marker=0x..`)
-                // - decode `n` elements using that marker
+                // Decode elements (manual best-effort).
                 let blocks_elem_marker: u8 = typed_elem_type
                     .as_deref()
                     .and_then(|s| s.split("|elem_marker=0x").nth(1))
                     .and_then(|hex| u8::from_str_radix(&hex[..2.min(hex.len())], 16).ok())
                     .unwrap_or(0x0a);
 
-                // Savepoint slice right after the typed-array header (including elem_marker already consumed).
                 let savepoint: &[u8] = r.chunk();
 
                 // --- Attempt 1: decode as `BlockCompleteEntry` objects ---
@@ -1912,8 +1925,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                     }
 
-                    // Each element is an EPEE object payload:
-                    // [field_count varint] then repeated [field_name][field_value]
                     let fields = match skip_epee_varint_u64(&mut reader_obj) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1988,7 +1999,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 }
 
                 if object_decode_ok && obj_out.len() == n as usize {
-                    // Commit consumption: advance the original Buf by the bytes we consumed in the temp reader.
                     let consumed = savepoint.len().saturating_sub(reader_obj.len());
                     r.advance(consumed);
                     self.blocks = Some(obj_out);
@@ -2002,19 +2012,8 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     );
                 }
 
-                // --- Attempt 2: decode as length-prefixed blob bytes (shared element marker) ---
-                //
-                // For a typed array, `blocks_elem_marker` applies to ALL elements, and elements do NOT include
-                // a per-element marker.
-                //
-                // IMPORTANT: for this daemon variant, the typed-array header includes a blob-like element marker,
-                // but the element stream itself is markerless (each element begins with the varint length).
-                //
-                // To be compatible with multiple daemon encodings, we:
-                // - treat `blocks_elem_marker` as the declared element *type* (blob-like), not a required byte prefix
-                // - if the marker byte happens to be present before an element, we skip it
-                // - otherwise we decode markerless: [varint_len][payload...]
-                const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024; // 10 MiB cap (defensive)
+                // --- Attempt 2: decode as length-prefixed blob bytes ---
+                const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024;
 
                 if !is_supported_blob_marker(blocks_elem_marker) {
                     return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -2029,24 +2028,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
 
                 for i in 0..n {
-                    if bulk_bin_debug_enabled() {
-                        println!(
-                            "🧩 getblocks.bin blocks[{}]: blob-decode(shared_marker=0x{:02x}) start (remaining={})",
-                            i,
-                            blocks_elem_marker,
-                            reader_blob.len()
-                        );
-                        if !reader_blob.is_empty() {
-                            let hex = hex_dump_prefix(reader_blob, 32);
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: blob-decode peek bytes[0..{}]={}",
-                                i,
-                                std::cmp::min(32, reader_blob.len()),
-                                hex
-                            );
-                        }
-                    }
-
                     if reader_blob.is_empty() {
                         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
                             format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing element bytes)")
@@ -2054,15 +2035,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         )));
                     }
 
-                    // Typed-array `blocks` on some daemons is NOT a clean "vector of elements" in portable_storage terms.
-                    // It can be a packed stream where the "element marker" in the typed-array header is informational,
-                    // and what follows is a sequence of already-delimited payloads.
-                    //
-                    // Based on observed data, treat each element as a raw length-prefixed payload and avoid any
-                    // pre-validation pass that can desync the cursor when the stream isn't actually element-aligned.
-                    //
-                    // Elements are usually markerless: [varint_len][payload...]
-                    // Some daemons may redundantly include the blob marker before each element; accept it if present.
                     if !reader_blob.is_empty() && reader_blob[0] == blocks_elem_marker {
                         reader_blob = &reader_blob[1..];
                     }
@@ -2074,55 +2046,17 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                     if blob_payload.len() > MAX_BLOCK_BYTES {
                         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={} > {MAX_BLOCK_BYTES})", blob_payload.len())
-                                .into_boxed_str(),
+                            format!(
+                                "getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={} > {MAX_BLOCK_BYTES})",
+                                blob_payload.len()
+                            )
+                            .into_boxed_str(),
                         )));
-                    }
-
-                    if bulk_bin_debug_enabled() {
-                        // After decoding one element, log the next element prefix so we can see whether we're aligned.
-                        if !reader_blob.is_empty() {
-                            let hex = hex_dump_prefix(reader_blob, 16);
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: next_element_prefix bytes[0..{}]={}",
-                                i,
-                                std::cmp::min(16, reader_blob.len()),
-                                hex
-                            );
-                        } else {
-                            println!("🧩 getblocks.bin blocks[{}]: next_element_prefix: (EOF)", i);
-                        }
-                    }
-
-                    if bulk_bin_debug_enabled() {
-                        println!(
-                            "🧩 getblocks.bin blocks[{}]: blob-decode ok (payload_len={})",
-                            i,
-                            blob_payload.len()
-                        );
-                        if !blob_payload.is_empty() {
-                            let hex = hex_dump_prefix(&blob_payload, 32);
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: blob payload peek bytes[0..{}]={}",
-                                i,
-                                std::cmp::min(32, blob_payload.len()),
-                                hex
-                            );
-                        }
                     }
 
                     if let Some(entry) =
                         try_decode_block_complete_entry_from_blob_payload(&blob_payload)?
                     {
-                        if bulk_bin_debug_enabled() {
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: inner object-decode from blob payload ok (block_bytes={} tx_blobs={} pruned={})",
-                                i,
-                                entry.block.len(),
-                                entry.txs.len(),
-                                entry.pruned
-                            );
-                        }
                         out.push(entry);
                     } else {
                         out.push(BlockCompleteEntry {
@@ -2133,7 +2067,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     }
                 }
 
-                // Commit consumption: advance the original Buf by the bytes we consumed in the temp reader.
                 let consumed = savepoint.len().saturating_sub(reader_blob.len());
                 r.advance(consumed);
 
