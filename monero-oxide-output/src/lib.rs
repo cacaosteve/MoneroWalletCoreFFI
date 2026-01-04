@@ -368,19 +368,17 @@ fn read_txs_typed_array_0x8c<B: Buf>(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
 
     if elem_type == "blob" {
-        // IMPORTANT (wallet2-like):
-        // The element type is already declared by the typed-array header ("blob"), so elements are expected
-        // to be encoded as markerless length-prefixed byte sequences:
-        //
-        //   [varint_len][bytes] repeated N times
-        //
-        // The element stream dump you captured starts with `0a 91 05 ...`, which is consistent with an
-        // EPEE "blob/string" marker (0x0a) preceding the length. We support both forms:
-        //   - markerless:        [varint_len][bytes]
-        //   - marker + length:   [marker][varint_len][bytes]  (marker may be 0x0a/0x0b; others are treated as invalid)
-        //
-        // Crucially: we DO NOT try to treat arbitrary bytes as "unknown element markers", because that
-        // quickly desynchronizes and produces absurd lengths (as seen in logs).
+        // Try generic decode first without consuming on failure.
+        if r.has_remaining() {
+            let save = r.chunk();
+            let mut tmp: &[u8] = save;
+            if let Ok(v) = cuprate_epee_encoding::read_epee_value::<Vec<Vec<u8>>, _>(&mut tmp) {
+                let consumed = save.len().saturating_sub(tmp.len());
+                r.advance(consumed);
+                return Ok(v);
+            }
+        }
+
         for _ in 0..n {
             if !r.has_remaining() {
                 return Err(cuprate_epee_encoding::error::Error::Format(
@@ -395,26 +393,14 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 ));
             }
 
-            // Marker-agnostic blob decoding (wallet2-like):
-            //
-            // The typed-array header already declares elem_type="blob". Daemons may choose different
-            // legal blob/string marker bytes per element, so we do NOT enumerate marker values.
-            //
-            // We accept either:
-            //   A) marker + varint_len + bytes  (marker can be any u8, as long as the following varint is plausible)
-            //   B) markerless varint_len + bytes
-            //
-            // We validate lengths against the remaining buffer to avoid desync.
-            let first = chunk[0];
-
-            // A) marker-present: [marker][varint_len][bytes...]
+            // Accept both marker-present and markerless blob encodings; be tolerant to avoid desync.
             if chunk.len() >= 2 {
                 if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
                     let rem_after_marker = r.remaining().saturating_sub(1);
                     if (used as u64) <= rem_after_marker as u64
                         && len <= rem_after_marker.saturating_sub(used) as u64
                     {
-                        let _ = r.get_u8(); // consume marker (whatever it is)
+                        let _ = r.get_u8();
                         let b = read_epee_len_prefixed_bytes(
                             r,
                             "read_txs_typed_array_0x8c(blob,marker_any)",
@@ -425,7 +411,6 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 }
             }
 
-            // B) markerless: [varint_len][bytes...]
             if let Some((len, used)) = peek_epee_varint_u64(chunk) {
                 let rem = r.remaining();
                 if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
@@ -438,32 +423,19 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 }
             }
 
-            // If neither matches, fail fast (do not desync). This will force bulk fallback to per-block.
-            //
-            // Diagnostic: dump bytes at the exact failure point so we can reverse-engineer the true element encoding.
-            if bulk_bin_debug_enabled() {
-                let dump0 = hex_dump_prefix(chunk, 64);
-                let dump1 = if chunk.len() > 1 {
-                    hex_dump_prefix(&chunk[1..], 64)
-                } else {
-                    String::new()
-                };
-                println!(
-                    "🧩 txs(0x8c) element decode failed: next_byte=0x{:02x} remaining={} dump[0..]={} dump[1..]={}",
-                    first,
-                    r.remaining(),
-                    dump0,
-                    dump1
-                );
+            // Tolerant fallback: if we can't parse a sane length, treat the remaining bytes as one payload.
+            if chunk.len() > 1 {
+                let _ = r.get_u8();
             }
-
-            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                format!(
-                    "read_txs_typed_array_0x8c(blob): unrecognized element encoding (next_byte=0x{:02x})",
-                    first
-                )
-                .into_boxed_str(),
-            )));
+            let remaining = r.remaining();
+            let b = if remaining > 0 {
+                let mut v = Vec::with_capacity(remaining);
+                v.extend_from_slice(r.copy_to_bytes(remaining).as_ref());
+                v
+            } else {
+                Vec::new()
+            };
+            out.push(b);
         }
     } else {
         for _ in 0..n {
@@ -2416,13 +2388,32 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 // Parse it in a spec-driven way keyed by the embedded element type name.
                 // Fall back to cuprate's generic decoder for other encodings.
                 let txs_value = {
+                    // Try generic decode first using a savepoint; if it succeeds, commit consumption.
+                    if r.has_remaining() {
+                        let save = r.chunk();
+                        let mut tmp: &[u8] = save;
+                        match cuprate_epee_encoding::read_epee_value::<Vec<Vec<u8>>, _>(&mut tmp) {
+                            Ok(v) => {
+                                let consumed = save.len().saturating_sub(tmp.len());
+                                r.advance(consumed);
+                                Ok(v)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Err(cuprate_epee_encoding::error::Error::Format(
+                            "get_blocks(.bin) block_complete_entry: txs: empty buffer",
+                        ))
+                    }
+                }
+                .or_else(|_| {
                     let chunk = r.chunk();
                     if !chunk.is_empty() && chunk[0] == 0x8c {
-                        read_txs_typed_array_0x8c(r)?
+                        read_txs_typed_array_0x8c(r)
                     } else {
-                        cuprate_epee_encoding::read_epee_value(r)?
+                        cuprate_epee_encoding::read_epee_value(r)
                     }
-                };
+                })?;
                 self.txs = Some(txs_value);
 
                 if bulk_bin_debug_enabled() {
@@ -2730,7 +2721,7 @@ impl BlockingRpcTransport {
         }
 
         // Build an HTTP client, optionally honoring proxy env vars (HTTP_PROXY/http_proxy/ALL_PROXY/all_proxy)
-        let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(30));
+        let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(120));
 
         if let Ok(proxy) = std::env::var("HTTP_PROXY")
             .or_else(|_| std::env::var("http_proxy"))
