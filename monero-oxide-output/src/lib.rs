@@ -1742,23 +1742,33 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 // - Our manual typed-array parsing has proven brittle across daemon variants.
                 // - A changing "elem_marker" across runs is a strong sign we may be misaligned.
                 // - The generic decoder is the best chance to correctly interpret portable_storage.
-                match cuprate_epee_encoding::read_epee_value::<Vec<BlockCompleteEntry>, _>(r) {
-                    Ok(v) => {
-                        if bulk_bin_debug_enabled() {
-                            println!(
-                                "🧩 getblocks.bin blocks: generic decode ok (count={})",
-                                v.len()
-                            );
+                // Retryable generic decode: do not consume the original buffer unless decode succeeds.
+                if r.has_remaining() {
+                    let save = r.chunk();
+                    let mut tmp: &[u8] = save;
+                    match cuprate_epee_encoding::read_epee_value::<Vec<BlockCompleteEntry>, _>(
+                        &mut tmp,
+                    ) {
+                        Ok(v) => {
+                            let consumed = save.len().saturating_sub(tmp.len());
+                            r.advance(consumed);
+                            if bulk_bin_debug_enabled() {
+                                println!(
+                                    "🧩 getblocks.bin blocks: generic decode ok (count={})",
+                                    v.len()
+                                );
+                            }
+                            self.blocks = Some(v);
+                            return Ok(true);
                         }
-                        self.blocks = Some(v);
-                        return Ok(true);
-                    }
-                    Err(e) => {
-                        if bulk_bin_debug_enabled() {
-                            println!(
-                                "🧩 getblocks.bin blocks: generic decode failed; falling back to manual parser: {}",
-                                e
-                            );
+                        Err(e) => {
+                            if bulk_bin_debug_enabled() {
+                                println!(
+                                    "🧩 getblocks.bin blocks: generic decode failed; falling back to manual parser: {}",
+                                    e
+                                );
+                            }
+                            // Leave `r` untouched and continue with manual instrumentation.
                         }
                     }
                 }
