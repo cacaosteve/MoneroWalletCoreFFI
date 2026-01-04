@@ -2305,11 +2305,71 @@ impl EpeeObject for GetBlocksBinRequest {
 
 /// Shared block entry for `get_blocks_by_height.bin` and (typically) `get_blocks.bin`.
 #[derive(Clone, Debug)]
+struct TxBlobEntry {
+    blob: Vec<u8>,
+    prunable_hash: Option<[u8; 32]>,
+}
+
+#[derive(Default)]
+struct TxBlobEntryBuilder {
+    blob: Option<Vec<u8>>,
+    prunable_hash: Option<[u8; 32]>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<TxBlobEntry> for TxBlobEntryBuilder {
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "blob" => {
+                self.blob = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "prunable_hash" => {
+                self.prunable_hash = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<TxBlobEntry> {
+        Ok(TxBlobEntry {
+            blob: self.blob.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field blob missing")
+            })?,
+            prunable_hash: self.prunable_hash,
+        })
+    }
+}
+
+impl EpeeObject for TxBlobEntry {
+    type Builder = TxBlobEntryBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        let mut n = 1; // blob
+        if self.prunable_hash.is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.blob, "blob", w)?;
+        if let Some(hash) = self.prunable_hash {
+            write_field(hash, "prunable_hash", w)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 struct BlockCompleteEntry {
     block: Vec<u8>,
     // Some daemons (or prune modes) omit tx blobs in certain responses.
     // When omitted, we treat it as an empty list and let the caller decide whether to fall back.
-    txs: Vec<Vec<u8>>,
+    txs: Vec<TxBlobEntry>,
     // In Monero `block_complete_entry`, daemons include whether the entry is pruned.
     // Wallet2 `/getblocks.bin` responses commonly include this field.
     pruned: bool,
@@ -2318,7 +2378,7 @@ struct BlockCompleteEntry {
 #[derive(Default)]
 struct BlockCompleteEntryBuilder {
     block: Option<Vec<u8>>,
-    txs: Option<Vec<Vec<u8>>>,
+    txs: Option<Vec<TxBlobEntry>>,
     pruned: Option<bool>,
 }
 
@@ -2387,8 +2447,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 // Some daemons encode `txs` with a typed-array marker (observed 0x8c + element type name "blob").
                 // Parse it in a spec-driven way keyed by the embedded element type name.
                 // Fall back to cuprate's generic decoder for other encodings.
-                let txs_value = {
-                    // Try generic decode first using a savepoint; if it succeeds, commit consumption.
+                let txs_value: Vec<Vec<u8>> = {
                     if r.has_remaining() {
                         let save = r.chunk();
                         let mut tmp: &[u8] = save;
@@ -2414,7 +2473,14 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         cuprate_epee_encoding::read_epee_value(r)
                     }
                 })?;
-                self.txs = Some(txs_value);
+                let tx_entries: Vec<TxBlobEntry> = txs_value
+                    .into_iter()
+                    .map(|blob| TxBlobEntry {
+                        blob,
+                        prunable_hash: None,
+                    })
+                    .collect();
+                self.txs = Some(tx_entries);
 
                 if bulk_bin_debug_enabled() {
                     let rem_after = r.remaining();
@@ -4404,7 +4470,7 @@ pub extern "C" fn wallet_refresh(
                                         let mut parsed_txs: Vec<Transaction<Pruned>> =
                                             Vec::with_capacity(entry.txs.len());
                                         for tx_blob in entry.txs {
-                                            let mut tb = tx_blob.as_slice();
+                                            let mut tb = tx_blob.blob.as_slice();
                                             match Transaction::<Pruned>::read(&mut tb) {
                                                 Ok(t) => parsed_txs.push(t),
                                                 Err(_) => {
@@ -4634,7 +4700,7 @@ pub extern "C" fn wallet_refresh(
                                         let mut parsed_txs: Vec<Transaction<Pruned>> =
                                             Vec::with_capacity(entry.txs.len());
                                         for tx_blob in entry.txs {
-                                            let mut tb = tx_blob.as_slice();
+                                            let mut tb = tx_blob.blob.as_slice();
                                             match Transaction::<Pruned>::read(&mut tb) {
                                                 Ok(t) => parsed_txs.push(t),
                                                 Err(_) => {
@@ -5127,7 +5193,7 @@ pub extern "C" fn wallet_refresh(
                                                 let mut parsed_txs: Vec<Transaction<Pruned>> =
                                                     Vec::with_capacity(entry.txs.len());
                                                 for tx_blob in entry.txs {
-                                                    let mut tb = tx_blob.as_slice();
+                                                    let mut tb = tx_blob.blob.as_slice();
                                                     match Transaction::<Pruned>::read(&mut tb) {
                                                         Ok(t) => parsed_txs.push(t),
                                                         Err(_) => {
@@ -5458,7 +5524,7 @@ pub extern "C" fn wallet_refresh(
                                 Vec::with_capacity(entry.txs.len());
                             let mut tx_parse_failed = false;
                             for tx_blob in entry.txs {
-                                let mut tb = tx_blob.as_slice();
+                                let mut tb = tx_blob.blob.as_slice();
                                 match Transaction::<Pruned>::read(&mut tb) {
                                     Ok(t) => parsed_txs.push(t),
                                     Err(_) => {
