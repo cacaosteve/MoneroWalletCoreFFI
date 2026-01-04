@@ -1117,12 +1117,22 @@ fn skip_epee_value_with_known_marker<B: Buf>(
             }
             Ok(())
         }
-        _ => Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!(
-                "skip_epee_value_with_known_marker: unsupported marker=0x{marker:02x} (extend decoder)"
-            )
-            .into_boxed_str(),
-        ))),
+        _ => {
+            // Tolerant fallback: treat unknown markers as blob-like with a varint length.
+            let len = skip_epee_varint_u64(r)?;
+            let len_usize = usize::try_from(len).map_err(|_| {
+                cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: length overflow (unknown marker)",
+                )
+            })?;
+            if r.remaining() < len_usize {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: EOF reading bytes (unknown marker)",
+                ));
+            }
+            r.advance(len_usize);
+            Ok(())
+        }
     }
 }
 
