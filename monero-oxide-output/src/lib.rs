@@ -413,11 +413,21 @@ fn read_txs_typed_array_0x8c<B: Buf>(
 
             if let Some((len, used)) = peek_epee_varint_u64(chunk) {
                 let rem = r.remaining();
+                // If the declared length fits, decode normally.
                 if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
                     let b = read_epee_len_prefixed_bytes(
                         r,
                         "read_txs_typed_array_0x8c(blob,markerless)",
                     )?;
+                    out.push(b);
+                    continue;
+                }
+                // Tolerant path: if the declared length is larger than remaining, consume what remains.
+                if (used as u64) <= rem as u64 && len > rem.saturating_sub(used) as u64 {
+                    r.advance(used);
+                    let rem_now = r.remaining();
+                    let mut b = Vec::with_capacity(rem_now);
+                    b.extend_from_slice(r.copy_to_bytes(rem_now).as_ref());
                     out.push(b);
                     continue;
                 }
