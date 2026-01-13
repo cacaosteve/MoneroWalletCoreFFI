@@ -27,6 +27,51 @@ enum BulkFetchMode {
 
 const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 
+fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0usize;
+    while i < 32 {
+        let hi = hex_val(bytes[i * 2])?;
+        let lo = hex_val(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Some(out)
+}
+
+fn walletcore_debug_target_txid() -> Option<[u8; 32]> {
+    std::env::var("WALLETCORE_DEBUG_TXID")
+        .ok()
+        .and_then(|s| parse_hex_32(&s))
+}
+
+fn walletcore_debug_target_height() -> Option<u64> {
+    std::env::var("WALLETCORE_DEBUG_HEIGHT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+fn walletcore_debug_target_window() -> u64 {
+    std::env::var("WALLETCORE_DEBUG_HEIGHT_WINDOW")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 fn build_stamp() -> &'static str {
     // Prefer a compile-time stamp if provided by the build system.
     //
@@ -529,10 +574,37 @@ use monero_ed25519::{Point as EdPoint, Scalar as EdScalar};
 use monero_seed::{Language as MoneroSeedLanguage, Seed as MoneroSeed};
 use monero_wallet::{
     block::Block,
-    rpc::{Rpc, RpcError, ScannableBlock},
     transaction::{Pruned, Timelock, Transaction},
     Scanner, ViewPair,
 };
+
+fn fingerprint32(label: &str, bytes: &[u8]) -> String {
+    use sha3::{Digest, Keccak256};
+    let mut h = Keccak256::new();
+    h.update(label.as_bytes());
+    h.update(bytes);
+    let out = h.finalize();
+
+    // Avoid adding a new `hex` dependency; render first 16 bytes as hex manually.
+    let mut s = String::with_capacity(32);
+    for b in out[..16].iter() {
+        use core::fmt::Write as _;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+// New monero-oxide split: use monero-interface traits + error types.
+use monero_interface::{
+    FeeError, FeePriority, FeeRate, InterfaceError, ProvidesBlockchain, ProvidesBlockchainMeta,
+    ProvidesFeeRates, ProvidesOutputs, ProvidesScannableBlocks, ProvidesTransactions,
+    PublishTransaction, ScannableBlock,
+};
+
+// TEMPORARY migration alias: keep the existing walletcore code compiling while we
+// port from the old monero_wallet::rpc::{Rpc, RpcError} API to monero-interface.
+// This is intentionally internal-only and should be removed once the migration is complete.
+type RpcError = InterfaceError;
 
 use serde::{Deserialize, Serialize};
 // Keccak256 is used via EdScalar::hash(), no direct import needed
@@ -541,6 +613,147 @@ use rand::{rngs::OsRng, RngCore};
 
 use ureq::serde_json;
 use zeroize::Zeroizing;
+
+// --- Per-wallet debug log file (NexaWal WalletCaches) ---
+//
+// NexaWal stores cache blobs at:
+//   Application Support/WalletCaches/{mainnet|stagenet}/{walletId}.cache
+//
+// We write a sibling log file:
+//   Application Support/WalletCaches/{mainnet|stagenet}/{walletId}.walletcore.log
+//
+// This is intentionally best-effort (never fails refresh) and is meant for automated log capture.
+fn nexawal_cache_log_path(wallet_id: &str, network: MoneroNetwork) -> Option<std::path::PathBuf> {
+    // Map network to NexaWal directory naming.
+    let net_dir = match network {
+        MoneroNetwork::Mainnet => "mainnet",
+        // NexaWal uses "stagenet" for non-mainnet in WalletManager.swift
+        MoneroNetwork::Stagenet => "stagenet",
+        // If the app ever uses other networks, fall back to stagenet naming.
+        _ => "stagenet",
+    };
+
+    let base = dirs::data_dir()?;
+    Some(
+        base.join("WalletCaches")
+            .join(net_dir)
+            .join(format!("{wallet_id}.walletcore.log")),
+    )
+}
+
+fn append_walletcore_log_line(wallet_id: &str, network: MoneroNetwork, line: &str) {
+    use std::io::Write;
+
+    let Some(path) = nexawal_cache_log_path(wallet_id, network) else {
+        return;
+    };
+
+    // Ensure parent directory exists (matches NexaWal behavior).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // Include timestamp for easier correlation.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ts} {line}");
+    }
+}
+
+macro_rules! walletcore_log {
+    ($wallet_id:expr, $network:expr, $($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        println!("{}", s);
+        append_walletcore_log_line($wallet_id, $network, &s);
+    }};
+}
+
+/// Returns a monotonic timestamp suitable for latency measurements (not wall clock).
+#[inline]
+fn now_mono_ms() -> u128 {
+    // Best-effort; monotonic by definition.
+    std::time::Instant::now().elapsed().as_millis()
+}
+
+// NOTE (telemetry plan):
+// I attempted to instrument monero-daemon-rpc directly to log whether scannable block fetch is
+// using BIN RPC (`get_blocks.bin`) vs JSON fallback, request sizing, and response sizes.
+// That code lives in your fork (https://github.com/cacaosteve/monero-oxide) under:
+//
+//   monero-oxide/interface/daemon/src/bin_rpc/blocks_bin.rs
+//
+// We cannot edit external clones from here. The correct workflow is:
+//
+// 1) Commit telemetry changes in the `cacaosteve/monero-oxide` repo (monero-daemon-rpc crate).
+// 2) Update `monero-oxide-output/Cargo.toml` to pin `rev = "<new fork commit sha>"`.
+// 3) Rebuild XCFramework, run NexaWal, and read per-wallet `.walletcore.log` to confirm:
+//    - BIN vs JSON path
+//    - per-request blocks, bytes, and latency
+//    - decode vs fetch breakdown
+//
+// This will let us directly compare our request pattern against wallet2/Feather and close the
+// current gap (fetch is ~2–3 blocks/sec at batch=25; Feather is ~27 blocks/sec on your link).
+
+// Global tokio runtime singleton for upstream async daemon RPC.
+// We use a single runtime per process to avoid expensive runtime creation per FFI call.
+static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("walletcore: failed to build tokio runtime")
+});
+
+static PANIC_HOOK_INSTALLED: Lazy<()> = Lazy::new(|| {
+    std::panic::set_hook(Box::new(|info| {
+        // Best-effort: print panic info to stdout so it shows up in Xcode / sim logs.
+        // Avoid allocations as much as possible.
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        println!("🧨 walletcore panic: thread={}", thread_name);
+
+        if let Some(loc) = info.location() {
+            println!(
+                "🧨 walletcore panic location: {}:{}",
+                loc.file(),
+                loc.line()
+            );
+        }
+
+        if let Some(msg) = info.payload().downcast_ref::<&str>() {
+            println!("🧨 walletcore panic message: {}", msg);
+        } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+            println!("🧨 walletcore panic message: {}", msg);
+        } else {
+            println!("🧨 walletcore panic message: <non-string payload>");
+        }
+
+        // If backtraces are enabled, this may print a useful stack trace.
+        // (On Apple platforms, make sure RUST_BACKTRACE=1 is set in the host env for the build/run.)
+        println!(
+            "🧨 walletcore backtrace:\n{:?}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }));
+});
+
+#[inline]
+fn fee_rate_max_per_weight_cap() -> u64 {
+    // Conservative safety cap to prevent a malicious/buggy node from returning an absurd fee.
+    // Can be overridden via WALLETCORE_MAX_FEE_PER_WEIGHT.
+    //
+    // Note: this is a *per-weight* fee, not a total fee.
+    std::env::var("WALLETCORE_MAX_FEE_PER_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10_000_000) // default cap
+}
 
 use bytes::{Buf, BufMut};
 use cuprate_epee_encoding::{from_bytes, to_bytes, write_field, EpeeObject};
@@ -664,7 +877,7 @@ fn release_oindexes_slot() {
     }
 }
 
-fn is_transient_oindexes_error(err: &RpcError) -> bool {
+fn is_transient_oindexes_error(err: &InterfaceError) -> bool {
     let s = err.to_string().to_lowercase();
     s.contains("connection reset")
         || s.contains("reset by peer")
@@ -673,12 +886,16 @@ fn is_transient_oindexes_error(err: &RpcError) -> bool {
         || s.contains("network error")
 }
 
-fn get_o_indexes_limited<R: Rpc>(rpc: &R, tx_hash: [u8; 32]) -> Result<Vec<u64>, RpcError> {
+fn get_o_indexes_limited<I: ProvidesOutputs>(
+    iface: &I,
+    tx_hash: [u8; 32],
+) -> Result<Vec<u64>, InterfaceError> {
     // Throttle + retry transient transport errors.
     let retries = oindexes_retries_from_env();
     for attempt in 0..=retries {
         acquire_oindexes_slot();
-        let res = block_on(rpc.get_o_indexes(tx_hash));
+        // monero-interface: output indexes are provided via `ProvidesOutputs`.
+        let res = block_on(iface.output_indexes(tx_hash));
         release_oindexes_slot();
 
         match res {
@@ -695,7 +912,7 @@ fn get_o_indexes_limited<R: Rpc>(rpc: &R, tx_hash: [u8; 32]) -> Result<Vec<u64>,
         }
     }
     // Unreachable, but Rust wants a return.
-    Err(RpcError::InternalError(
+    Err(InterfaceError::InternalError(
         "get_o_indexes_limited: exhausted retries".to_string(),
     ))
 }
@@ -1472,6 +1689,9 @@ fn network_from_flag(is_mainnet: u8) -> MoneroNetwork {
 }
 
 #[derive(Clone)]
+// NOTE: Migrating to upstream daemon RPC (monero-daemon-rpc + monero-simple-request-rpc).
+// Keep the old transport code in place for now, but stop constructing/using it in walletcore
+// entrypoints. We'll delete this once the migration is complete.
 struct BlockingRpcTransport {
     agent: Arc<ureq::Agent>,
     base_url: String,
@@ -1853,6 +2073,18 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             ));
                         }
                         let elem_marker = r.get_u8();
+
+                        // Some daemons appear to use a different object marker for typed-array elements.
+                        // We still expect an "object-like" container here; accept both the canonical 0x0c
+                        // and the observed variant 0x10 to avoid failing fast.
+                        if elem_marker != 0x0c && elem_marker != 0x10 {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!(
+                                    "getblocks.bin decode failed in field 'blocks': unexpected typed-array element marker=0x{elem_marker:02x} (expected object marker 0x0c or 0x10)"
+                                )
+                                .into_boxed_str(),
+                            )));
+                        }
 
                         (
                             n,
@@ -2859,12 +3091,12 @@ impl BlockingRpcTransport {
         let response = self
             .request_for(route)
             .send_bytes(&body)
-            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
         let mut reader = response.into_reader();
         let mut buf = Vec::new();
         reader
             .read_to_end(&mut buf)
-            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
         Ok(buf)
     }
 
@@ -2875,12 +3107,12 @@ impl BlockingRpcTransport {
         let response = self
             .request_for_bin(route)
             .send_bytes(&body)
-            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
         let mut reader = response.into_reader();
         let mut buf = Vec::new();
         reader
             .read_to_end(&mut buf)
-            .map_err(|err| RpcError::ConnectionError(err.to_string()))?;
+            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
         Ok(buf)
     }
 
@@ -2892,11 +3124,11 @@ impl BlockingRpcTransport {
         let req = GetBlocksByHeightBinRequest { heights, prune };
         let body = to_bytes(req)
             .map(|b| b.to_vec())
-            .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee encode: {e}")))?;
         let resp_bytes = self.post_bin("get_blocks_by_height.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksByHeightBinResponse = from_bytes(&mut reader)
-            .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee decode: {e}")))?;
         Ok(resp)
     }
 
@@ -2913,11 +3145,11 @@ impl BlockingRpcTransport {
         };
         let body = to_bytes(req)
             .map(|b| b.to_vec())
-            .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee encode: {e}")))?;
         let resp_bytes = self.post_bin("get_blocks.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksBinResponse = from_bytes(&mut reader)
-            .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee decode: {e}")))?;
         Ok(resp)
     }
 
@@ -2972,7 +3204,7 @@ impl BlockingRpcTransport {
 
         let body = to_bytes(req)
             .map(|b| b.to_vec())
-            .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee encode: {e}")))?;
 
         // Wallet2-style endpoint (underscored variant) to match wallet2/Feather behavior.
         //
@@ -2981,7 +3213,7 @@ impl BlockingRpcTransport {
         let resp_bytes = self.post_bin("get_blocks.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksFastBinResponse = from_bytes(&mut reader)
-            .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
+            .map_err(|e| RpcError::InvalidInterface(format!("epee decode: {e}")))?;
         Ok(resp)
     }
 
@@ -3100,17 +3332,20 @@ impl BlockingRpcTransport {
     }
 }
 
-impl Rpc for BlockingRpcTransport {
-    fn post(
-        &self,
-        route: &str,
-        body: Vec<u8>,
-    ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + Send {
-        let client = self.clone();
-        let route_string = route.to_string();
-        async move { client.post_bytes(&route_string, body) }
-    }
-}
+// NOTE: The upstream `Rpc` trait no longer exists in the latest monero-oxide split.
+// We keep this commented block around to ease migration and to preserve context.
+//
+// impl Rpc for BlockingRpcTransport {
+//     fn post(
+//         &self,
+//         route: &str,
+//         body: Vec<u8>,
+//     ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + Send {
+//         let client = self.clone();
+//         let route_string = route.to_string();
+//         async move { client.post_bytes(&route_string, body) }
+//     }
+// }
 struct DaemonStatus {
     height: u64,
     top_block_timestamp: u64,
@@ -3184,12 +3419,10 @@ fn fetch_daemon_status(client: &BlockingRpcTransport) -> Result<DaemonStatus, (c
 
 fn map_rpc_error(err: RpcError) -> c_int {
     match err {
-        RpcError::ConnectionError(_) => -15,
+        // monero-interface error kinds (temporary alias via `type RpcError = InterfaceError`)
+        RpcError::InterfaceError(_) => -15,
         RpcError::InternalError(_) => -16,
-        RpcError::InvalidNode(_) => -16,
-        RpcError::TransactionsNotFound(_) => -16,
-        RpcError::InvalidTransaction(_) => -16,
-        _ => -16,
+        RpcError::InvalidInterface(_) => -16,
     }
 }
 
@@ -3994,9 +4227,16 @@ pub extern "C" fn wallet_refresh(
         return record_error(-30, "wallet_refresh: cancelled");
     }
 
+    // Install panic hook once per process for better crash diagnostics.
+    Lazy::force(&PANIC_HOOK_INSTALLED);
+
     // Clear any stale cancellation request once we have decided to start.
     // This ensures a prior cancel doesn't accidentally cancel a new refresh later.
     set_refresh_cancel_for_wallet(id, false);
+
+    // Stage logging to diagnose early refresh termination
+    println!("🧭 wallet_refresh stage=init wallet_id={}", id);
+    // Best-effort per-wallet log line (network derived once we have snapshot below; we will log again later).
 
     let arg_url = if !node_url.is_null() {
         unsafe { CStr::from_ptr(node_url) }
@@ -4042,25 +4282,12 @@ pub extern "C" fn wallet_refresh(
         env_bulk_mode,
         env_bulk_fetch_batch
     );
-
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
-            return record_error(
-                code,
-                format!("wallet_refresh: invalid daemon url '{base_url}'"),
-            );
-        }
-    };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
-            return record_error(
-                code,
-                format!("wallet_refresh: failed to query daemon '{base_url}': {message}"),
-            );
-        }
-    };
+    // NOTE: per-wallet file logging requires the wallet network, which we only know after loading
+    // the snapshot. Until then, we stick to stdout-only logging.
+    println!(
+        "🧭 wallet_refresh stage=after_entry_stamp wallet_id={} node_url={}",
+        id, base_url
+    );
 
     let snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
@@ -4070,6 +4297,138 @@ pub extern "C" fn wallet_refresh(
                 return record_error(-13, format!("wallet_refresh: wallet '{id}' not registered"))
             }
         }
+    };
+
+    // Now that we know the wallet network, write per-wallet logs to the NexaWal cache log too.
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=snapshot_loaded wallet_id={} network={:?}",
+        id,
+        snapshot.network
+    );
+
+    // Refresh-level timing summary accumulators (debug/perf telemetry).
+    // These are cheap counters; they help explain Debug-vs-Release gaps (simulator + logging + IO).
+    let refresh_t0 = std::time::Instant::now();
+    let mut refresh_fetch_ms_total: u128 = 0;
+    let mut refresh_scan_ms_total: u128 = 0;
+    let mut refresh_persist_ms_total: u128 = 0;
+    let mut refresh_blocks_total: usize = 0;
+    let mut refresh_outputs_added_total: usize = 0;
+    let mut refresh_batches_total: usize = 0;
+
+    // Persist timing is measured as "everything between end-of-scan and next fetch", so keep a marker.
+    // When this is `Some`, we close it right before starting the next fetch.
+    let mut persist_span_start: Option<std::time::Instant> = None;
+
+    // Gate noisy per-batch telemetry behind an env var to reduce simulator logging overhead.
+    // Keep the final `📈 wallet_refresh summary ...` always enabled.
+    let refresh_telemetry_enabled: bool = std::env::var("WALLETCORE_REFRESH_TELEMETRY")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(false);
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=after_entry_stamp wallet_id={} node_url={}",
+        id,
+        base_url
+    );
+
+    // Use upstream daemon RPC implementation (monero-daemon-rpc + monero-simple-request-rpc)
+    // instead of our bespoke BlockingRpcTransport. This is closer to wallet2/Feather semantics
+    // and reduces custom transport behavior.
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=daemon_connect_start wallet_id={}",
+        id
+    );
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧭 wallet_refresh stage=daemon_connect_error wallet_id={} err={}",
+                id,
+                e
+            );
+            return record_error(
+                -16,
+                format!("wallet_refresh: failed to connect daemon '{base_url}': {e}"),
+            );
+        }
+    };
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=daemon_connect_ok wallet_id={}",
+        id
+    );
+
+    // Fetch daemon height via upstream interface.
+    // monero-interface defines height via ProvidesBlockchainMeta::latest_block_number (0-based).
+    // Our DaemonStatus.height is treated as a 1-based "chain height" in several places, so convert:
+    // daemon_height = latest_block_number + 1.
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=daemon_height_start wallet_id={}",
+        id
+    );
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => {
+            let h = n.saturating_add(1) as u64;
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧭 wallet_refresh stage=daemon_height_ok wallet_id={} height={}",
+                id,
+                h
+            );
+            h
+        }
+        Err(e) => {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧭 wallet_refresh stage=daemon_height_error wallet_id={} err={}",
+                id,
+                e
+            );
+            return record_error(
+                -16,
+                format!("wallet_refresh: failed to query daemon height '{base_url}': {e}"),
+            );
+        }
+    };
+
+    // Diagnostic clamp for upstream contiguous_scannable_blocks fetch size.
+    // This is intentionally conservative to detect whether large batches trigger a hard kill (OOM/watchdog).
+    // Override via WALLETCORE_UPSTREAM_BLOCK_BATCH (default=25).
+    let upstream_block_batch: u64 = std::env::var("WALLETCORE_UPSTREAM_BLOCK_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(25)
+        .clamp(1, 500);
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 wallet_refresh stage=upstream_batch_config wallet_id={} upstream_block_batch={}",
+        id,
+        upstream_block_batch
+    );
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
@@ -4100,18 +4459,96 @@ pub extern "C" fn wallet_refresh(
         .map(|v| v.max(1))
         .unwrap_or(1);
 
+    // Log safe wallet key fingerprints and scanner registration plan.
+    // We avoid logging raw keys; fingerprints are Keccak(label||bytes).
+    // Fingerprints are Keccak(label||bytes) truncated to 16 bytes hex, to avoid logging raw secrets.
+    //
+    // MasterKeys doesn't store public keys directly; derive stable fingerprints from existing fields.
+    // - spend_scalar / view_scalar_dalek are sensitive; we only fingerprint their byte encodings.
+    // - entropy is also sensitive; we fingerprint it for correlation only.
+    let spend_scalar_bytes = master.spend_scalar.to_bytes();
+    let view_scalar_bytes = master.view_scalar_dalek.to_bytes();
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🔐 wallet_fingerprint wallet_id={} spend_scalar_fpr={} view_scalar_fpr={} entropy_fpr={}",
+        id,
+        fingerprint32("spend_scalar", &spend_scalar_bytes),
+        fingerprint32("view_scalar", &view_scalar_bytes),
+        fingerprint32("entropy", master.entropy.as_ref()),
+    );
+
+    // Log the derived primary address (account 0, subaddress 0) so you can compare to Feather.
+    // This is not secret and is the fastest way to validate mnemonic->keys derivation.
+    let derived_primary_address = derive_address_string(&master, 0, 0, snapshot.network);
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🏠 derived_primary_address wallet_id={} address={}",
+        id,
+        derived_primary_address
+    );
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 scanner_subaddress_plan wallet_id={} account_gap={} gap_limit={} majors=[0..{}) minors=[0..={}]",
+        id,
+        account_gap,
+        gap_limit,
+        account_gap,
+        gap_limit
+    );
+
     // Register subaddresses across accounts and subaddresses:
     // major: [0, account_gap), minor: [0, gap_limit]
+    //
+    // IMPORTANT: `monero_address::SubaddressIndex::new(0, 0)` is intentionally `None` because
+    // (0,0) represents the *primary address*, not a subaddress.
+    //
+    // For scanning, we must include the primary address. `monero_wallet::Scanner::new(view_pair)`
+    // already covers the primary address; subaddress registration is for (account,address) != (0,0).
+    //
+    // Therefore:
+    // - do NOT treat (major,0) as a subaddress registration attempt
+    // - register only subaddresses with minor in 1..=gap_limit
+    let mut registered: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut first_failed: Option<(u32, u32)> = None;
+    let mut last_failed: Option<(u32, u32)> = None;
+
     for major in 0..account_gap {
-        if let Some(idx0) = SubaddressIndex::new(major, 0) {
-            scanner.register_subaddress(idx0);
-        }
         for minor in 1..=gap_limit {
             if let Some(idx) = SubaddressIndex::new(major, minor) {
                 scanner.register_subaddress(idx);
+                registered = registered.saturating_add(1);
+            } else {
+                failed = failed.saturating_add(1);
+                first_failed = first_failed.or(Some((major, minor)));
+                last_failed = Some((major, minor));
             }
         }
     }
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧭 scanner_subaddress_registered wallet_id={} registered_count={} failed_count={} first_failed={:?} last_failed={:?}",
+        id,
+        registered,
+        failed,
+        first_failed,
+        last_failed
+    );
+
+    // Optional targeted scan debug controls (env-gated).
+    // - WALLETCORE_DEBUG_TXID=<64 hex>         (log whether this txid is present in block + whether we matched outputs)
+    // - WALLETCORE_DEBUG_HEIGHT=<u64>          (log only for this height, or within ±WINDOW)
+    // - WALLETCORE_DEBUG_HEIGHT_WINDOW=<u64>   (default: 0)
+    let debug_txid = walletcore_debug_target_txid();
+    let debug_height = walletcore_debug_target_height();
+    let debug_height_window = walletcore_debug_target_window();
 
     let mut working_outputs = snapshot.tracked_outputs.clone();
     let mut seen_outpoints = snapshot.seen_outpoints.clone();
@@ -4257,6 +4694,7 @@ pub extern "C" fn wallet_refresh(
                         let local_gap = gap_limit;
                         let id_owned_for_worker = id.to_string();
                         let worker_effective_bulk_fetch = effective_bulk_fetch;
+                        let worker_upstream_block_batch = upstream_block_batch;
 
                         std::thread::spawn(move || {
                             // Early exit if cancelled before worker begins
@@ -4279,623 +4717,165 @@ pub extern "C" fn wallet_refresh(
 
                             let mut collected: Vec<TrackedOutput> = Vec::new();
 
-                            match worker_effective_bulk_fetch {
-                                BulkFetchMode::Wallet2FastBlocks => {
-                                    let count = end_h_exclusive.saturating_sub(start_h);
-                                    if count == 0 {
-                                        let _ = txc.send(Ok(collected));
-                                        return;
-                                    }
-
-                                    // Build short chain history (block_ids) from the persisted bounded hash window.
-                                    // If empty, seed it via on_get_block_hash and retry.
-                                    let mut block_ids = {
-                                        let mut ids: Vec<[u8; 32]> = Vec::new();
-                                        if let Ok(map) = WALLET_STORE.lock() {
-                                            if let Some(state) = map.get(&id_owned_for_worker) {
-                                                ids = build_short_chain_history(state);
-                                            }
-                                        }
-                                        ids
-                                    };
-
-                                    if block_ids.is_empty() {
-                                        match client.seed_recent_block_hashes_for_wallet2(
-                                            &id_owned_for_worker,
-                                            start_h,
-                                        ) {
-                                            Ok(()) => {
-                                                if let Ok(map) = WALLET_STORE.lock() {
-                                                    if let Some(state) =
-                                                        map.get(&id_owned_for_worker)
-                                                    {
-                                                        block_ids =
-                                                            build_short_chain_history(state);
-                                                    }
-                                                }
-                                            }
-                                            Err((code, msg)) => {
-                                                let _ = txc.send(Err((
-                                                    code,
-                                                    format!(
-                                                        "wallet_refresh: wallet2 bulk seed failed at start_h {}: {}",
-                                                        start_h, msg
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        }
-                                    }
-
-                                    if block_ids.is_empty() {
-                                        let _ = txc.send(Err((
-                                            -16,
-                                            "wallet_refresh: wallet2 bulk mode has no chain history yet (block_ids empty after seeding)".to_string(),
-                                        )));
-                                        return;
-                                    }
-
-                                    // Call wallet2-style getblocks.bin (blocks + output_indices).
-                                    let resp = match client
-                                        .get_blocks_fast_bin(block_ids, start_h, true)
-                                    {
-                                        Ok(r) => r,
-                                        Err(err) => {
-                                            let _ = txc.send(Err((
-                                                -16,
-                                                format!(
-                                                    "wallet_refresh: bulk getblocks.bin failed at heights {}..{}: {}",
-                                                    start_h,
-                                                    end_h_exclusive.saturating_sub(1),
-                                                    err
-                                                ),
-                                            )));
-                                            return;
-                                        }
-                                    };
-
-                                    if resp.blocks.is_empty() {
-                                        let _ = txc.send(Err((
-                                            -16,
-                                            format!(
-                                                "wallet_refresh: bulk getblocks.bin returned 0 blocks for heights {}..{}",
-                                                start_h,
-                                                end_h_exclusive.saturating_sub(1)
-                                            ),
-                                        )));
-                                        return;
-                                    }
-
-                                    if resp.blocks.len() != resp.output_indices.len() {
-                                        let _ = txc.send(Err((
-                                            -16,
-                                            format!(
-                                                "wallet_refresh: getblocks.bin mismatched blocks ({}) and output_indices ({}) sizes",
-                                                resp.blocks.len(),
-                                                resp.output_indices.len()
-                                            ),
-                                        )));
-                                        return;
-                                    }
-
-                                    // Scan each returned block entry in order. We assign heights sequentially starting from start_h.
-                                    let mut th = start_h;
-                                    for (entry, boi) in
-                                        resp.blocks.into_iter().zip(resp.output_indices.into_iter())
-                                    {
-                                        if refresh_cancelled_for_wallet(&id_owned_for_worker) {
-                                            let _ = txc.send(Err((
-                                                -30,
-                                                "wallet_refresh: cancelled".to_string(),
-                                            )));
-                                            return;
-                                        }
-
-                                        // If tx blobs are missing for this entry, fall back to per-block for just that height.
-                                        if entry.txs.is_empty() {
-                                            let block_number = match usize::try_from(th) {
-                                                Ok(v) => v,
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        "wallet_refresh: block number conversion overflow"
-                                                            .to_string(),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            let scannable = match block_on(
-                                                client.get_scannable_block_by_number(block_number),
-                                            ) {
-                                                Ok(block) => block,
-                                                Err(err) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: per-block fallback RPC block fetch failed at height {}: {}",
-                                                            th, err
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            // Record hash
-                                            {
-                                                let block_hash = scannable.block.hash();
-                                                if let Ok(mut map) = WALLET_STORE.lock() {
-                                                    if let Some(state) =
-                                                        map.get_mut(&id_owned_for_worker)
-                                                    {
-                                                        push_recent_block_hash(
-                                                            state, th, block_hash,
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let miner_hash =
-                                                scannable.block.miner_transaction().hash();
-                                            let outputs = match local_scanner.scan(scannable) {
-                                                Ok(result) => result.ignore_additional_timelock(),
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!("wallet_refresh: scanner failed at height {}", th),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            for output in outputs {
-                                                let (major, minor) = output
-                                                    .subaddress()
-                                                    .map(|idx| (idx.account(), idx.address()))
-                                                    .unwrap_or((0, 0));
-                                                collected.push(TrackedOutput {
-                                                    tx_hash: output.transaction(),
-                                                    index_in_tx: output.index_in_transaction(),
-                                                    amount: output.commitment().amount,
-                                                    block_height: th,
-                                                    additional_timelock: output
-                                                        .additional_timelock(),
-                                                    is_coinbase: output.transaction() == miner_hash,
-                                                    subaddress_major: major,
-                                                    subaddress_minor: minor,
-                                                    spent: false,
-                                                });
-                                            }
-
-                                            th = th.saturating_add(1);
-                                            continue;
-                                        }
-
-                                        // Parse block blob
-                                        let mut bb = entry.block.as_slice();
-                                        let parsed_block = match Block::read(&mut bb) {
-                                            Ok(b) => b,
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    format!(
-                                                        "wallet_refresh: block parse failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        // Parse tx blobs (pruned)
-                                        let mut parsed_txs: Vec<Transaction<Pruned>> =
-                                            Vec::with_capacity(entry.txs.len());
-                                        for tx_blob in entry.txs {
-                                            let mut tb = tx_blob.blob.as_slice();
-                                            match Transaction::<Pruned>::read(&mut tb) {
-                                                Ok(t) => parsed_txs.push(t),
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: tx parse failed at height {}",
-                                                            th
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            }
-                                        }
-
-                                        // Record hash from the parsed block (works without extra RPC)
-                                        {
-                                            let block_hash = parsed_block.hash();
-                                            if let Ok(mut map) = WALLET_STORE.lock() {
-                                                if let Some(state) =
-                                                    map.get_mut(&id_owned_for_worker)
-                                                {
-                                                    push_recent_block_hash(state, th, block_hash);
-                                                }
-                                            }
-                                        }
-
-                                        // Compute output_index_for_first_ringct_output from output_indices (wallet2-style),
-                                        // avoiding get_o_indexes.bin.
-                                        let mut output_index_for_first_ringct_output: Option<u64> =
-                                            None;
-                                        for txoi in boi.indices.iter() {
-                                            if let Some(first) = txoi.indices.first() {
-                                                output_index_for_first_ringct_output = Some(*first);
-                                                break;
-                                            }
-                                        }
-
-                                        let scannable = ScannableBlock {
-                                            block: parsed_block,
-                                            transactions: parsed_txs,
-                                            output_index_for_first_ringct_output,
-                                        };
-
-                                        let miner_hash = scannable.block.miner_transaction().hash();
-                                        let outputs = match local_scanner.scan(scannable) {
-                                            Ok(result) => result.ignore_additional_timelock(),
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    format!(
-                                                        "wallet_refresh: scanner failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        for output in outputs {
-                                            let (major, minor) = output
-                                                .subaddress()
-                                                .map(|idx| (idx.account(), idx.address()))
-                                                .unwrap_or((0, 0));
-                                            collected.push(TrackedOutput {
-                                                tx_hash: output.transaction(),
-                                                index_in_tx: output.index_in_transaction(),
-                                                amount: output.commitment().amount,
-                                                block_height: th,
-                                                additional_timelock: output.additional_timelock(),
-                                                is_coinbase: output.transaction() == miner_hash,
-                                                subaddress_major: major,
-                                                subaddress_minor: minor,
-                                                spent: false,
-                                            });
-                                        }
-
-                                        th = th.saturating_add(1);
-                                    }
-
-                                    let _ = txc.send(Ok(collected));
+                            // Upstream fast path: fetch contiguous scannable blocks in batches using the
+                            // monero-daemon-rpc bin RPC implementation.
+                            //
+                            // This intentionally bypasses our bespoke bulk bin fetch logic and aligns closer
+                            // to wallet2/Feather semantics as implemented in monero-oxide.
+                            let start_bn = match usize::try_from(start_h) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    let _ = txc.send(Err((
+                                        -16,
+                                        "wallet_refresh: block number conversion overflow"
+                                            .to_string(),
+                                    )));
+                                    return;
                                 }
-
-                                BulkFetchMode::RangeBlocks => {
-                                    let count = end_h_exclusive.saturating_sub(start_h);
-                                    if count == 0 {
-                                        let _ = txc.send(Ok(collected));
-                                        return;
-                                    }
-
-                                    let resp = match client.get_blocks_bin(start_h, count, false) {
-                                        Ok(r) => r,
-                                        Err(err) => {
-                                            let _ = txc.send(Err((
-                                                -16,
-                                                format!(
-                                                    "wallet_refresh: bulk get_blocks.bin failed at heights {}..{}: {}",
-                                                    start_h,
-                                                    end_h_exclusive.saturating_sub(1),
-                                                    err
-                                                ),
-                                            )));
-                                            return;
-                                        }
-                                    };
-
-                                    if resp.blocks.is_empty() {
+                            };
+                            let end_bn_inclusive = match end_h_exclusive.saturating_sub(1) {
+                                x => match usize::try_from(x) {
+                                    Ok(v) => v,
+                                    Err(_) => {
                                         let _ = txc.send(Err((
                                             -16,
-                                            format!(
-                                                "wallet_refresh: bulk get_blocks.bin returned 0 blocks for heights {}..{}",
-                                                start_h,
-                                                end_h_exclusive.saturating_sub(1)
-                                            ),
+                                            "wallet_refresh: block number conversion overflow"
+                                                .to_string(),
                                         )));
                                         return;
                                     }
+                                },
+                            };
 
-                                    let mut th = start_h;
-                                    for entry in resp.blocks {
-                                        if refresh_cancelled_for_wallet(&id_owned_for_worker) {
-                                            let _ = txc.send(Err((
-                                                -30,
-                                                "wallet_refresh: cancelled".to_string(),
-                                            )));
-                                            return;
-                                        }
-
-                                        if entry.txs.is_empty() {
-                                            let block_number = match usize::try_from(th) {
-                                                Ok(v) => v,
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        "wallet_refresh: block number conversion overflow"
-                                                            .to_string(),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            let scannable = match block_on(
-                                                client.get_scannable_block_by_number(block_number),
-                                            ) {
-                                                Ok(block) => block,
-                                                Err(err) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: per-block fallback RPC block fetch failed at height {}: {}",
-                                                            th, err
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            // Record block hash into wallet2-style recent hash history
-                                            // (used to build short chain history for `/getblocks.bin`).
-                                            {
-                                                let block_hash = scannable.block.hash();
-                                                if let Ok(mut map) = WALLET_STORE.lock() {
-                                                    if let Some(state) =
-                                                        map.get_mut(&id_owned_for_worker)
-                                                    {
-                                                        push_recent_block_hash(
-                                                            state, th, block_hash,
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let miner_hash =
-                                                scannable.block.miner_transaction().hash();
-                                            let outputs = match local_scanner.scan(scannable) {
-                                                Ok(result) => result.ignore_additional_timelock(),
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: scanner failed at height {}",
-                                                            th
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-
-                                            for output in outputs {
-                                                let (major, minor) = output
-                                                    .subaddress()
-                                                    .map(|idx| (idx.account(), idx.address()))
-                                                    .unwrap_or((0, 0));
-                                                collected.push(TrackedOutput {
-                                                    tx_hash: output.transaction(),
-                                                    index_in_tx: output.index_in_transaction(),
-                                                    amount: output.commitment().amount,
-                                                    block_height: th,
-                                                    additional_timelock: output
-                                                        .additional_timelock(),
-                                                    is_coinbase: output.transaction() == miner_hash,
-                                                    subaddress_major: major,
-                                                    subaddress_minor: minor,
-                                                    spent: false,
-                                                });
-                                            }
-
-                                            th = th.saturating_add(1);
-                                            continue;
-                                        }
-
-                                        let mut bb = entry.block.as_slice();
-                                        let parsed_block = match Block::read(&mut bb) {
-                                            Ok(b) => b,
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    format!(
-                                                        "wallet_refresh: block parse failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        let mut parsed_txs: Vec<Transaction<Pruned>> =
-                                            Vec::with_capacity(entry.txs.len());
-                                        for tx_blob in entry.txs {
-                                            let mut tb = tx_blob.blob.as_slice();
-                                            match Transaction::<Pruned>::read(&mut tb) {
-                                                Ok(t) => parsed_txs.push(t),
-                                                Err(_) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: tx parse failed at height {}",
-                                                            th
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            }
-                                        }
-
-                                        let mut output_index_for_first_ringct_output: Option<u64> =
-                                            None;
-                                        let miner_tx_hash = parsed_block.miner_transaction().hash();
-                                        let miner_tx = Transaction::<Pruned>::from(
-                                            parsed_block.miner_transaction().clone(),
-                                        );
-
-                                        for (hash, tx) in
-                                            core::iter::once((&miner_tx_hash, &miner_tx)).chain(
-                                                parsed_block.transactions.iter().zip(&parsed_txs),
-                                            )
-                                        {
-                                            if (!matches!(tx, Transaction::V2 { .. }))
-                                                || tx.prefix().outputs.is_empty()
-                                            {
-                                                continue;
-                                            }
-
-                                            let idxs = match get_o_indexes_limited(&client, *hash) {
-                                                Ok(v) => v,
-                                                Err(err3) => {
-                                                    let _ = txc.send(Err((
-                                                        -16,
-                                                        format!(
-                                                            "wallet_refresh: get_o_indexes failed at height {}: {}",
-                                                            th, err3
-                                                        ),
-                                                    )));
-                                                    return;
-                                                }
-                                            };
-                                            if let Some(first) = idxs.first() {
-                                                output_index_for_first_ringct_output = Some(*first);
-                                            }
-                                            break;
-                                        }
-
-                                        let scannable = ScannableBlock {
-                                            block: parsed_block,
-                                            transactions: parsed_txs,
-                                            output_index_for_first_ringct_output,
-                                        };
-
-                                        let miner_hash = scannable.block.miner_transaction().hash();
-                                        let outputs = match local_scanner.scan(scannable) {
-                                            Ok(result) => result.ignore_additional_timelock(),
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    format!(
-                                                        "wallet_refresh: scanner failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        for output in outputs {
-                                            let (major, minor) = output
-                                                .subaddress()
-                                                .map(|idx| (idx.account(), idx.address()))
-                                                .unwrap_or((0, 0));
-                                            collected.push(TrackedOutput {
-                                                tx_hash: output.transaction(),
-                                                index_in_tx: output.index_in_transaction(),
-                                                amount: output.commitment().amount,
-                                                block_height: th,
-                                                additional_timelock: output.additional_timelock(),
-                                                is_coinbase: output.transaction() == miner_hash,
-                                                subaddress_major: major,
-                                                subaddress_minor: minor,
-                                                spent: false,
-                                            });
-                                        }
-
-                                        th = th.saturating_add(1);
-                                    }
-
-                                    let _ = txc.send(Ok(collected));
-                                }
-
-                                BulkFetchMode::PerBlock => {
-                                    // Original per-block scan for this span.
-                                    for th in start_h..end_h_exclusive {
-                                        if refresh_cancelled_for_wallet(&id_owned_for_worker) {
-                                            let _ = txc.send(Err((
-                                                -30,
-                                                "wallet_refresh: cancelled".to_string(),
-                                            )));
-                                            return;
-                                        }
-
-                                        let block_number = match usize::try_from(th) {
-                                            Ok(v) => v,
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    "wallet_refresh: block number conversion overflow"
-                                                        .to_string(),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        let scannable = match block_on(
-                                            client.get_scannable_block_by_number(block_number),
-                                        ) {
-                                            Ok(block) => block,
-                                            Err(err) => {
-                                                let code = map_rpc_error(err);
-                                                let _ = txc.send(Err((
-                                                    code,
-                                                    format!(
-                                                        "wallet_refresh: RPC block fetch failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        let miner_hash = scannable.block.miner_transaction().hash();
-                                        let outputs = match local_scanner.scan(scannable) {
-                                            Ok(result) => result.ignore_additional_timelock(),
-                                            Err(_) => {
-                                                let _ = txc.send(Err((
-                                                    -16,
-                                                    format!(
-                                                        "wallet_refresh: scanner failed at height {}",
-                                                        th
-                                                    ),
-                                                )));
-                                                return;
-                                            }
-                                        };
-
-                                        for output in outputs {
-                                            let (major, minor) = output
-                                                .subaddress()
-                                                .map(|idx| (idx.account(), idx.address()))
-                                                .unwrap_or((0, 0));
-                                            collected.push(TrackedOutput {
-                                                tx_hash: output.transaction(),
-                                                index_in_tx: output.index_in_transaction(),
-                                                amount: output.commitment().amount,
-                                                block_height: th,
-                                                additional_timelock: output.additional_timelock(),
-                                                is_coinbase: output.transaction() == miner_hash,
-                                                subaddress_major: major,
-                                                subaddress_minor: minor,
-                                                spent: false,
-                                            });
-                                        }
-                                    }
-
-                                    let _ = txc.send(Ok(collected));
-                                }
+                            // Nothing to do
+                            if start_h >= end_h_exclusive {
+                                let _ = txc.send(Ok(collected));
+                                return;
                             }
+
+                            // Diagnostic clamp inside workers as well: fetch in smaller chunks to avoid OOM.
+                            let mut cur = start_bn;
+                            while cur <= end_bn_inclusive {
+                                if refresh_cancelled_for_wallet(&id_owned_for_worker) {
+                                    let _ = txc
+                                        .send(Err((-30, "wallet_refresh: cancelled".to_string())));
+                                    return;
+                                }
+
+                                let chunk_end = (cur
+                                    .saturating_add(worker_upstream_block_batch as usize)
+                                    .saturating_sub(1))
+                                .min(end_bn_inclusive);
+
+                                println!(
+                                    "🧭 wallet_refresh worker stage=contiguous_scannable_blocks_start wallet_id={} range={}..={}",
+                                    id_owned_for_worker,
+                                    cur,
+                                    chunk_end
+                                );
+
+                                let scannables = match TOKIO_RUNTIME
+                                    .block_on(client.contiguous_scannable_blocks(cur..=chunk_end))
+                                {
+                                    Ok(v) => {
+                                        println!(
+                                            "🧭 wallet_refresh worker stage=contiguous_scannable_blocks_ok wallet_id={} blocks={}",
+                                            id_owned_for_worker,
+                                            v.len()
+                                        );
+                                        v
+                                    }
+                                    Err(err) => {
+                                        println!(
+                                            "🧭 wallet_refresh worker stage=contiguous_scannable_blocks_error wallet_id={} err={}",
+                                            id_owned_for_worker,
+                                            err
+                                        );
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            format!(
+                                                "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
+                                                cur,
+                                                chunk_end,
+                                                err
+                                            ),
+                                        )));
+                                        return;
+                                    }
+                                };
+
+                                if scannables.is_empty() {
+                                    let _ = txc.send(Err((
+                                        -16,
+                                        format!(
+                                            "wallet_refresh: contiguous_scannable_blocks returned 0 blocks for heights {}..{}",
+                                            cur, chunk_end
+                                        ),
+                                    )));
+                                    return;
+                                }
+
+                                let mut th = u64::try_from(cur).unwrap_or(0);
+                                for scannable in scannables {
+                                    if refresh_cancelled_for_wallet(&id_owned_for_worker) {
+                                        let _ = txc.send(Err((
+                                            -30,
+                                            "wallet_refresh: cancelled".to_string(),
+                                        )));
+                                        return;
+                                    }
+
+                                    // Record block hash into wallet2-style recent hash history
+                                    {
+                                        let block_hash = scannable.block.hash();
+                                        if let Ok(mut map) = WALLET_STORE.lock() {
+                                            if let Some(state) = map.get_mut(&id_owned_for_worker) {
+                                                push_recent_block_hash(state, th, block_hash);
+                                            }
+                                        }
+                                    }
+
+                                    let miner_hash = scannable.block.miner_transaction().hash();
+                                    let outputs = match local_scanner.scan(scannable) {
+                                        Ok(result) => result.ignore_additional_timelock(),
+                                        Err(_) => {
+                                            let _ = txc.send(Err((
+                                                -16,
+                                                format!(
+                                                    "wallet_refresh: scanner failed at height {}",
+                                                    th
+                                                ),
+                                            )));
+                                            return;
+                                        }
+                                    };
+
+                                    for output in outputs {
+                                        let (major, minor) = output
+                                            .subaddress()
+                                            .map(|idx| (idx.account(), idx.address()))
+                                            .unwrap_or((0, 0));
+                                        collected.push(TrackedOutput {
+                                            tx_hash: output.transaction(),
+                                            index_in_tx: output.index_in_transaction(),
+                                            amount: output.commitment().amount,
+                                            block_height: th,
+                                            additional_timelock: output.additional_timelock(),
+                                            is_coinbase: output.transaction() == miner_hash,
+                                            subaddress_major: major,
+                                            subaddress_minor: minor,
+                                            spent: false,
+                                        });
+                                    }
+
+                                    th = th.saturating_add(1);
+                                }
+
+                                cur = chunk_end.saturating_add(1);
+                            }
+
+                            let _ = txc.send(Ok(collected));
+                            return;
                         });
                     }
 
@@ -5001,737 +4981,482 @@ pub extern "C" fn wallet_refresh(
             // Ensure we align with daemon height after finishing batches
             scan_cursor = daemon.height;
         } else {
-            // Sequential scan with optional bulk *.bin fetch.
+            // Sequential scan: use upstream daemon RPC implementation only.
             //
-            // Bulk fetch is default-enabled but clearnet-only (node_url must be provided),
-            // and may be disabled via WALLETCORE_BULK_FETCH=0.
-            let clearnet_scan: bool = !node_url.is_null();
-            let mut effective_bulk_fetch: BulkFetchMode = if clearnet_scan {
-                bulk_fetch_mode
-            } else {
-                BulkFetchMode::PerBlock
-            };
-
-            // If wallet2-fast fails, prefer range-based bulk mode (get_blocks.bin) over per-block JSON.
-            //
-            // This is a pragmatic performance fallback: we keep binary bulk fetch but avoid the more fragile
-            // wallet2-fast response decoding path.
-            //
-            // Env override:
-            // - WALLETCORE_WALLET2_FAST_FALLBACK=range (default)
-            // - WALLETCORE_WALLET2_FAST_FALLBACK=per_block
-            let wallet2_fast_fallback = std::env::var("WALLETCORE_WALLET2_FAST_FALLBACK")
-                .ok()
-                .unwrap_or_else(|| "range".to_string())
-                .to_lowercase();
-
-            // One-line logging for bulk enable/fallback (per refresh)
-            let mut bulk_fetch_logged: bool = false;
-            // Tracks whether the wallet2-fast path has deterministically failed this refresh and we should
-            // switch modes for subsequent iterations.
-            let mut wallet2_fast_failed: bool = false;
-            let mut bulk_fetch_fallback_logged: bool = false;
-
+            // During performance iteration we explicitly disable bespoke bulk fetch modes and any
+            // fallback logic. If the upstream interface fails, we fail hard with a clear error.
             while scan_cursor < daemon.height {
                 // Cancellation check (per-wallet)
                 if refresh_cancelled_for_wallet(id) {
+                    // Close any open persist span.
+                    if let Some(p0) = persist_span_start.take() {
+                        refresh_persist_ms_total =
+                            refresh_persist_ms_total.saturating_add(p0.elapsed().as_millis());
+                    }
+
+                    let total_ms = refresh_t0.elapsed().as_millis();
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "📈 wallet_refresh summary wallet_id={} status=cancelled total_ms={} batches={} blocks={} outputs_added={} fetch_ms_total={} scan_ms_total={} persist_ms_total={}",
+                        id,
+                        total_ms,
+                        refresh_batches_total,
+                        refresh_blocks_total,
+                        refresh_outputs_added_total,
+                        refresh_fetch_ms_total,
+                        refresh_scan_ms_total,
+                        refresh_persist_ms_total
+                    );
                     return record_error(-30, "wallet_refresh: cancelled");
                 }
 
-                // If wallet2-fast already failed this refresh, switch modes before the next attempt.
-                if wallet2_fast_failed && effective_bulk_fetch == BulkFetchMode::Wallet2FastBlocks {
-                    effective_bulk_fetch = if wallet2_fast_fallback == "per_block" {
-                        BulkFetchMode::PerBlock
-                    } else {
-                        BulkFetchMode::RangeBlocks
-                    };
+                let end_exclusive = std::cmp::min(
+                    daemon.height,
+                    scan_cursor.saturating_add(upstream_block_batch),
+                );
+                if end_exclusive <= scan_cursor {
+                    break;
                 }
 
-                match effective_bulk_fetch {
-                    BulkFetchMode::Wallet2FastBlocks | BulkFetchMode::RangeBlocks => {
-                        if !bulk_fetch_logged {
-                            let mode_str = match effective_bulk_fetch {
-                                BulkFetchMode::Wallet2FastBlocks => "getblocks(wallet2)",
-                                BulkFetchMode::RangeBlocks => "get_blocks(range)",
-                                BulkFetchMode::PerBlock => "per_block",
-                            };
-                            print!(
-                                "🧱 bulk-fetch(bin:{})=on batch={} clearnet={}\n",
-                                mode_str, bulk_fetch_batch, clearnet_scan
-                            );
-                            bulk_fetch_logged = true;
-                        }
+                let start_bn = match usize::try_from(scan_cursor) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return record_error(
+                            -16,
+                            "wallet_refresh: block number conversion overflow",
+                        )
+                    }
+                };
+                let end_bn_inclusive = match usize::try_from(end_exclusive.saturating_sub(1)) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return record_error(
+                            -16,
+                            "wallet_refresh: block number conversion overflow",
+                        )
+                    }
+                };
 
-                        let end_exclusive = std::cmp::min(
-                            daemon.height,
-                            scan_cursor.saturating_add(bulk_fetch_batch as u64),
-                        );
-                        let count = end_exclusive.saturating_sub(scan_cursor);
+                // Close the previous batch's persist span (measures overhead between scan end and next fetch).
+                if let Some(p0) = persist_span_start.take() {
+                    refresh_persist_ms_total =
+                        refresh_persist_ms_total.saturating_add(p0.elapsed().as_millis());
+                }
 
-                        // In wallet2-fast mode, attempt the wallet2-style call first.
-                        // If it fails (decode/format issues on some daemon variants), mark wallet2_fast_failed
-                        // and optionally retry via the range-based bulk call.
-                        if effective_bulk_fetch == BulkFetchMode::Wallet2FastBlocks
-                            && !wallet2_fast_failed
-                        {
-                            // Build short chain history (block_ids) from persisted bounded hash window.
-                            // If empty, seed it via on_get_block_hash and retry.
-                            let mut block_ids = build_short_chain_history(&snapshot);
+                walletcore_log!(
+                    id,
+                    snapshot.network,
+                    "🧭 wallet_refresh stage=contiguous_scannable_blocks_start wallet_id={} range={}..={}",
+                    id,
+                    start_bn,
+                    end_bn_inclusive
+                );
 
-                            if block_ids.is_empty() {
-                                let seed_res = rpc_client
-                                    .seed_recent_block_hashes_for_wallet2(id, scan_cursor);
-                                if seed_res.is_ok() {
-                                    // Reload snapshot to pick up the seeded hashes.
-                                    if let Ok(map) = WALLET_STORE.lock() {
-                                        if let Some(state) = map.get(id) {
-                                            block_ids = build_short_chain_history(state);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !block_ids.is_empty() {
-                                match rpc_client.get_blocks_fast_bin(block_ids, scan_cursor, true) {
-                                    Ok(resp) => {
-                                        // If we ever get a successful wallet2-fast response here, we still
-                                        // need to scan its blocks. For now, we treat success as "unsupported"
-                                        // unless the response contains txs and output_indices aligned.
-                                        //
-                                        // NOTE: A fuller implementation would scan resp.blocks + resp.output_indices
-                                        // similarly to the parallel worker path.
-                                        if resp.blocks.is_empty()
-                                            || resp.blocks.len() != resp.output_indices.len()
-                                        {
-                                            wallet2_fast_failed = true;
-                                            if !bulk_fetch_fallback_logged {
-                                                print!(
-                                                    "🧱 bulk-fetch(bin:getblocks(wallet2)) unexpected response shape; switching to {}: blocks={} oindexes={}\n",
-                                                    if wallet2_fast_fallback == "per_block" { "per-block" } else { "range bulk (get_blocks.bin)" },
-                                                    resp.blocks.len(),
-                                                    resp.output_indices.len()
-                                                );
-                                                bulk_fetch_fallback_logged = true;
-                                            }
-                                        } else {
-                                            // Minimal sequential scan of the returned wallet2-fast entries.
-                                            // Heights are assigned sequentially starting at scan_cursor.
-                                            let mut th = scan_cursor;
-                                            for (entry, boi) in resp
-                                                .blocks
-                                                .into_iter()
-                                                .zip(resp.output_indices.into_iter())
-                                            {
-                                                if refresh_cancelled_for_wallet(id) {
-                                                    return record_error(
-                                                        -30,
-                                                        "wallet_refresh: cancelled",
-                                                    );
-                                                }
-
-                                                // If tx blobs are missing, fall back to per-block for just that height.
-                                                if entry.txs.is_empty() {
-                                                    let block_number = match usize::try_from(th) {
-                                                        Ok(v) => v,
-                                                        Err(_) => return record_error(-16, "wallet_refresh: block number conversion overflow"),
-                                                    };
-                                                    let scannable = match block_on(
-                                                        rpc_client.get_scannable_block_by_number(
-                                                            block_number,
-                                                        ),
-                                                    ) {
-                                                        Ok(block) => block,
-                                                        Err(err2) => {
-                                                            let code = map_rpc_error(err2);
-                                                            return record_error(code, format!("wallet_refresh: per-block fallback RPC block fetch failed at height {}", th));
-                                                        }
-                                                    };
-
-                                                    // Record block hash for wallet2-style recent hash history
-                                                    {
-                                                        let block_hash = scannable.block.hash();
-                                                        if let Ok(mut map) = WALLET_STORE.lock() {
-                                                            if let Some(state) = map.get_mut(id) {
-                                                                push_recent_block_hash(
-                                                                    state, th, block_hash,
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-
-                                                    let miner_hash =
-                                                        scannable.block.miner_transaction().hash();
-                                                    let outputs = match scanner.scan(scannable) {
-                                                        Ok(result) => result.ignore_additional_timelock(),
-                                                        Err(_) => return record_error(-16, format!("wallet_refresh: scanner failed at height {}", th)),
-                                                    };
-
-                                                    for output in outputs {
-                                                        let key = (
-                                                            output.transaction(),
-                                                            output.index_in_transaction(),
-                                                        );
-                                                        if !seen_outpoints.insert(key) {
-                                                            continue;
-                                                        }
-                                                        let (major, minor) = output
-                                                            .subaddress()
-                                                            .map(|idx| {
-                                                                (idx.account(), idx.address())
-                                                            })
-                                                            .unwrap_or((0, 0));
-                                                        working_outputs.push(TrackedOutput {
-                                                            tx_hash: output.transaction(),
-                                                            index_in_tx: output
-                                                                .index_in_transaction(),
-                                                            amount: output.commitment().amount,
-                                                            block_height: th,
-                                                            additional_timelock: output
-                                                                .additional_timelock(),
-                                                            is_coinbase: output.transaction()
-                                                                == miner_hash,
-                                                            subaddress_major: major,
-                                                            subaddress_minor: minor,
-                                                            spent: false,
-                                                        });
-                                                    }
-
-                                                    th = th.saturating_add(1);
-                                                    continue;
-                                                }
-
-                                                // Parse block blob
-                                                let mut bb = entry.block.as_slice();
-                                                let parsed_block = match Block::read(&mut bb) {
-                                                    Ok(b) => b,
-                                                    Err(_) => {
-                                                        wallet2_fast_failed = true;
-                                                        break;
-                                                    }
-                                                };
-
-                                                // Parse tx blobs (pruned)
-                                                let mut parsed_txs: Vec<Transaction<Pruned>> =
-                                                    Vec::with_capacity(entry.txs.len());
-                                                for tx_blob in entry.txs {
-                                                    let mut tb = tx_blob.blob.as_slice();
-                                                    match Transaction::<Pruned>::read(&mut tb) {
-                                                        Ok(t) => parsed_txs.push(t),
-                                                        Err(_) => {
-                                                            wallet2_fast_failed = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                if wallet2_fast_failed {
-                                                    break;
-                                                }
-
-                                                // Record block hash
-                                                {
-                                                    let block_hash = parsed_block.hash();
-                                                    if let Ok(mut map) = WALLET_STORE.lock() {
-                                                        if let Some(state) = map.get_mut(id) {
-                                                            push_recent_block_hash(
-                                                                state, th, block_hash,
-                                                            );
-                                                        }
-                                                    }
-                                                }
-
-                                                // Compute output_index_for_first_ringct_output from output_indices
-                                                let mut output_index_for_first_ringct_output: Option<u64> = None;
-                                                for txoi in boi.indices.iter() {
-                                                    if let Some(first) = txoi.indices.first() {
-                                                        output_index_for_first_ringct_output =
-                                                            Some(*first);
-                                                        break;
-                                                    }
-                                                }
-
-                                                let scannable = ScannableBlock {
-                                                    block: parsed_block,
-                                                    transactions: parsed_txs,
-                                                    output_index_for_first_ringct_output,
-                                                };
-
-                                                let miner_hash =
-                                                    scannable.block.miner_transaction().hash();
-                                                let outputs = match scanner.scan(scannable) {
-                                                    Ok(result) => {
-                                                        result.ignore_additional_timelock()
-                                                    }
-                                                    Err(_) => {
-                                                        wallet2_fast_failed = true;
-                                                        break;
-                                                    }
-                                                };
-
-                                                for output in outputs {
-                                                    let key = (
-                                                        output.transaction(),
-                                                        output.index_in_transaction(),
-                                                    );
-                                                    if !seen_outpoints.insert(key) {
-                                                        continue;
-                                                    }
-                                                    let (major, minor) = output
-                                                        .subaddress()
-                                                        .map(|idx| (idx.account(), idx.address()))
-                                                        .unwrap_or((0, 0));
-                                                    working_outputs.push(TrackedOutput {
-                                                        tx_hash: output.transaction(),
-                                                        index_in_tx: output.index_in_transaction(),
-                                                        amount: output.commitment().amount,
-                                                        block_height: th,
-                                                        additional_timelock: output
-                                                            .additional_timelock(),
-                                                        is_coinbase: output.transaction()
-                                                            == miner_hash,
-                                                        subaddress_major: major,
-                                                        subaddress_minor: minor,
-                                                        spent: false,
-                                                    });
-                                                }
-
-                                                th = th.saturating_add(1);
-                                            }
-
-                                            // Advance cursor and update progress for the wallet2-fast span we just scanned.
-                                            scan_cursor = th;
-                                            update_scan_progress(
-                                                id,
-                                                scan_cursor.min(daemon.height),
-                                                daemon.height,
-                                                daemon.top_block_timestamp,
-                                                snapshot.restore_height,
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        wallet2_fast_failed = true;
-                                        if !bulk_fetch_fallback_logged {
-                                            print!(
-                                                "🧱 bulk-fetch(bin:getblocks(wallet2)) failed; switching to {}: {}\n",
-                                                if wallet2_fast_fallback == "per_block" { "per-block" } else { "range bulk (get_blocks.bin)" },
-                                                err
-                                            );
-                                            bulk_fetch_fallback_logged = true;
-                                        }
-                                    }
-                                }
+                let fetch_t0 = std::time::Instant::now();
+                let scannables = match TOKIO_RUNTIME
+                    .block_on(rpc_client.contiguous_scannable_blocks(start_bn..=end_bn_inclusive))
+                {
+                    Ok(v) => {
+                        let fetch_ms = fetch_t0.elapsed().as_millis();
+                        refresh_fetch_ms_total = refresh_fetch_ms_total.saturating_add(fetch_ms);
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
+                            id,
+                            v.len(),
+                            fetch_ms,
+                            if fetch_ms > 0 {
+                                (v.len() as f64) / (fetch_ms as f64 / 1000.0)
                             } else {
-                                wallet2_fast_failed = true;
-                                if !bulk_fetch_fallback_logged {
-                                    print!(
-                                        "🧱 bulk-fetch(bin:getblocks(wallet2)) missing chain history; switching to {} (no block_ids)\n",
-                                        if wallet2_fast_fallback == "per_block" { "per-block" } else { "range bulk (get_blocks.bin)" }
-                                    );
-                                    bulk_fetch_fallback_logged = true;
+                                0.0
+                            }
+                        );
+                        v
+                    }
+                    Err(err) => {
+                        let fetch_ms = fetch_t0.elapsed().as_millis();
+                        refresh_fetch_ms_total = refresh_fetch_ms_total.saturating_add(fetch_ms);
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧭 wallet_refresh stage=contiguous_scannable_blocks_error wallet_id={} fetch_ms={} err={}",
+                            id,
+                            fetch_ms,
+                            err
+                        );
+                        return record_error(
+                            -16,
+                            format!(
+                                "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
+                                scan_cursor,
+                                end_exclusive.saturating_sub(1),
+                                err
+                            ),
+                        );
+                    }
+                };
+
+                if scannables.is_empty() {
+                    return record_error(
+                        -16,
+                        format!(
+                            "wallet_refresh: contiguous_scannable_blocks returned 0 blocks for heights {}..{}",
+                            scan_cursor,
+                            end_exclusive.saturating_sub(1)
+                        ),
+                    );
+                }
+
+                let scan_t0 = std::time::Instant::now();
+                let mut outputs_added_in_batch: usize = 0;
+                let blocks_in_batch: usize = scannables.len();
+
+                // Debug: per-batch scannable transaction completeness stats.
+                // This helps diagnose "0 outputs" cases by confirming the daemon provided tx blobs
+                // with non-empty extra and outputs (required for output discovery).
+                let mut batch_txs_total: usize = 0;
+                let mut batch_txs_v1: usize = 0;
+                let mut batch_txs_v2: usize = 0;
+                let mut batch_txs_v2_proofs_some: usize = 0;
+                let mut batch_txs_v2_proofs_none: usize = 0;
+                let mut batch_txs_extra_nonempty: usize = 0;
+                let mut batch_txs_outputs_nonzero: usize = 0;
+                let mut batch_outputs_total: usize = 0;
+
+                let mut th = scan_cursor;
+                for scannable in scannables {
+                    if refresh_cancelled_for_wallet(id) {
+                        return record_error(-30, "wallet_refresh: cancelled");
+                    }
+
+                    // Record block hash into wallet2-style recent hash history
+                    {
+                        let block_hash = scannable.block.hash();
+                        if let Ok(mut map) = WALLET_STORE.lock() {
+                            if let Some(state) = map.get_mut(id) {
+                                push_recent_block_hash(state, th, block_hash);
+                            }
+                        }
+                    }
+
+                    let miner_hash = scannable.block.miner_transaction().hash();
+
+                    // Inspect transaction completeness before scanning.
+                    // Note: `scannable.transactions` excludes the miner tx; count it separately.
+                    {
+                        // Miner tx
+                        batch_txs_total = batch_txs_total.saturating_add(1);
+                        match scannable.block.miner_transaction() {
+                            Transaction::V1 { .. } => {
+                                batch_txs_v1 = batch_txs_v1.saturating_add(1);
+                            }
+                            Transaction::V2 { proofs, .. } => {
+                                batch_txs_v2 = batch_txs_v2.saturating_add(1);
+                                if proofs.is_some() {
+                                    batch_txs_v2_proofs_some =
+                                        batch_txs_v2_proofs_some.saturating_add(1);
+                                } else {
+                                    batch_txs_v2_proofs_none =
+                                        batch_txs_v2_proofs_none.saturating_add(1);
                                 }
                             }
+                        }
+                        let miner_prefix = scannable.block.miner_transaction().prefix();
+                        if !miner_prefix.extra.is_empty() {
+                            batch_txs_extra_nonempty = batch_txs_extra_nonempty.saturating_add(1);
+                        }
+                        if !miner_prefix.outputs.is_empty() {
+                            batch_txs_outputs_nonzero = batch_txs_outputs_nonzero.saturating_add(1);
+                            batch_outputs_total =
+                                batch_outputs_total.saturating_add(miner_prefix.outputs.len());
+                        }
+                    }
 
-                            // If configured to fall back to per-block, do so immediately.
-                            if wallet2_fast_fallback == "per_block" {
-                                effective_bulk_fetch = BulkFetchMode::PerBlock;
-                                continue;
+                    // Non-miner txs (validated)
+                    //
+                    // Note: `rpc_client.contiguous_scannable_blocks(...)` returns `Vec<ScannableBlock>`,
+                    // and `ScannableBlock.transactions` is `Vec<Transaction<Pruned>>` (already validated).
+                    for tx_ref in &scannable.transactions {
+                        batch_txs_total = batch_txs_total.saturating_add(1);
+
+                        match tx_ref {
+                            Transaction::V1 { .. } => {
+                                batch_txs_v1 = batch_txs_v1.saturating_add(1);
                             }
-
-                            // Otherwise, retry the same span using range bulk mode below.
-                            effective_bulk_fetch = BulkFetchMode::RangeBlocks;
+                            Transaction::V2 { proofs, .. } => {
+                                batch_txs_v2 = batch_txs_v2.saturating_add(1);
+                                if proofs.is_some() {
+                                    batch_txs_v2_proofs_some =
+                                        batch_txs_v2_proofs_some.saturating_add(1);
+                                } else {
+                                    batch_txs_v2_proofs_none =
+                                        batch_txs_v2_proofs_none.saturating_add(1);
+                                }
+                            }
                         }
 
-                        // Range bulk mode: Fetch contiguous range via get_blocks.bin (full tx blobs)
-                        let resp = match rpc_client.get_blocks_bin(scan_cursor, count, false) {
-                            Ok(r) => r,
-                            Err(err) => {
-                                if !bulk_fetch_fallback_logged {
-                                    print!(
-                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: {}\n",
-                                        err
-                                    );
-                                    bulk_fetch_fallback_logged = true;
-                                }
-                                // Process current height via per-block, then continue (we'll keep falling back)
-                                let block_number = match usize::try_from(scan_cursor) {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        return record_error(
-                                            -16,
-                                            "wallet_refresh: block number conversion overflow",
-                                        )
-                                    }
-                                };
-                                let scannable = match block_on(
-                                    rpc_client.get_scannable_block_by_number(block_number),
-                                ) {
-                                    Ok(block) => block,
-                                    Err(err2) => {
-                                        let code = map_rpc_error(err2);
-                                        return record_error(
-                                            code,
-                                            format!(
-                                                "wallet_refresh: RPC block fetch failed at height {}",
-                                                scan_cursor
-                                            ),
-                                        );
-                                    }
-                                };
-                                let miner_hash = scannable.block.miner_transaction().hash();
-                                let outputs = match scanner.scan(scannable) {
-                                    Ok(result) => result.ignore_additional_timelock(),
-                                    Err(_) => {
-                                        return record_error(
-                                            -16,
-                                            format!(
-                                                "wallet_refresh: scanner failed at height {}",
-                                                scan_cursor
-                                            ),
-                                        );
-                                    }
-                                };
-                                for output in outputs {
-                                    let key = (output.transaction(), output.index_in_transaction());
-                                    if !seen_outpoints.insert(key) {
-                                        continue;
-                                    }
-                                    let (major, minor) = output
-                                        .subaddress()
-                                        .map(|idx| (idx.account(), idx.address()))
-                                        .unwrap_or((0, 0));
-                                    working_outputs.push(TrackedOutput {
-                                        tx_hash: output.transaction(),
-                                        index_in_tx: output.index_in_transaction(),
-                                        amount: output.commitment().amount,
-                                        block_height: scan_cursor,
-                                        additional_timelock: output.additional_timelock(),
-                                        is_coinbase: output.transaction() == miner_hash,
-                                        subaddress_major: major,
-                                        subaddress_minor: minor,
-                                        spent: false,
-                                    });
-                                }
-                                scan_cursor += 1;
-                                update_scan_progress(
-                                    id,
-                                    scan_cursor.min(daemon.height),
-                                    daemon.height,
-                                    daemon.top_block_timestamp,
-                                    snapshot.restore_height,
-                                );
-                                continue;
-                            }
-                        };
+                        let prefix = tx_ref.prefix();
+                        if !prefix.extra.is_empty() {
+                            batch_txs_extra_nonempty = batch_txs_extra_nonempty.saturating_add(1);
+                        }
+                        if !prefix.outputs.is_empty() {
+                            batch_txs_outputs_nonzero = batch_txs_outputs_nonzero.saturating_add(1);
+                            batch_outputs_total =
+                                batch_outputs_total.saturating_add(prefix.outputs.len());
+                        }
+                    }
 
-                        // Process returned entries sequentially (assumed 1-per-height starting at scan_cursor).
-                        // If any specific entry is missing tx blobs, fall back to the existing per-block logic
-                        // for just that height instead of aborting the entire batch.
-                        let mut th = scan_cursor;
-                        for entry in resp.blocks {
-                            if refresh_cancelled_for_wallet(id) {
-                                return record_error(-30, "wallet_refresh: cancelled");
-                            }
+                    // Targeted debug: check whether this height/tx is present and whether we detect any outputs for it.
+                    //
+                    // Behavior:
+                    // - If WALLETCORE_DEBUG_HEIGHT is set, only emit logs within [height - window, height + window].
+                    //   This keeps logs readable and makes it easy to focus on a known problematic height.
+                    // - If WALLETCORE_DEBUG_HEIGHT is NOT set, and WALLETCORE_DEBUG_TXID is set, emit txid
+                    //   presence logs for every scanned height (noisy by design).
+                    let dbg_this_height = debug_height
+                        .map(|h| {
+                            let w = debug_height_window;
+                            th >= h.saturating_sub(w) && th <= h.saturating_add(w)
+                        })
+                        .unwrap_or(false);
 
-                            // If this entry omitted tx blobs, scan this single height via per-block RPC and continue.
-                            if entry.txs.is_empty() {
-                                if !bulk_fetch_fallback_logged {
-                                    print!(
-                                        "🧱 bulk-fetch(bin:get_blocks) partial fallback: missing tx blobs for some heights; using per-block for those\n"
-                                    );
-                                    bulk_fetch_fallback_logged = true;
-                                }
+                    let should_log_this_height = if debug_height.is_some() {
+                        dbg_this_height
+                    } else {
+                        // No specific height configured; allow "log everywhere" mode only when txid is set.
+                        debug_txid.is_some()
+                    };
 
-                                let block_number = match usize::try_from(th) {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        if !bulk_fetch_fallback_logged {
-                                            print!(
-                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: block number conversion overflow\n"
-                                            );
-                                            bulk_fetch_fallback_logged = true;
-                                        }
-                                        break;
-                                    }
-                                };
-
-                                let scannable = match block_on(
-                                    rpc_client.get_scannable_block_by_number(block_number),
-                                ) {
-                                    Ok(block) => block,
-                                    Err(_) => {
-                                        if !bulk_fetch_fallback_logged {
-                                            print!(
-                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: RPC block fetch failed\n"
-                                            );
-                                            bulk_fetch_fallback_logged = true;
-                                        }
-                                        break;
-                                    }
-                                };
-
-                                // Record block hash into wallet2-style recent hash history
-                                // (used to build short chain history for `/getblocks.bin`).
-                                {
-                                    let block_hash = scannable.block.hash();
-                                    if let Ok(mut map) = WALLET_STORE.lock() {
-                                        if let Some(state) = map.get_mut(id) {
-                                            push_recent_block_hash(state, th, block_hash);
-                                        }
-                                    }
-                                }
-
-                                let miner_hash = scannable.block.miner_transaction().hash();
-                                let outputs = match scanner.scan(scannable) {
-                                    Ok(result) => result.ignore_additional_timelock(),
-                                    Err(_) => {
-                                        if !bulk_fetch_fallback_logged {
-                                            print!(
-                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: scanner failed\n"
-                                            );
-                                            bulk_fetch_fallback_logged = true;
-                                        }
-                                        break;
-                                    }
-                                };
-
-                                for output in outputs {
-                                    let (major, minor) = output
-                                        .subaddress()
-                                        .map(|idx| (idx.account(), idx.address()))
-                                        .unwrap_or((0, 0));
-                                    working_outputs.push(TrackedOutput {
-                                        tx_hash: output.transaction(),
-                                        index_in_tx: output.index_in_transaction(),
-                                        amount: output.commitment().amount,
-                                        block_height: th,
-                                        additional_timelock: output.additional_timelock(),
-                                        is_coinbase: output.transaction() == miner_hash,
-                                        subaddress_major: major,
-                                        subaddress_minor: minor,
-                                        spent: false,
-                                    });
-                                }
-
-                                th = th.saturating_add(1);
-                                scan_cursor = th;
-                                update_scan_progress(
-                                    id,
-                                    scan_cursor.min(daemon.height),
-                                    daemon.height,
-                                    daemon.top_block_timestamp,
-                                    snapshot.restore_height,
-                                );
-                                continue;
-                            }
-
-                            // Parse block blob
-                            let mut bb = entry.block.as_slice();
-                            let parsed_block = match Block::read(&mut bb) {
-                                Ok(b) => b,
-                                Err(_) => {
-                                    if !bulk_fetch_fallback_logged {
-                                        print!(
-                                            "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: block parse failed\n"
-                                        );
-                                        bulk_fetch_fallback_logged = true;
-                                    }
+                    if should_log_this_height {
+                        if dbg_this_height {
+                            walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧪 debug_target height={} txs_in_block={} (non_miner) miner_tx_hash={}",
+                                th,
+                                scannable.transactions.len(),
+                                hex_dump_prefix(&scannable.block.miner_transaction().hash(), 32)
+                            );
+                        }
+                        if let Some(target) = debug_txid {
+                            let mut contains = false;
+                            for h in &scannable.block.transactions {
+                                if *h == target {
+                                    contains = true;
                                     break;
                                 }
-                            };
-
-                            // Parse tx blobs (pruned)
-                            let mut parsed_txs: Vec<Transaction<Pruned>> =
-                                Vec::with_capacity(entry.txs.len());
-                            let mut tx_parse_failed = false;
-                            for tx_blob in entry.txs {
-                                let mut tb = tx_blob.blob.as_slice();
-                                match Transaction::<Pruned>::read(&mut tb) {
-                                    Ok(t) => parsed_txs.push(t),
-                                    Err(_) => {
-                                        tx_parse_failed = true;
-                                        break;
-                                    }
-                                }
                             }
-                            if tx_parse_failed {
-                                if !bulk_fetch_fallback_logged {
-                                    print!(
-                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: tx parse failed\n"
-                                    );
-                                    bulk_fetch_fallback_logged = true;
-                                }
-                                break;
-                            }
-
-                            // Compute output_index_for_first_ringct_output (A1) using get_o_indexes.bin.
-                            let mut output_index_for_first_ringct_output: Option<u64> = None;
-                            let miner_tx_hash = parsed_block.miner_transaction().hash();
-                            let miner_tx = Transaction::<Pruned>::from(
-                                parsed_block.miner_transaction().clone(),
+                            walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧪 debug_target_txid height={} target_txid={} block_contains={}",
+                                th,
+                                hex_dump_prefix(&target, 32),
+                                contains
                             );
-                            for (hash, tx) in core::iter::once((&miner_tx_hash, &miner_tx))
-                                .chain(parsed_block.transactions.iter().zip(&parsed_txs))
-                            {
-                                if (!matches!(tx, Transaction::V2 { .. }))
-                                    || tx.prefix().outputs.is_empty()
-                                {
-                                    continue;
-                                }
-                                let idxs = match get_o_indexes_limited(&rpc_client, *hash) {
-                                    Ok(v) => v,
-                                    Err(err) => {
-                                        if !bulk_fetch_fallback_logged {
-                                            print!(
-                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: get_o_indexes failed ({})\n",
-                                                err
-                                            );
-                                            bulk_fetch_fallback_logged = true;
-                                        }
-                                        break;
-                                    }
-                                };
-                                if let Some(first) = idxs.first() {
-                                    output_index_for_first_ringct_output = Some(*first);
-                                }
-                                break;
-                            }
+                        }
+                    }
 
-                            let scannable = ScannableBlock {
-                                block: parsed_block,
-                                transactions: parsed_txs,
-                                output_index_for_first_ringct_output,
-                            };
+                    let outputs = match scanner.scan(scannable) {
+                        Ok(result) => result.ignore_additional_timelock(),
+                        Err(_) => {
+                            return record_error(
+                                -16,
+                                format!("wallet_refresh: scanner failed at height {}", th),
+                            );
+                        }
+                    };
 
-                            let miner_hash = scannable.block.miner_transaction().hash();
-                            let outputs = match scanner.scan(scannable) {
-                                Ok(result) => result.ignore_additional_timelock(),
-                                Err(_) => {
-                                    return record_error(
-                                        -16,
-                                        format!(
-                                            "wallet_refresh: scanner failed at height {}",
-                                            scan_cursor
-                                        ),
-                                    );
-                                }
-                            };
+                    for output in outputs {
+                        let key = (output.transaction(), output.index_in_transaction());
+                        if !seen_outpoints.insert(key) {
+                            continue;
+                        }
 
-                            for output in outputs {
-                                let key = (output.transaction(), output.index_in_transaction());
-                                if !seen_outpoints.insert(key) {
-                                    continue;
-                                }
-
-                                let (major, minor) = output
+                        // Targeted debug: log every matched output for the target txid (if provided).
+                        if let Some(target) = debug_txid {
+                            if output.transaction() == target {
+                                let (maj, min) = output
                                     .subaddress()
                                     .map(|idx| (idx.account(), idx.address()))
                                     .unwrap_or((0, 0));
-
-                                working_outputs.push(TrackedOutput {
-                                    tx_hash: output.transaction(),
-                                    index_in_tx: output.index_in_transaction(),
-                                    amount: output.commitment().amount,
-                                    block_height: scan_cursor,
-                                    additional_timelock: output.additional_timelock(),
-                                    is_coinbase: output.transaction() == miner_hash,
-                                    subaddress_major: major,
-                                    subaddress_minor: minor,
-                                    spent: false,
-                                });
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "🧪 debug_target_match height={} txid={} out_index={} subaddr=({}, {}) amount_piconero={}",
+                                    th,
+                                    hex_dump_prefix(&target, 32),
+                                    output.index_in_transaction(),
+                                    maj,
+                                    min,
+                                    output.commitment().amount
+                                );
                             }
-
-                            scan_cursor += 1;
-                            update_scan_progress(
-                                id,
-                                scan_cursor.min(daemon.height),
-                                daemon.height,
-                                daemon.top_block_timestamp,
-                                snapshot.restore_height,
-                            );
                         }
 
-                        if bulk_fetch_fallback_logged {
-                            continue;
-                        }
+                        let (major, minor) = output
+                            .subaddress()
+                            .map(|idx| (idx.account(), idx.address()))
+                            .unwrap_or((0, 0));
+                        working_outputs.push(TrackedOutput {
+                            tx_hash: output.transaction(),
+                            index_in_tx: output.index_in_transaction(),
+                            amount: output.commitment().amount,
+                            block_height: th,
+                            additional_timelock: output.additional_timelock(),
+                            is_coinbase: output.transaction() == miner_hash,
+                            subaddress_major: major,
+                            subaddress_minor: minor,
+                            spent: false,
+                        });
+                        outputs_added_in_batch = outputs_added_in_batch.saturating_add(1);
                     }
 
-                    BulkFetchMode::PerBlock => {
-                        let block_number = match usize::try_from(scan_cursor) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                return record_error(
-                                    -16,
-                                    "wallet_refresh: block number conversion overflow",
-                                )
-                            }
-                        };
-                        let scannable = match block_on(
-                            rpc_client.get_scannable_block_by_number(block_number),
-                        ) {
-                            Ok(block) => block,
-                            Err(err) => {
-                                let code = map_rpc_error(err);
-                                return record_error(
-                                    code,
-                                    format!(
-                                        "wallet_refresh: RPC block fetch failed at height {}",
-                                        scan_cursor
-                                    ),
-                                );
-                            }
-                        };
-                        let miner_hash = scannable.block.miner_transaction().hash();
-                        let outputs = match scanner.scan(scannable) {
-                            Ok(result) => result.ignore_additional_timelock(),
-                            Err(_) => {
-                                return record_error(
-                                    -16,
-                                    format!(
-                                        "wallet_refresh: scanner failed at height {}",
-                                        scan_cursor
-                                    ),
-                                );
-                            }
-                        };
+                    th = th.saturating_add(1);
+                }
 
-                        for output in outputs {
-                            let key = (output.transaction(), output.index_in_transaction());
-                            if !seen_outpoints.insert(key) {
-                                continue;
-                            }
+                let scan_ms = scan_t0.elapsed().as_millis();
+                refresh_scan_ms_total = refresh_scan_ms_total.saturating_add(scan_ms);
+                refresh_blocks_total = refresh_blocks_total.saturating_add(blocks_in_batch);
+                refresh_outputs_added_total =
+                    refresh_outputs_added_total.saturating_add(outputs_added_in_batch);
+                refresh_batches_total = refresh_batches_total.saturating_add(1);
 
-                            let (major, minor) = output
-                                .subaddress()
-                                .map(|idx| (idx.account(), idx.address()))
-                                .unwrap_or((0, 0));
+                if refresh_telemetry_enabled {
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧪 scannable_completeness wallet_id={} range={}..={} blocks={} txs_total={} txs_v1={} txs_v2={} v2_proofs_some={} v2_proofs_none={} txs_extra_nonempty={} txs_outputs_nonzero={} outputs_total={}",
+                        id,
+                        start_bn,
+                        end_bn_inclusive,
+                        blocks_in_batch,
+                        batch_txs_total,
+                        batch_txs_v1,
+                        batch_txs_v2,
+                        batch_txs_v2_proofs_some,
+                        batch_txs_v2_proofs_none,
+                        batch_txs_extra_nonempty,
+                        batch_txs_outputs_nonzero,
+                        batch_outputs_total
+                    );
 
-                            working_outputs.push(TrackedOutput {
-                                tx_hash: output.transaction(),
-                                index_in_tx: output.index_in_transaction(),
-                                amount: output.commitment().amount,
-                                block_height: scan_cursor,
-                                additional_timelock: output.additional_timelock(),
-                                is_coinbase: output.transaction() == miner_hash,
-                                subaddress_major: major,
-                                subaddress_minor: minor,
-                                spent: false,
-                            });
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "📊 wallet_refresh batch_stats wallet_id={} range={}..={} blocks={} outputs_added={} fetch_ms_total={} scan_ms={} blocks_per_s={:.2} outputs_per_s={:.2}",
+                        id,
+                        start_bn,
+                        end_bn_inclusive,
+                        blocks_in_batch,
+                        outputs_added_in_batch,
+                        refresh_fetch_ms_total,
+                        scan_ms,
+                        if scan_ms > 0 {
+                            (blocks_in_batch as f64) / (scan_ms as f64 / 1000.0)
+                        } else {
+                            0.0
+                        },
+                        if scan_ms > 0 {
+                            (outputs_added_in_batch as f64) / (scan_ms as f64 / 1000.0)
+                        } else {
+                            0.0
                         }
+                    );
+                }
 
-                        scan_cursor += 1;
-                        update_scan_progress(
+                // Start persist-span timer for "overhead after scan" (IO/locking/serialization).
+                // This will be closed at the top of the next loop iteration (right before the next fetch).
+                persist_span_start = Some(std::time::Instant::now());
+
+                // Post-batch balance breakdown (debug):
+                // Helps reconcile discrepancies vs Feather by showing the current total and a few largest outputs.
+                if outputs_added_in_batch > 0 {
+                    let mut total_piconero: u64 = 0;
+                    for o in &working_outputs {
+                        total_piconero = total_piconero.saturating_add(o.amount);
+                    }
+
+                    // Show the largest few outputs to identify any single output driving a delta.
+                    let mut top = working_outputs.clone();
+                    top.sort_by(|a, b| b.amount.cmp(&a.amount));
+                    let top_n = top.len().min(10);
+
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "💰 balance_debug wallet_id={} total_piconero={} outputs_count={} top_n={}",
+                        id,
+                        total_piconero,
+                        working_outputs.len(),
+                        top_n
+                    );
+
+                    for (i, o) in top.into_iter().take(top_n).enumerate() {
+                        walletcore_log!(
                             id,
-                            scan_cursor.min(daemon.height),
-                            daemon.height,
-                            daemon.top_block_timestamp,
-                            snapshot.restore_height,
+                            snapshot.network,
+                            "💰 balance_debug_top wallet_id={} idx={} amount_piconero={} height={} tx_hash={} index_in_tx={} subaddr=({}, {}) coinbase={} timelock={:?}",
+                            id,
+                            i,
+                            o.amount,
+                            o.block_height,
+                            hex_dump_prefix(&o.tx_hash, 32),
+                            o.index_in_tx,
+                            o.subaddress_major,
+                            o.subaddress_minor,
+                            o.is_coinbase,
+                            o.additional_timelock
                         );
                     }
                 }
+
+                scan_cursor = th;
+                update_scan_progress(
+                    id,
+                    scan_cursor.min(daemon.height),
+                    daemon.height,
+                    daemon.top_block_timestamp,
+                    snapshot.restore_height,
+                );
             }
+
             scan_cursor = daemon.height;
         }
+    }
+
+    // Close any trailing persist span (the last batch has no "next fetch" to close it).
+    if let Some(p0) = persist_span_start.take() {
+        refresh_persist_ms_total =
+            refresh_persist_ms_total.saturating_add(p0.elapsed().as_millis());
+    }
+
+    // Final refresh summary (this is the single most useful line to compare Debug-vs-Release).
+    {
+        let total_ms = refresh_t0.elapsed().as_millis();
+        let total_ms_u128: u128 = total_ms;
+
+        let other_ms = total_ms_u128
+            .saturating_sub(refresh_fetch_ms_total)
+            .saturating_sub(refresh_scan_ms_total)
+            .saturating_sub(refresh_persist_ms_total);
+
+        walletcore_log!(
+            id,
+            snapshot.network,
+            "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} fetch_ms_total={} scan_ms_total={} persist_ms_total={} other_ms={}",
+            id,
+            total_ms,
+            refresh_batches_total,
+            refresh_blocks_total,
+            refresh_outputs_added_total,
+            refresh_fetch_ms_total,
+            refresh_scan_ms_total,
+            refresh_persist_ms_total,
+            other_ms
+        );
     }
 
     working_outputs.retain(|output| !output.spent);
@@ -5827,130 +5552,17 @@ pub extern "C" fn wallet_refresh(
         }
     }
 
-    // Fallback confirmation: ask the daemon whether remaining pending outgoing txids exist.
-    // This is bounded by the number of pending outgoing entries (typically small).
-    {
-        // Collect pending txids still marked pending in the ledger.
-        let mut txs_hashes: Vec<String> = Vec::new();
-        for p in snapshot.pending_outgoing.iter() {
-            if let Some(entry) = computed_ledger.get(&p.txid) {
-                if entry.direction == "out" && entry.is_pending {
-                    txs_hashes.push(p.txid.clone());
-                }
-            }
-        }
-
-        if !txs_hashes.is_empty() {
-            // Call daemon get_transactions and parse enough fields to distinguish:
-            // - in_pool == true  => still pending
-            // - in_pool == false => mined (set height if available)
-            //
-            // This avoids incorrectly marking mempool txs as confirmed.
-            match rpc_client.json_rpc_call(
-                "get_transactions",
-                serde_json::json!({ "txs_hashes": txs_hashes }),
-            ) {
-                Ok(value) => {
-                    if let Some(result) = value.get("result") {
-                        // missed_tx is returned as an array of hex strings for unknown txs
-                        let missed: std::collections::HashSet<String> = result
-                            .get("missed_tx")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        // Parse returned tx records (each should correspond to a requested tx hash unless missed).
-                        if let Some(txs) = result.get("txs").and_then(|v| v.as_array()) {
-                            for tx in txs {
-                                let txid = match tx.get("tx_hash").and_then(|h| h.as_str()) {
-                                    Some(s) => s.to_string(),
-                                    None => continue,
-                                };
-
-                                // If daemon doesn't know the tx, skip.
-                                if missed.contains(&txid) {
-                                    continue;
-                                }
-
-                                // Default behavior: if we can't parse in_pool, be conservative and keep pending.
-                                let in_pool = tx.get("in_pool").and_then(|v| v.as_bool());
-                                let block_height = tx.get("block_height").and_then(|v| v.as_u64());
-
-                                if let Some(entry) = computed_ledger.get_mut(&txid) {
-                                    if entry.direction == "out" {
-                                        match in_pool {
-                                            Some(true) => {
-                                                // Still in mempool; keep pending.
-                                                entry.is_pending = true;
-                                                // Do not set height.
-                                            }
-                                            Some(false) => {
-                                                // Mined.
-                                                entry.is_pending = false;
-
-                                                // Record mined height (if available)
-                                                if entry.height.is_none() || entry.height == Some(0)
-                                                {
-                                                    entry.height = block_height.filter(|h| *h > 0);
-                                                }
-
-                                                // Fetch mined block timestamp via get_block_header_by_height.
-                                                // If this fails, fall back to daemon top timestamp.
-                                                if entry.timestamp.is_none() {
-                                                    if let Some(h) = entry.height {
-                                                        let header_res = rpc_client.json_rpc_call(
-                                                            "get_block_header_by_height",
-                                                            serde_json::json!({ "height": h }),
-                                                        );
-                                                        if let Ok(v) = header_res {
-                                                            if let Some(ts) = v
-                                                                .get("result")
-                                                                .and_then(|r| r.get("block_header"))
-                                                                .and_then(|bh| bh.get("timestamp"))
-                                                                .and_then(|t| t.as_u64())
-                                                            {
-                                                                entry.timestamp = Some(ts);
-                                                            }
-                                                        }
-                                                    }
-
-                                                    if entry.timestamp.is_none()
-                                                        && daemon.top_block_timestamp > 0
-                                                    {
-                                                        entry.timestamp =
-                                                            Some(daemon.top_block_timestamp);
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                // Unknown; keep pending to avoid mislabeling mempool txs as confirmed.
-                                                entry.is_pending = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Defensive fallback: if a requested tx is not missed and we have no txs array details,
-                        // do NOT mark it confirmed (to avoid treating mempool as confirmed). We only ever clear
-                        // pending status here when we can observe in_pool == false or we confirm via output scanning.
-                        //
-                        // (No-op by design.)
-                        let _ = missed;
-                    }
-                }
-                Err((_code, _msg)) => {
-                    // Ignore: node may not support the method or may be temporarily unavailable.
-                    // Pending entries will still confirm via the on-chain output heuristic when possible.
-                }
-            }
-        }
-    }
+    // Fallback confirmation: disabled during upstream daemon RPC migration.
+    //
+    // Historically we queried JSON-RPC `get_transactions` / `get_block_header_by_height` here to
+    // decide whether pending outgoing txids are still in the mempool or mined.
+    //
+    // With the move to `monero-daemon-rpc`, this code needs to be rewritten to use the upstream
+    // interface (or its JSON-RPC helpers) and to be async-aware. While we iterate on refresh/scan
+    // performance, we intentionally skip this fallback to keep the hot path simple and to avoid
+    // masking interface/transport issues.
+    //
+    // Pending outgoing entries will still confirm via the on-chain output heuristic when possible.
 
     // Drop pending_outgoing entries that are now confirmed in the ledger.
     let mut pending_outgoing = snapshot.pending_outgoing.clone();
@@ -6681,26 +6293,39 @@ pub extern "C" fn wallet_send(
         }
     };
 
-    // Build RPC client and fetch daemon status
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
+    // Build daemon RPC client via upstream implementation (monero-daemon-rpc + monero-simple-request-rpc)
+    // instead of our bespoke BlockingRpcTransport. This aligns closer with wallet2/Feather behavior.
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_send: invalid daemon url '{base_url}'"),
+                -16,
+                format!("wallet_send: failed to connect daemon '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
     };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
+
+    // Fetch daemon height via upstream interface.
+    // monero-interface defines height via ProvidesBlockchainMeta::latest_block_number (0-based).
+    // Our DaemonStatus.height is treated as a 1-based "chain height" in several places, so convert:
+    // daemon_height = latest_block_number + 1.
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => n.saturating_add(1) as u64,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_send: failed to query daemon '{base_url}': {message}"),
+                -16,
+                format!("wallet_send: failed to query daemon height '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     // Construct master keys and view pair
@@ -6745,16 +6370,20 @@ pub extern "C" fn wallet_send(
     let mut rng = OsRng;
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
-    // Fetch fee rate once
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_send: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
+    // Fetch fee rate once (upstream monero-interface)
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_send: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
 
     // Change to primary account (no explicit subaddress)
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
@@ -6796,20 +6425,21 @@ pub extern "C" fn wallet_send(
                     return ptr::null_mut();
                 }
             };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
-                            "wallet_send: RPC block fetch failed at height {}",
-                            t.block_height
-                        ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_send: RPC block fetch failed at height {}",
+                                t.block_height
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
 
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),
@@ -6838,7 +6468,7 @@ pub extern "C" fn wallet_send(
                 }
             };
 
-            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -6847,7 +6477,14 @@ pub extern "C" fn wallet_send(
             )) {
                 Ok(i) => i,
                 Err(err) => {
-                    let code = map_rpc_error(err);
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    let code = match err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner)
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
                     record_error(code, "wallet_send: decoy selection failed");
                     return ptr::null_mut();
                 }
@@ -6928,20 +6565,21 @@ pub extern "C" fn wallet_send(
                 return ptr::null_mut();
             }
         };
-        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-            Ok(block) => block,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(
-                    code,
-                    format!(
-                        "wallet_send: RPC block fetch failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
+        let scannable =
+            match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
 
         let outputs = match scanner.scan(scannable) {
             Ok(result) => result.ignore_additional_timelock(),
@@ -6969,7 +6607,7 @@ pub extern "C" fn wallet_send(
             }
         };
 
-        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+        let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
             &mut rng,
             &rpc_client,
             ring_len_eff,
@@ -6978,7 +6616,14 @@ pub extern "C" fn wallet_send(
         )) {
             Ok(i) => i,
             Err(err) => {
-                let code = map_rpc_error(err);
+                // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                let code = match err {
+                    monero_interface::TransactionsError::InterfaceError(inner) => {
+                        map_rpc_error(inner)
+                    }
+                    monero_interface::TransactionsError::TransactionNotFound => -16,
+                    monero_interface::TransactionsError::PrunedTransaction => -16,
+                };
                 record_error(code, "wallet_send: decoy selection failed");
                 return ptr::null_mut();
             }
@@ -7022,9 +6667,15 @@ pub extern "C" fn wallet_send(
         }
     };
 
-    // Broadcast
-    if let Err(err) = block_on(rpc_client.publish_transaction(&tx)) {
-        let code = map_rpc_error(err);
+    // Broadcast (upstream monero-interface)
+    if let Err(err) = TOKIO_RUNTIME.block_on(rpc_client.publish_transaction(&tx)) {
+        // PublishTransactionError wraps InterfaceError for transport/protocol issues.
+        let code = match err {
+            monero_interface::PublishTransactionError::InterfaceError(inner) => {
+                map_rpc_error(inner)
+            }
+            _ => -16,
+        };
         record_error(code, "wallet_send: publish_transaction failed");
         return ptr::null_mut();
     }
@@ -7187,25 +6838,33 @@ pub extern "C" fn wallet_preview_fee(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_preview_fee: invalid daemon url '{base_url}'"),
+                -16,
+                format!("wallet_preview_fee: failed to connect daemon '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
     };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
+
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => n.saturating_add(1) as u64,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_preview_fee: failed to query daemon '{base_url}': {message}"),
+                -16,
+                format!("wallet_preview_fee: failed to query daemon height '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
@@ -7266,15 +6925,19 @@ pub extern "C" fn wallet_preview_fee(
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_preview_fee: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_preview_fee: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
@@ -7320,20 +6983,21 @@ pub extern "C" fn wallet_preview_fee(
                     return ptr::null_mut();
                 }
             };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
-                            "wallet_preview_fee: RPC block fetch failed at height {}",
-                            t.block_height
-                        ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_preview_fee: RPC block fetch failed at height {}",
+                                t.block_height
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),
                 Err(_) => {
@@ -7360,7 +7024,7 @@ pub extern "C" fn wallet_preview_fee(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -7369,7 +7033,14 @@ pub extern "C" fn wallet_preview_fee(
             )) {
                 Ok(i) => i,
                 Err(err) => {
-                    let code = map_rpc_error(err);
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    let code = match err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner)
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
                     record_error(code, "wallet_preview_fee: decoy selection failed");
                     return ptr::null_mut();
                 }
@@ -7587,25 +7258,33 @@ pub extern "C" fn wallet_send_with_filter(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_send_with_filter: invalid daemon url '{base_url}'"),
+                -16,
+                format!("wallet_send_with_filter: failed to connect daemon '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
     };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
+
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => n.saturating_add(1) as u64,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_send_with_filter: failed to query daemon '{base_url}': {message}"),
+                -16,
+                format!("wallet_send_with_filter: failed to query daemon height '{base_url}': {e}"),
             );
             return ptr::null_mut();
         }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
@@ -7673,15 +7352,19 @@ pub extern "C" fn wallet_send_with_filter(
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_send_with_filter: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_send_with_filter: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
@@ -7726,20 +7409,21 @@ pub extern "C" fn wallet_send_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
-                            "wallet_send_with_filter: RPC block fetch failed at height {}",
-                            t.block_height
-                        ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_send_with_filter: RPC block fetch failed at height {}",
+                                t.block_height
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),
                 Err(_) => {
@@ -7766,7 +7450,7 @@ pub extern "C" fn wallet_send_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -7775,7 +7459,14 @@ pub extern "C" fn wallet_send_with_filter(
             )) {
                 Ok(i) => i,
                 Err(err) => {
-                    let code = map_rpc_error(err);
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    let code = match err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner)
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
                     record_error(code, "wallet_send_with_filter: decoy selection failed");
                     return ptr::null_mut();
                 }
@@ -7855,20 +7546,21 @@ pub extern "C" fn wallet_send_with_filter(
                 return ptr::null_mut();
             }
         };
-        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-            Ok(block) => block,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(
-                    code,
-                    format!(
-                        "wallet_send_with_filter: RPC block fetch failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
+        let scannable =
+            match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send_with_filter: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
         let outputs = match scanner.scan(scannable) {
             Ok(result) => result.ignore_additional_timelock(),
             Err(_) => {
@@ -7895,7 +7587,7 @@ pub extern "C" fn wallet_send_with_filter(
                 return ptr::null_mut();
             }
         };
-        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+        let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
             &mut rng,
             &rpc_client,
             ring_len_eff,
@@ -7904,7 +7596,14 @@ pub extern "C" fn wallet_send_with_filter(
         )) {
             Ok(i) => i,
             Err(err) => {
-                let code = map_rpc_error(err);
+                // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                let code = match err {
+                    monero_interface::TransactionsError::InterfaceError(inner) => {
+                        map_rpc_error(inner)
+                    }
+                    monero_interface::TransactionsError::TransactionNotFound => -16,
+                    monero_interface::TransactionsError::PrunedTransaction => -16,
+                };
                 record_error(code, "wallet_send_with_filter: decoy selection failed");
                 return ptr::null_mut();
             }
@@ -7948,8 +7647,14 @@ pub extern "C" fn wallet_send_with_filter(
         }
     };
 
-    if let Err(err) = block_on(rpc_client.publish_transaction(&tx)) {
-        let code = map_rpc_error(err);
+    if let Err(err) = TOKIO_RUNTIME.block_on(rpc_client.publish_transaction(&tx)) {
+        // PublishTransactionError wraps InterfaceError for transport/protocol issues.
+        let code = match err {
+            monero_interface::PublishTransactionError::InterfaceError(inner) => {
+                map_rpc_error(inner)
+            }
+            _ => -16,
+        };
         record_error(code, "wallet_send_with_filter: publish_transaction failed");
         return ptr::null_mut();
     }
@@ -8092,27 +7797,37 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_preview_sweep_with_filter: invalid daemon url '{base_url}'"),
-            );
-            return ptr::null_mut();
-        }
-    };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
-            record_error(
-                code,
+                -16,
                 format!(
-                    "wallet_preview_sweep_with_filter: failed to query daemon '{base_url}': {message}"
+                    "wallet_preview_sweep_with_filter: failed to connect daemon '{base_url}': {e}"
                 ),
             );
             return ptr::null_mut();
         }
+    };
+
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => n.saturating_add(1) as u64,
+        Err(e) => {
+            record_error(
+                -16,
+                format!(
+                    "wallet_preview_sweep_with_filter: failed to query daemon height '{base_url}': {e}"
+                ),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
@@ -8188,18 +7903,19 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
     // Fee rate once
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(
-                code,
-                "wallet_preview_sweep_with_filter: get_fee_rate failed",
-            );
-            return ptr::null_mut();
-        }
-    };
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_preview_sweep_with_filter: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
@@ -8237,20 +7953,21 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
                             "wallet_preview_sweep_with_filter: RPC block fetch failed at height {}",
                             t.block_height
                         ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+                        );
+                        return ptr::null_mut();
+                    }
+                };
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),
                 Err(_) => {
@@ -8277,7 +7994,7 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -8286,7 +8003,14 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
             )) {
                 Ok(i) => i,
                 Err(err) => {
-                    let code = map_rpc_error(err);
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    let code = match err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner)
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
                     record_error(
                         code,
                         "wallet_preview_sweep_with_filter: decoy selection failed",
@@ -8720,27 +8444,37 @@ pub extern "C" fn wallet_preview_fee_with_filter(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
-    let rpc_client = match BlockingRpcTransport::new(&base_url) {
-        Ok(client) => client,
-        Err(code) => {
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
             record_error(
-                code,
-                format!("wallet_preview_fee_with_filter: invalid daemon url '{base_url}'"),
+                -16,
+                format!(
+                    "wallet_preview_fee_with_filter: failed to connect daemon '{base_url}': {e}"
+                ),
             );
             return ptr::null_mut();
         }
     };
-    let daemon = match fetch_daemon_status(&rpc_client) {
-        Ok(status) => status,
-        Err((code, message)) => {
+
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(n) => n.saturating_add(1) as u64,
+        Err(e) => {
             record_error(
-                code,
+                -16,
                 format!(
-                "wallet_preview_fee_with_filter: failed to query daemon '{base_url}': {message}"
-            ),
+                    "wallet_preview_fee_with_filter: failed to query daemon height '{base_url}': {e}"
+                ),
             );
             return ptr::null_mut();
         }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height,
+        top_block_timestamp: 0,
     };
 
     let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
@@ -8814,15 +8548,19 @@ pub extern "C" fn wallet_preview_fee_with_filter(
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_preview_fee_with_filter: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_preview_fee_with_filter: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
@@ -8868,20 +8606,21 @@ pub extern "C" fn wallet_preview_fee_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
                             "wallet_preview_fee_with_filter: RPC block fetch failed at height {}",
                             t.block_height
                         ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+                        );
+                        return ptr::null_mut();
+                    }
+                };
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),
                 Err(_) => {
@@ -8908,7 +8647,7 @@ pub extern "C" fn wallet_preview_fee_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -8917,7 +8656,14 @@ pub extern "C" fn wallet_preview_fee_with_filter(
             )) {
                 Ok(i) => i,
                 Err(err) => {
-                    let code = map_rpc_error(err);
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    let code = match err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner)
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
                     record_error(
                         code,
                         "wallet_preview_fee_with_filter: decoy selection failed",

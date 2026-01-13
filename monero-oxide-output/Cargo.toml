@@ -10,15 +10,27 @@ crate-type = ["cdylib", "staticlib"]
 
 
 [dependencies]
-monero-wallet = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-wallet", features = ["std"] }
+monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-wallet", features = ["std"] }
 monero-seed = { git = "https://github.com/monero-oxide/monero-wallet-util", package = "monero-seed", features = ["std"] }
-monero-address = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-address", features = ["std"] }
-monero-ed25519 = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-ed25519", features = ["std"] }
+monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-address", features = ["std"] }
+monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-ed25519", features = ["std"] }
+monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-interface", features = ["std", "walletcore-lenient-prunable", "walletcore-lenient-tx-verify"] }
+
+# Upstream daemon RPC implementation + recommended HTTP transport (simple-request)
+monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-daemon-rpc", features = ["std", "walletcore-telemetry", "walletcore-lenient-prunable"] }
+monero-simple-request-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-simple-request-rpc", features = ["webpki-roots"] }
+
+# Required because we construct a lightweight runtime (Runtime::new + block_on) around upstream async daemon RPC.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
-monero-io = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-io", features = ["std"] }
-monero-epee = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-epee" }
+monero-io = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-io", features = ["std"] }
+monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-epee" }
+
+# Locate Application Support / data directory for per-wallet log file writing
+dirs = "5"
 
 
 
