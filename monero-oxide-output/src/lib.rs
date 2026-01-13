@@ -578,6 +578,9 @@ use monero_wallet::{
     Scanner, ViewPair,
 };
 
+#[cfg(feature = "scanner-microprof")]
+use monero_wallet::scanner_microprof_snapshot;
+
 fn fingerprint32(label: &str, bytes: &[u8]) -> String {
     use sha3::{Digest, Keccak256};
     let mut h = Keccak256::new();
@@ -4318,6 +4321,12 @@ pub extern "C" fn wallet_refresh(
     let mut refresh_outputs_added_total: usize = 0;
     let mut refresh_batches_total: usize = 0;
 
+    // Prefetch telemetry (pipelined refresh):
+    // - prefetch_ms_total: total wall time spent inside the prefetch task (network + decode)
+    // - prefetch_join_wait_ms_total: time spent waiting (after scanning) for the prefetch task to finish
+    let mut refresh_prefetch_ms_total: u128 = 0;
+    let mut refresh_prefetch_join_wait_ms_total: u128 = 0;
+
     // Persist timing is measured as "everything between end-of-scan and next fetch", so keep a marker.
     // When this is `Some`, we close it right before starting the next fetch.
     let mut persist_span_start: Option<std::time::Instant> = None;
@@ -4362,6 +4371,27 @@ pub extern "C" fn wallet_refresh(
             return record_error(
                 -16,
                 format!("wallet_refresh: failed to connect daemon '{base_url}': {e}"),
+            );
+        }
+    };
+
+    // Create a second persistent daemon client for prefetch so we don't pay connection setup cost
+    // on every pipelined iteration.
+    let prefetch_rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧭 wallet_refresh stage=daemon_connect_error wallet_id={} err={}",
+                id,
+                e
+            );
+            return record_error(
+                -16,
+                format!("wallet_refresh: failed to connect daemon (prefetch) '{base_url}': {e}"),
             );
         }
     };
@@ -4981,10 +5011,24 @@ pub extern "C" fn wallet_refresh(
             // Ensure we align with daemon height after finishing batches
             scan_cursor = daemon.height;
         } else {
-            // Sequential scan: use upstream daemon RPC implementation only.
+            // Sequential scan: upstream daemon RPC + pipelined fetch.
+            //
+            // Goal: overlap network fetch with CPU scanning WITHOUT parallel scanning.
+            // We keep at most 1 fetch in-flight at a time:
+            //   - fetch batch N
+            //   - begin async fetch of batch N+1
+            //   - scan batch N while fetch N+1 is in progress
+            //   - await fetch N+1 and repeat
             //
             // During performance iteration we explicitly disable bespoke bulk fetch modes and any
             // fallback logic. If the upstream interface fails, we fail hard with a clear error.
+            let mut next_scannables: Option<(u64, u64, Vec<ScannableBlock>)> = None;
+
+            // Prefetch client used by the pipelined fetch path.
+            // We wrap it in an Arc so we can move a cheap clone into the spawned task without
+            // moving the main refresh client.
+            let prefetch_rpc_client = std::sync::Arc::new(prefetch_rpc_client);
+
             while scan_cursor < daemon.height {
                 // Cancellation check (per-wallet)
                 if refresh_cancelled_for_wallet(id) {
@@ -5011,6 +5055,7 @@ pub extern "C" fn wallet_refresh(
                     return record_error(-30, "wallet_refresh: cancelled");
                 }
 
+                // Determine the next batch range based on where we are.
                 let end_exclusive = std::cmp::min(
                     daemon.height,
                     scan_cursor.saturating_add(upstream_block_batch),
@@ -5019,7 +5064,10 @@ pub extern "C" fn wallet_refresh(
                     break;
                 }
 
-                let start_bn = match usize::try_from(scan_cursor) {
+                let start_bn_u64 = scan_cursor;
+                let end_bn_inclusive_u64 = end_exclusive.saturating_sub(1);
+
+                let start_bn = match usize::try_from(start_bn_u64) {
                     Ok(v) => v,
                     Err(_) => {
                         return record_error(
@@ -5028,7 +5076,7 @@ pub extern "C" fn wallet_refresh(
                         )
                     }
                 };
-                let end_bn_inclusive = match usize::try_from(end_exclusive.saturating_sub(1)) {
+                let end_bn_inclusive = match usize::try_from(end_bn_inclusive_u64) {
                     Ok(v) => v,
                     Err(_) => {
                         return record_error(
@@ -5044,6 +5092,7 @@ pub extern "C" fn wallet_refresh(
                         refresh_persist_ms_total.saturating_add(p0.elapsed().as_millis());
                 }
 
+                // Stage log for the batch we're about to scan.
                 walletcore_log!(
                     id,
                     snapshot.network,
@@ -5053,49 +5102,112 @@ pub extern "C" fn wallet_refresh(
                     end_bn_inclusive
                 );
 
-                let fetch_t0 = std::time::Instant::now();
-                let scannables = match TOKIO_RUNTIME
-                    .block_on(rpc_client.contiguous_scannable_blocks(start_bn..=end_bn_inclusive))
+                // Acquire scannables for this batch:
+                // - if we already prefetched exactly this range, consume it
+                // - otherwise, fetch synchronously now (fallback; should be rare after first iteration)
+                let scannables: Vec<ScannableBlock> = if let Some((pf_start, pf_end, pf_vec)) =
+                    next_scannables.take()
                 {
-                    Ok(v) => {
-                        let fetch_ms = fetch_t0.elapsed().as_millis();
-                        refresh_fetch_ms_total = refresh_fetch_ms_total.saturating_add(fetch_ms);
-                        walletcore_log!(
-                            id,
-                            snapshot.network,
-                            "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
-                            id,
-                            v.len(),
-                            fetch_ms,
-                            if fetch_ms > 0 {
-                                (v.len() as f64) / (fetch_ms as f64 / 1000.0)
-                            } else {
-                                0.0
+                    if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 {
+                        pf_vec
+                    } else {
+                        // Prefetch mismatch (shouldn't happen in normal flow); discard and fetch this range.
+                        let fetch_t0 = std::time::Instant::now();
+                        let fetched = match TOKIO_RUNTIME.block_on(
+                            rpc_client.contiguous_scannable_blocks(start_bn..=end_bn_inclusive),
+                        ) {
+                            Ok(v) => {
+                                let fetch_ms = fetch_t0.elapsed().as_millis();
+                                refresh_fetch_ms_total =
+                                    refresh_fetch_ms_total.saturating_add(fetch_ms);
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
+                                    id,
+                                    v.len(),
+                                    fetch_ms,
+                                    if fetch_ms > 0 {
+                                        (v.len() as f64) / (fetch_ms as f64 / 1000.0)
+                                    } else {
+                                        0.0
+                                    }
+                                );
+                                v
                             }
-                        );
-                        v
+                            Err(err) => {
+                                let fetch_ms = fetch_t0.elapsed().as_millis();
+                                refresh_fetch_ms_total =
+                                    refresh_fetch_ms_total.saturating_add(fetch_ms);
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "🧭 wallet_refresh stage=contiguous_scannable_blocks_error wallet_id={} fetch_ms={} err={}",
+                                    id,
+                                    fetch_ms,
+                                    err
+                                );
+                                return record_error(
+                                    -16,
+                                    format!(
+                                        "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
+                                        scan_cursor,
+                                        end_exclusive.saturating_sub(1),
+                                        err
+                                    ),
+                                );
+                            }
+                        };
+                        fetched
                     }
-                    Err(err) => {
-                        let fetch_ms = fetch_t0.elapsed().as_millis();
-                        refresh_fetch_ms_total = refresh_fetch_ms_total.saturating_add(fetch_ms);
-                        walletcore_log!(
-                            id,
-                            snapshot.network,
-                            "🧭 wallet_refresh stage=contiguous_scannable_blocks_error wallet_id={} fetch_ms={} err={}",
-                            id,
-                            fetch_ms,
-                            err
-                        );
-                        return record_error(
-                            -16,
-                            format!(
-                                "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
-                                scan_cursor,
-                                end_exclusive.saturating_sub(1),
+                } else {
+                    let fetch_t0 = std::time::Instant::now();
+                    let fetched = match TOKIO_RUNTIME.block_on(
+                        rpc_client.contiguous_scannable_blocks(start_bn..=end_bn_inclusive),
+                    ) {
+                        Ok(v) => {
+                            let fetch_ms = fetch_t0.elapsed().as_millis();
+                            refresh_fetch_ms_total =
+                                refresh_fetch_ms_total.saturating_add(fetch_ms);
+                            walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
+                                id,
+                                v.len(),
+                                fetch_ms,
+                                if fetch_ms > 0 {
+                                    (v.len() as f64) / (fetch_ms as f64 / 1000.0)
+                                } else {
+                                    0.0
+                                }
+                            );
+                            v
+                        }
+                        Err(err) => {
+                            let fetch_ms = fetch_t0.elapsed().as_millis();
+                            refresh_fetch_ms_total =
+                                refresh_fetch_ms_total.saturating_add(fetch_ms);
+                            walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧭 wallet_refresh stage=contiguous_scannable_blocks_error wallet_id={} fetch_ms={} err={}",
+                                id,
+                                fetch_ms,
                                 err
-                            ),
-                        );
-                    }
+                            );
+                            return record_error(
+                                -16,
+                                format!(
+                                    "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
+                                    scan_cursor,
+                                    end_exclusive.saturating_sub(1),
+                                    err
+                                ),
+                            );
+                        }
+                    };
+                    fetched
                 };
 
                 if scannables.is_empty() {
@@ -5109,13 +5221,55 @@ pub extern "C" fn wallet_refresh(
                     );
                 }
 
+                // Kick off prefetch for the next range while we scan this batch.
+                let next_start = end_exclusive;
+                let next_end_exclusive = std::cmp::min(
+                    daemon.height,
+                    next_start.saturating_add(upstream_block_batch),
+                );
+                let next_end_inclusive = next_end_exclusive.saturating_sub(1);
+
+                let prefetch_handle = if next_end_exclusive > next_start {
+                    let next_start_bn = match usize::try_from(next_start) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return record_error(
+                                -16,
+                                "wallet_refresh: block number conversion overflow",
+                            )
+                        }
+                    };
+                    let next_end_bn = match usize::try_from(next_end_inclusive) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return record_error(
+                                -16,
+                                "wallet_refresh: block number conversion overflow",
+                            )
+                        }
+                    };
+
+                    // NOTE: don't move `rpc_client` into the task (we still need it in the loop).
+                    // Use the persistent prefetch client instead to avoid reconnect/handshake overhead.
+                    let prefetch_client = prefetch_rpc_client.clone();
+                    Some(TOKIO_RUNTIME.spawn(async move {
+                        let t0 = std::time::Instant::now();
+                        let res = prefetch_client
+                            .contiguous_scannable_blocks(next_start_bn..=next_end_bn)
+                            .await;
+                        let prefetch_ms = t0.elapsed().as_millis();
+                        (next_start, next_end_inclusive, prefetch_ms, res)
+                    }))
+                } else {
+                    None
+                };
+
+                // ---- Scan this batch (CPU-bound) while prefetch is in-flight ----
                 let scan_t0 = std::time::Instant::now();
                 let mut outputs_added_in_batch: usize = 0;
                 let blocks_in_batch: usize = scannables.len();
 
                 // Debug: per-batch scannable transaction completeness stats.
-                // This helps diagnose "0 outputs" cases by confirming the daemon provided tx blobs
-                // with non-empty extra and outputs (required for output discovery).
                 let mut batch_txs_total: usize = 0;
                 let mut batch_txs_v1: usize = 0;
                 let mut batch_txs_v2: usize = 0;
@@ -5144,7 +5298,6 @@ pub extern "C" fn wallet_refresh(
                     let miner_hash = scannable.block.miner_transaction().hash();
 
                     // Inspect transaction completeness before scanning.
-                    // Note: `scannable.transactions` excludes the miner tx; count it separately.
                     {
                         // Miner tx
                         batch_txs_total = batch_txs_total.saturating_add(1);
@@ -5175,9 +5328,6 @@ pub extern "C" fn wallet_refresh(
                     }
 
                     // Non-miner txs (validated)
-                    //
-                    // Note: `rpc_client.contiguous_scannable_blocks(...)` returns `Vec<ScannableBlock>`,
-                    // and `ScannableBlock.transactions` is `Vec<Transaction<Pruned>>` (already validated).
                     for tx_ref in &scannable.transactions {
                         batch_txs_total = batch_txs_total.saturating_add(1);
 
@@ -5208,13 +5358,6 @@ pub extern "C" fn wallet_refresh(
                         }
                     }
 
-                    // Targeted debug: check whether this height/tx is present and whether we detect any outputs for it.
-                    //
-                    // Behavior:
-                    // - If WALLETCORE_DEBUG_HEIGHT is set, only emit logs within [height - window, height + window].
-                    //   This keeps logs readable and makes it easy to focus on a known problematic height.
-                    // - If WALLETCORE_DEBUG_HEIGHT is NOT set, and WALLETCORE_DEBUG_TXID is set, emit txid
-                    //   presence logs for every scanned height (noisy by design).
                     let dbg_this_height = debug_height
                         .map(|h| {
                             let w = debug_height_window;
@@ -5225,7 +5368,6 @@ pub extern "C" fn wallet_refresh(
                     let should_log_this_height = if debug_height.is_some() {
                         dbg_this_height
                     } else {
-                        // No specific height configured; allow "log everywhere" mode only when txid is set.
                         debug_txid.is_some()
                     };
 
@@ -5275,7 +5417,6 @@ pub extern "C" fn wallet_refresh(
                             continue;
                         }
 
-                        // Targeted debug: log every matched output for the target txid (if provided).
                         if let Some(target) = debug_txid {
                             if output.transaction() == target {
                                 let (maj, min) = output
@@ -5367,50 +5508,61 @@ pub extern "C" fn wallet_refresh(
                     );
                 }
 
-                // Start persist-span timer for "overhead after scan" (IO/locking/serialization).
-                // This will be closed at the top of the next loop iteration (right before the next fetch).
+                // Start persist-span timer for "overhead after scan".
                 persist_span_start = Some(std::time::Instant::now());
 
-                // Post-batch balance breakdown (debug):
-                // Helps reconcile discrepancies vs Feather by showing the current total and a few largest outputs.
-                if outputs_added_in_batch > 0 {
-                    let mut total_piconero: u64 = 0;
-                    for o in &working_outputs {
-                        total_piconero = total_piconero.saturating_add(o.amount);
+                // Await and store prefetch results (if any) for the next loop iteration.
+                if let Some(handle) = prefetch_handle {
+                    let join_wait_t0 = std::time::Instant::now();
+                    match TOKIO_RUNTIME.block_on(handle) {
+                        Ok((pf_start, pf_end, pf_ms, Ok(v))) => {
+                            refresh_prefetch_ms_total =
+                                refresh_prefetch_ms_total.saturating_add(pf_ms);
+                            refresh_prefetch_join_wait_ms_total =
+                                refresh_prefetch_join_wait_ms_total
+                                    .saturating_add(join_wait_t0.elapsed().as_millis());
+                            next_scannables = Some((pf_start, pf_end, v));
+                        }
+                        Ok((_pf_start, _pf_end, pf_ms, Err(err))) => {
+                            refresh_prefetch_ms_total =
+                                refresh_prefetch_ms_total.saturating_add(pf_ms);
+                            refresh_prefetch_join_wait_ms_total =
+                                refresh_prefetch_join_wait_ms_total
+                                    .saturating_add(join_wait_t0.elapsed().as_millis());
+                            walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧭 wallet_refresh stage=contiguous_scannable_blocks_error wallet_id={} err={}",
+                                id,
+                                err
+                            );
+                            return record_error(
+                                -16,
+                                format!(
+                                    "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
+                                    next_start,
+                                    next_end_inclusive,
+                                    err
+                                ),
+                            );
+                        }
+                        Err(join_err) => {
+                            refresh_prefetch_join_wait_ms_total =
+                                refresh_prefetch_join_wait_ms_total
+                                    .saturating_add(join_wait_t0.elapsed().as_millis());
+                            return record_error(
+                                -16,
+                                format!(
+                                    "wallet_refresh: prefetch task join error at heights {}..{}: {}",
+                                    next_start,
+                                    next_end_inclusive,
+                                    join_err
+                                ),
+                            );
+                        }
                     }
-
-                    // Show the largest few outputs to identify any single output driving a delta.
-                    let mut top = working_outputs.clone();
-                    top.sort_by(|a, b| b.amount.cmp(&a.amount));
-                    let top_n = top.len().min(10);
-
-                    walletcore_log!(
-                        id,
-                        snapshot.network,
-                        "💰 balance_debug wallet_id={} total_piconero={} outputs_count={} top_n={}",
-                        id,
-                        total_piconero,
-                        working_outputs.len(),
-                        top_n
-                    );
-
-                    for (i, o) in top.into_iter().take(top_n).enumerate() {
-                        walletcore_log!(
-                            id,
-                            snapshot.network,
-                            "💰 balance_debug_top wallet_id={} idx={} amount_piconero={} height={} tx_hash={} index_in_tx={} subaddr=({}, {}) coinbase={} timelock={:?}",
-                            id,
-                            i,
-                            o.amount,
-                            o.block_height,
-                            hex_dump_prefix(&o.tx_hash, 32),
-                            o.index_in_tx,
-                            o.subaddress_major,
-                            o.subaddress_minor,
-                            o.is_coinbase,
-                            o.additional_timelock
-                        );
-                    }
+                } else {
+                    next_scannables = None;
                 }
 
                 scan_cursor = th;
@@ -5446,7 +5598,7 @@ pub extern "C" fn wallet_refresh(
         walletcore_log!(
             id,
             snapshot.network,
-            "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} fetch_ms_total={} scan_ms_total={} persist_ms_total={} other_ms={}",
+            "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} fetch_ms_total={} scan_ms_total={} persist_ms_total={} other_ms={} prefetch_ms_total={} prefetch_join_wait_ms_total={}",
             id,
             total_ms,
             refresh_batches_total,
@@ -5455,8 +5607,43 @@ pub extern "C" fn wallet_refresh(
             refresh_fetch_ms_total,
             refresh_scan_ms_total,
             refresh_persist_ms_total,
-            other_ms
+            other_ms,
+            refresh_prefetch_ms_total,
+            refresh_prefetch_join_wait_ms_total
         );
+
+        #[cfg(feature = "scanner-microprof")]
+        {
+            if let Some(mp) = scanner_microprof_snapshot(true) {
+                // Convert nanos -> milliseconds for readability in logs
+                let ns_to_ms = |ns: u64| -> u64 { ns / 1_000_000 };
+
+                walletcore_log!(
+                    id,
+                    snapshot.network,
+                    "🧬 scanner_microprof wallet_id={} blocks={} txs_scanned={} outputs_visited={} ecdh_derivations={} ecdh_cache_hits={} ecdh_cache_misses={} viewtag_mismatch={} commitment_verify_attempts={} commitment_verify_fail={} outputs_matched={} extra_parse_fail={} tx_keys_missing={} ms_block_setup={} ms_scan_transaction={} ms_commitment_verify={} ms_ecdh_mul={} ms_output_derivations={} ms_subaddress_lookup={}",
+                    id,
+                    mp.blocks,
+                    mp.txs_scanned,
+                    mp.outputs_visited,
+                    mp.ecdh_derivations,
+                    mp.ecdh_cache_hits,
+                    mp.ecdh_cache_misses,
+                    mp.viewtag_mismatch,
+                    mp.commitment_verify_attempts,
+                    mp.commitment_verify_fail,
+                    mp.outputs_matched,
+                    mp.extra_parse_fail,
+                    mp.tx_keys_missing,
+                    ns_to_ms(mp.ns_block_setup),
+                    ns_to_ms(mp.ns_scan_transaction),
+                    ns_to_ms(mp.ns_commitment_verify),
+                    ns_to_ms(mp.ns_ecdh_mul),
+                    ns_to_ms(mp.ns_output_derivations),
+                    ns_to_ms(mp.ns_subaddress_lookup)
+                );
+            }
+        }
     }
 
     working_outputs.retain(|output| !output.spent);

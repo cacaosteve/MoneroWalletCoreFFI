@@ -33,6 +33,17 @@ else
   die "PROFILE must be 'debug' or 'release' (got '${PROFILE}')"
 fi
 
+# Optional Cargo features: set CARGO_FEATURES="feat1 feat2" (space-separated) to enable.
+# Example:
+#   PROFILE=release CARGO_FEATURES="scanner-microprof" Scripts/build_xcframework.sh
+CARGO_FEATURES="${CARGO_FEATURES:-}"
+CARGO_FEATURES_FLAG=""
+if [[ -n "${CARGO_FEATURES}" ]]; then
+  # shellcheck disable=SC2206
+  CARGO_FEATURES_ARR=( ${CARGO_FEATURES} )
+  CARGO_FEATURES_FLAG="--features $(IFS=,; echo "${CARGO_FEATURES_ARR[*]}")"
+fi
+
 # Tooling detection
 XCODEBUILD_BIN="$(command -v xcodebuild || true)"
 RUSTUP_BIN="$(command -v rustup || true)"
@@ -83,7 +94,7 @@ ensure_targets() {
 build_target() {
   local triple="$1"
   echo "• Building monerowalletcore for ${triple} (${PROFILE})"
-  (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} --target "${triple}")
+  (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
 }
 
 lib_path_for() {
