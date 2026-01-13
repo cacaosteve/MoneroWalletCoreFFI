@@ -22,7 +22,16 @@ XCFRAMEWORK_PATH="${OUT_DIR}/${FRAMEWORK_NAME}.xcframework"
 
 # Build profile: release (default) or debug
 PROFILE="${PROFILE:-release}" # set PROFILE=debug to build debug libs
-CARGO_PROFILE_FLAG="--${PROFILE}"
+
+# Cargo flag: only --release is valid. Debug is the default (no flag).
+CARGO_PROFILE_FLAG=""
+if [[ "${PROFILE}" == "release" ]]; then
+  CARGO_PROFILE_FLAG="--release"
+elif [[ "${PROFILE}" == "debug" ]]; then
+  CARGO_PROFILE_FLAG=""
+else
+  die "PROFILE must be 'debug' or 'release' (got '${PROFILE}')"
+fi
 
 # Tooling detection
 XCODEBUILD_BIN="$(command -v xcodebuild || true)"
