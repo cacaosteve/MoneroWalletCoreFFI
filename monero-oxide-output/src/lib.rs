@@ -5014,15 +5014,29 @@ pub extern "C" fn wallet_refresh(
             // Sequential scan: upstream daemon RPC + pipelined fetch.
             //
             // Goal: overlap network fetch with CPU scanning WITHOUT parallel scanning.
-            // We keep at most 1 fetch in-flight at a time:
-            //   - fetch batch N
-            //   - begin async fetch of batch N+1
-            //   - scan batch N while fetch N+1 is in progress
-            //   - await fetch N+1 and repeat
+            //
+            // We keep a small number of fetches in-flight (prefetch depth) to reduce tail latency:
+            // - depth=1: fetch N+1 while scanning N
+            // - depth=2: fetch N+1 and N+2 while scanning N (reduces "join wait" on spiky latency)
+            //
+            // Configure via WALLETCORE_PREFETCH_DEPTH (default=1, clamp 1..=2).
             //
             // During performance iteration we explicitly disable bespoke bulk fetch modes and any
             // fallback logic. If the upstream interface fails, we fail hard with a clear error.
-            let mut next_scannables: Option<(u64, u64, Vec<ScannableBlock>)> = None;
+            let prefetch_depth: usize = std::env::var("WALLETCORE_PREFETCH_DEPTH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 2);
+
+            // Prefetch queue: holds ready-to-scan batches fetched ahead of time.
+            let mut next_scannables_q: std::collections::VecDeque<(u64, u64, Vec<ScannableBlock>)> =
+                std::collections::VecDeque::new();
+
+            // Prefetch tasks currently in-flight.
+            let mut prefetch_in_flight: std::collections::VecDeque<
+                tokio::task::JoinHandle<(u64, u64, u128, Result<Vec<ScannableBlock>, RpcError>)>,
+            > = std::collections::VecDeque::new();
 
             // Prefetch client used by the pipelined fetch path.
             // We wrap it in an Arc so we can move a cheap clone into the spawned task without
@@ -5103,15 +5117,15 @@ pub extern "C" fn wallet_refresh(
                 );
 
                 // Acquire scannables for this batch:
-                // - if we already prefetched exactly this range, consume it
-                // - otherwise, fetch synchronously now (fallback; should be rare after first iteration)
+                // - prefer a ready prefetched batch if it matches the current range
+                // - otherwise, fetch synchronously now (fallback)
                 let scannables: Vec<ScannableBlock> = if let Some((pf_start, pf_end, pf_vec)) =
-                    next_scannables.take()
+                    next_scannables_q.pop_front()
                 {
                     if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 {
                         pf_vec
                     } else {
-                        // Prefetch mismatch (shouldn't happen in normal flow); discard and fetch this range.
+                        // Prefetch mismatch (shouldn't happen); discard and fetch this range synchronously.
                         let fetch_t0 = std::time::Instant::now();
                         let fetched = match TOKIO_RUNTIME.block_on(
                             rpc_client.contiguous_scannable_blocks(start_bn..=end_bn_inclusive),
@@ -5221,15 +5235,32 @@ pub extern "C" fn wallet_refresh(
                     );
                 }
 
-                // Kick off prefetch for the next range while we scan this batch.
-                let next_start = end_exclusive;
-                let next_end_exclusive = std::cmp::min(
-                    daemon.height,
-                    next_start.saturating_add(upstream_block_batch),
-                );
-                let next_end_inclusive = next_end_exclusive.saturating_sub(1);
+                // Ensure we have enough prefetch in flight to satisfy desired depth.
+                //
+                // We compute the "next ranges" relative to the end of the current batch and whatever is
+                // already queued / in-flight.
+                let mut cursor_for_prefetch = end_exclusive;
+                // Account for already-ready prefetched batches
+                for (s, e, _) in next_scannables_q.iter() {
+                    let _ = (s, e);
+                    cursor_for_prefetch = cursor_for_prefetch.saturating_add(upstream_block_batch);
+                }
+                // Account for already in-flight tasks
+                for _ in prefetch_in_flight.iter() {
+                    cursor_for_prefetch = cursor_for_prefetch.saturating_add(upstream_block_batch);
+                }
 
-                let prefetch_handle = if next_end_exclusive > next_start {
+                while prefetch_in_flight.len() + next_scannables_q.len() < prefetch_depth {
+                    let next_start = cursor_for_prefetch;
+                    let next_end_exclusive = std::cmp::min(
+                        daemon.height,
+                        next_start.saturating_add(upstream_block_batch),
+                    );
+                    if next_end_exclusive <= next_start {
+                        break;
+                    }
+                    let next_end_inclusive = next_end_exclusive.saturating_sub(1);
+
                     let next_start_bn = match usize::try_from(next_start) {
                         Ok(v) => v,
                         Err(_) => {
@@ -5249,20 +5280,19 @@ pub extern "C" fn wallet_refresh(
                         }
                     };
 
-                    // NOTE: don't move `rpc_client` into the task (we still need it in the loop).
-                    // Use the persistent prefetch client instead to avoid reconnect/handshake overhead.
                     let prefetch_client = prefetch_rpc_client.clone();
-                    Some(TOKIO_RUNTIME.spawn(async move {
+                    let handle = TOKIO_RUNTIME.spawn(async move {
                         let t0 = std::time::Instant::now();
                         let res = prefetch_client
                             .contiguous_scannable_blocks(next_start_bn..=next_end_bn)
                             .await;
                         let prefetch_ms = t0.elapsed().as_millis();
                         (next_start, next_end_inclusive, prefetch_ms, res)
-                    }))
-                } else {
-                    None
-                };
+                    });
+                    prefetch_in_flight.push_back(handle);
+
+                    cursor_for_prefetch = next_end_exclusive;
+                }
 
                 // ---- Scan this batch (CPU-bound) while prefetch is in-flight ----
                 let scan_t0 = std::time::Instant::now();
@@ -5511,8 +5541,15 @@ pub extern "C" fn wallet_refresh(
                 // Start persist-span timer for "overhead after scan".
                 persist_span_start = Some(std::time::Instant::now());
 
-                // Await and store prefetch results (if any) for the next loop iteration.
-                if let Some(handle) = prefetch_handle {
+                // Drain prefetch tasks into the ready queue, but keep depth=2 non-blocking:
+                // only await enough tasks to ensure we have at least one ready batch for the next iteration.
+                //
+                // This avoids waiting for "N+2" when we only need "N+1" to continue scanning smoothly.
+                while next_scannables_q.is_empty() {
+                    let Some(handle) = prefetch_in_flight.pop_front() else {
+                        break;
+                    };
+
                     let join_wait_t0 = std::time::Instant::now();
                     match TOKIO_RUNTIME.block_on(handle) {
                         Ok((pf_start, pf_end, pf_ms, Ok(v))) => {
@@ -5521,7 +5558,7 @@ pub extern "C" fn wallet_refresh(
                             refresh_prefetch_join_wait_ms_total =
                                 refresh_prefetch_join_wait_ms_total
                                     .saturating_add(join_wait_t0.elapsed().as_millis());
-                            next_scannables = Some((pf_start, pf_end, v));
+                            next_scannables_q.push_back((pf_start, pf_end, v));
                         }
                         Ok((_pf_start, _pf_end, pf_ms, Err(err))) => {
                             refresh_prefetch_ms_total =
@@ -5539,9 +5576,7 @@ pub extern "C" fn wallet_refresh(
                             return record_error(
                                 -16,
                                 format!(
-                                    "wallet_refresh: contiguous_scannable_blocks failed at heights {}..{}: {}",
-                                    next_start,
-                                    next_end_inclusive,
+                                    "wallet_refresh: contiguous_scannable_blocks (prefetch) failed: {}",
                                     err
                                 ),
                             );
@@ -5552,17 +5587,10 @@ pub extern "C" fn wallet_refresh(
                                     .saturating_add(join_wait_t0.elapsed().as_millis());
                             return record_error(
                                 -16,
-                                format!(
-                                    "wallet_refresh: prefetch task join error at heights {}..{}: {}",
-                                    next_start,
-                                    next_end_inclusive,
-                                    join_err
-                                ),
+                                format!("wallet_refresh: prefetch task join error: {}", join_err),
                             );
                         }
                     }
-                } else {
-                    next_scannables = None;
                 }
 
                 scan_cursor = th;
