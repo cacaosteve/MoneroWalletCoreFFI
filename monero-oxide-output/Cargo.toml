@@ -7,7 +7,10 @@ edition = "2021"
 name = "monerowalletcore"
 crate-type = ["cdylib", "staticlib"]
 
-
+[features]
+# Enable scanner micro-profiler plumbing (compile-time + runtime).
+# Runtime toggle is controlled via env var: MONERO_WALLET_SCANNER_MICROPROF=1
+scanner-microprof = ["monero-wallet/scanner-microprof"]
 
 [dependencies]
 monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-wallet", features = ["std"] }
@@ -32,8 +35,6 @@ monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191
 # Locate Application Support / data directory for per-wallet log file writing
 dirs = "5"
 
-
-
 # Buf/BufMut traits used by cuprate-epee-encoding helpers in our debug tooling
 bytes = "1"
 
@@ -54,10 +55,21 @@ zmq = "0.10"
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 
-
-
 [profile.release]
-overflow-checks = true
+overflow-checks = false
 
 [profile.dev]
 overflow-checks = true
+
+# Use your local monero-oxide checkout so we can enable local-only features (e.g. scanner-microprof)
+# without needing to push them to the upstream git revision.
+[patch."https://github.com/cacaosteve/monero-oxide"]
+monero-wallet = { path = "../../monero-oxide/monero-oxide/wallet" }
+monero-oxide = { path = "../../monero-oxide/monero-oxide" }
+monero-interface = { path = "../../monero-oxide/monero-oxide/interface" }
+monero-daemon-rpc = { path = "../../monero-oxide/monero-oxide/interface/daemon" }
+monero-simple-request-rpc = { path = "../../monero-oxide/monero-oxide/interface/daemon/simple-request" }
+monero-address = { path = "../../monero-oxide/monero-oxide/wallet/address" }
+monero-ed25519 = { path = "../../monero-oxide/monero-oxide/ed25519" }
+monero-io = { path = "../../monero-oxide/monero-oxide/io" }
+monero-epee = { path = "../../monero-oxide/monero-oxide/epee" }
