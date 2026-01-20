@@ -50,6 +50,7 @@ once_cell = "1.19"
 ureq = { version = "2", features = ["tls", "json"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 bincode = "1.3"
 rand = "0.8"
 
