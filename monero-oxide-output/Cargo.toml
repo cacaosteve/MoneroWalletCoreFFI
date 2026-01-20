@@ -12,6 +12,10 @@ crate-type = ["cdylib", "staticlib"]
 # Runtime toggle is controlled via env var: MONERO_WALLET_SCANNER_MICROPROF=1
 scanner-microprof = ["monero-wallet/scanner-microprof"]
 
+# Forward monero-wallet's compile-time generators (precomputed tables) feature through walletcore
+# so the xcframework build can enable it via CARGO_FEATURES.
+compile-time-generators = ["monero-wallet/compile-time-generators"]
+
 [dependencies]
 monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-wallet", features = ["std"] }
 monero-seed = { git = "https://github.com/monero-oxide/monero-wallet-util", package = "monero-seed", features = ["std"] }

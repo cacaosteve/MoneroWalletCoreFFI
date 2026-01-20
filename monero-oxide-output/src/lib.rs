@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // (moved into the main std::sync import above)
@@ -26,6 +26,236 @@ enum BulkFetchMode {
 }
 
 const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
+
+fn walletcore_disable_decoys() -> bool {
+    matches!(
+        std::env::var("WALLETCORE_DISABLE_DECOYS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn walletcore_decoy_probe_enabled() -> bool {
+    matches!(
+        std::env::var("WALLETCORE_DECOY_PROBE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// Decoy selection mode for send/preview.
+///
+/// Current modes:
+/// - (unset): default (existing monero_interface transport; currently failing on some nodes)
+/// - "bin16": use binary RPC-backed decoy provider (ring size forced to 16; work-in-progress)
+fn walletcore_decoy_mode() -> Option<String> {
+    std::env::var("WALLETCORE_DECOY_MODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn walletcore_decoy_mode_bin16() -> bool {
+    matches!(walletcore_decoy_mode().as_deref(), Some("bin16"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputSelectMode {
+    /// Default behavior (current): smallest-first.
+    SmallestFirst,
+    /// Debug/reliability mode: pick largest outputs first to minimize input count and fee.
+    LargestFirst,
+}
+
+/// Input selection override.
+///
+/// Values:
+/// - (unset): `smallest_first` (current behavior)
+/// - `largest_first`: prefer largest outputs first (useful for debugging / reducing input count)
+fn walletcore_input_select_mode() -> InputSelectMode {
+    match std::env::var("WALLETCORE_INPUT_SELECT")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("largest_first") | Some("largest") => InputSelectMode::LargestFirst,
+        Some("smallest_first") | Some("smallest") | None | Some("") => {
+            InputSelectMode::SmallestFirst
+        }
+        Some(_) => InputSelectMode::SmallestFirst,
+    }
+}
+/// Fee priority override (used when fetching fee rate from daemon).
+///
+/// Values:
+/// - (unset): default (Normal)
+/// - "low" | "unimportant" => `FeePriority::Unimportant` (maps to daemon fee tier `fee`/`fees[0]`)
+/// - "normal"             => `FeePriority::Normal`      (maps to daemon `fees[1]`)
+/// - "high" | "elevated"  => `FeePriority::Elevated`    (maps to daemon `fees[2]`)
+/// - "very_high" | "priority" => `FeePriority::Priority` (maps to daemon `fees[3]`)
+fn walletcore_fee_priority() -> FeePriority {
+    match std::env::var("WALLETCORE_FEE_PRIORITY")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("low") | Some("unimportant") => FeePriority::Unimportant,
+        Some("high") | Some("elevated") => FeePriority::Elevated,
+        Some("very_high") | Some("veryhigh") | Some("very-high") | Some("priority") => {
+            FeePriority::Priority
+        }
+        Some("normal") | None | Some("") => FeePriority::Normal,
+        Some(_) => FeePriority::Normal,
+    }
+}
+
+/// Binary RPC-backed decoy provider placeholder.
+///
+/// NOTE: The `monero-daemon-rpc` crate already provides a `MoneroDaemon<T>` implementation which
+/// supports binary RPC (bin_rpc) for decoy selection via `ProvidesDecoys`/`ProvidesUnvalidatedDecoys`.
+/// We don't need to implement decoy selection ourselves; we just need to pass the correct provider
+/// into `OutputWithDecoys::new(...)` when `WALLETCORE_DECOY_MODE=bin16` is enabled.
+///
+/// This struct remains as a lightweight holder for configuration/logging and to avoid churn while
+/// migrating call sites. It is not used for decoy selection.
+struct BinDecoyProvider {
+    base_url: String,
+}
+
+/// Construct a daemon interface which supports binary RPC (bin_rpc) decoy selection.
+///
+/// NOTE: `monero-simple-request-rpc`'s `SimpleRequestTransport::new(url)` returns a fully constructed
+/// `MoneroDaemon<SimpleRequestTransport>`, not the transport itself. That `MoneroDaemon` is the type
+/// which implements `ProvidesUnvalidatedDecoys` (thus `ProvidesDecoys`) via bin RPC:
+/// - get_output_distribution.bin
+/// - get_outs.bin
+async fn make_bin_decoy_daemon(
+    base_url: &str,
+) -> Result<
+    monero_daemon_rpc::MoneroDaemon<monero_simple_request_rpc::SimpleRequestTransport>,
+    monero_interface::InterfaceError,
+> {
+    monero_simple_request_rpc::SimpleRequestTransport::new(base_url.to_string()).await
+}
+
+/// Query `get_output_histogram` (JSON-RPC) and return `total_instances` for `amount=0` (RingCT).
+///
+/// This is used as a fallback input to decoy selection when `get_output_distribution(.bin)` is
+/// unavailable/broken on a daemon. We only need the total count of RingCT outputs.
+///
+/// Expected response shape:
+/// `{ "histogram": [ { "amount": 0, "total_instances": N, ... } ], ... }`
+async fn ringct_total_instances_via_histogram(
+    daemon: &monero_daemon_rpc::MoneroDaemon<monero_simple_request_rpc::SimpleRequestTransport>,
+) -> Result<u64, monero_interface::InterfaceError> {
+    #[derive(serde::Deserialize)]
+    struct HistogramEntry {
+        amount: u64,
+        total_instances: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HistogramResponse {
+        histogram: Vec<HistogramEntry>,
+    }
+
+    // Use the public untyped JSON-RPC call, then deserialize just what we need.
+    let raw = daemon
+        .json_rpc_call(
+            "get_output_histogram",
+            Some(r#"{ "amounts": [0] }"#.to_string()),
+            8 * 1024,
+        )
+        .await?;
+
+    let res: HistogramResponse = serde_json::from_str(&raw).map_err(|_| {
+        monero_interface::InterfaceError::InvalidInterface(
+            "get_output_histogram response wasn't the expected json".to_string(),
+        )
+    })?;
+
+    let entry = res
+        .histogram
+        .into_iter()
+        .find(|e| e.amount == 0)
+        .ok_or_else(|| {
+            monero_interface::InterfaceError::InvalidInterface(
+                "get_output_histogram returned no entry for amount=0".to_string(),
+            )
+        })?;
+
+    if entry.total_instances == 0 {
+        return Err(monero_interface::InterfaceError::InvalidInterface(
+            "get_output_histogram returned total_instances=0 for amount=0".to_string(),
+        ));
+    }
+
+    Ok(entry.total_instances)
+}
+
+/// Broadcast a signed transaction using monerod's non-JSON-RPC endpoint:
+/// `POST /send_raw_transaction` with body `{ "tx_as_hex": "...", "do_not_relay": false }`.
+///
+/// Your daemon returns `Method not found` for JSON-RPC `send_raw_transaction`, so we must use this route.
+///
+/// Returns `Ok(())` if status is OK, else `Err(InterfaceError::InterfaceError(...))` with details.
+async fn broadcast_send_raw_transaction(
+    base_url: &str,
+    tx_bytes: &[u8],
+) -> Result<(), monero_interface::InterfaceError> {
+    #[derive(serde::Deserialize)]
+    struct SendRawTxResponse {
+        status: Option<String>,
+        reason: Option<String>,
+        fee_too_low: Option<bool>,
+        too_big: Option<bool>,
+        invalid_input: Option<bool>,
+        invalid_output: Option<bool>,
+        overspend: Option<bool>,
+        not_relayed: Option<bool>,
+        sanity_check_failed: Option<bool>,
+    }
+
+    let tx_as_hex = hex_lowercase(tx_bytes);
+    let body = serde_json::json!({
+        "tx_as_hex": tx_as_hex,
+        "do_not_relay": false
+    })
+    .to_string()
+    .into_bytes();
+
+    // Use the existing SimpleRequest transport (handles auth if present and ensures response is read).
+    let daemon = make_bin_decoy_daemon(base_url).await?;
+    let raw = daemon
+        .rpc_call(
+            "send_raw_transaction",
+            Some(String::from_utf8_lossy(&body).to_string()),
+            64 * 1024,
+        )
+        .await?;
+
+    let res: SendRawTxResponse = serde_json::from_str(&raw).map_err(|_| {
+        monero_interface::InterfaceError::InvalidInterface(
+            "send_raw_transaction response wasn't the expected json".to_string(),
+        )
+    })?;
+
+    let status = res.status.unwrap_or_else(|| "UNKNOWN".to_string());
+    if status.eq_ignore_ascii_case("OK") {
+        return Ok(());
+    }
+
+    Err(monero_interface::InterfaceError::InterfaceError(format!(
+        "send_raw_transaction status={} reason={} fee_too_low={:?} too_big={:?} invalid_input={:?} invalid_output={:?} overspend={:?} not_relayed={:?} sanity_check_failed={:?}",
+        status,
+        res.reason.unwrap_or_else(|| "(none)".to_string()),
+        res.fee_too_low,
+        res.too_big,
+        res.invalid_input,
+        res.invalid_output,
+        res.overspend,
+        res.not_relayed,
+        res.sanity_check_failed
+    )))
+}
 
 fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
     fn hex_val(b: u8) -> Option<u8> {
@@ -600,9 +830,15 @@ fn fingerprint32(label: &str, bytes: &[u8]) -> String {
 // New monero-oxide split: use monero-interface traits + error types.
 use monero_interface::{
     FeeError, FeePriority, FeeRate, InterfaceError, ProvidesBlockchain, ProvidesBlockchainMeta,
-    ProvidesFeeRates, ProvidesOutputs, ProvidesScannableBlocks, ProvidesTransactions,
-    PublishTransaction, ScannableBlock,
+    ProvidesDecoys, ProvidesFeeRates, ProvidesOutputs, ProvidesScannableBlocks,
+    ProvidesTransactions, PublishTransaction, ScannableBlock,
 };
+
+// Spend detection (key image computation) will use curve25519-dalek scalar math directly.
+// No monero-wallet ed25519 aliases are needed here.
+
+// Spend detection: compute key images for owned outputs so we can later detect on-chain spends.
+// (imports live above; do not duplicate)
 
 // TEMPORARY migration alias: keep the existing walletcore code compiling while we
 // port from the old monero_wallet::rpc::{Rpc, RpcError} API to monero-interface.
@@ -958,6 +1194,121 @@ fn clear_last_error() {
     if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
         *slot = None;
     }
+}
+
+fn walletcore_sweep_bisect_enabled() -> bool {
+    matches!(
+        std::env::var("WALLETCORE_SWEEP_BISECT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn is_invalid_input_send_raw_tx_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    // We currently bubble errors up in a few different string shapes (depending on which layer created them).
+    // Make this matcher resilient so bisect triggers reliably.
+    m.contains("send_raw_transaction status=failed") && m.contains("invalid_input=some(true)")
+}
+
+fn is_failed_send_raw_tx_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("send_raw_transaction status=failed")
+}
+
+fn walletcore_send_bisect_on_failed_enabled() -> bool {
+    std::env::var("WALLETCORE_SEND_BISECT_ON_FAILED")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+/// Env toggle: enable bisect debugging on *normal sends* when daemon broadcast reports invalid_input=true.
+fn walletcore_send_bisect_enabled() -> bool {
+    std::env::var("WALLETCORE_SEND_BISECT")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+fn walletcore_debug_spend_detect_enabled() -> bool {
+    std::env::var("WALLETCORE_DEBUG_SPEND_DETECT")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+// Env-gated diagnostics: dump selected tracked outputs (txid:vout + key metadata) for preview/send flows.
+fn walletcore_debug_input_dump_enabled() -> bool {
+    std::env::var("WALLETCORE_DEBUG_INPUT_DUMP")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+fn walletcore_debug_dump_tracked_outputs(
+    wallet_id: &str,
+    network: MoneroNetwork,
+    label: &str,
+    outputs: &[TrackedOutput],
+    daemon_height: u64,
+    top_block_timestamp: u64,
+) {
+    if !walletcore_debug_input_dump_enabled() {
+        return;
+    }
+
+    walletcore_log!(
+        wallet_id,
+        network,
+        "🧾 {} wallet_id={} selected_count={} daemon_height={} top_ts={}",
+        label,
+        wallet_id,
+        outputs.len(),
+        daemon_height,
+        top_block_timestamp
+    );
+
+    for o in outputs {
+        walletcore_log!(
+            wallet_id,
+            network,
+            "🧾 {} wallet_id={} out={} key_image={} spent={} unlocked={} timelock_kind={} timelock_value={} subaddr={}:{} coinbase={} amount_piconero={}",
+            label,
+            wallet_id,
+            format!("{}:{}", hex_lowercase(&o.tx_hash), o.index_in_tx),
+            hex_lowercase(&o.key_image),
+            o.spent,
+            o.is_unlocked(daemon_height, top_block_timestamp),
+            match o.additional_timelock {
+                Timelock::None => "none",
+                Timelock::Block(_) => "block",
+                Timelock::Time(_) => "time",
+            },
+            match o.additional_timelock {
+                Timelock::None => "null".to_string(),
+                Timelock::Block(h) => h.to_string(),
+                Timelock::Time(t) => t.to_string(),
+            },
+            o.subaddress_major,
+            o.subaddress_minor,
+            o.is_coinbase,
+            o.amount
+        );
+    }
+}
+
+/// Minimum input amount (piconero) to include in "Send Max" (sweep).
+///
+/// Rationale: some very small outputs cost more to spend than they're worth (fee > amount).
+/// Those should be excluded from sweep so "Send Max" succeeds and doesn't burn fees.
+///
+/// Env override: `WALLETCORE_SWEEP_MIN_INPUT_PICONERO`
+/// Default: 50_000_000 (0.000050000000 XMR)
+fn walletcore_sweep_min_input_piconero() -> u64 {
+    std::env::var("WALLETCORE_SWEEP_MIN_INPUT_PICONERO")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(50_000_000)
 }
 
 fn record_error(code: c_int, message: impl Into<String>) -> c_int {
@@ -3585,6 +3936,8 @@ pub extern "C" fn wallet_derive_subaddress_from_mnemonic(
 struct TrackedOutput {
     tx_hash: [u8; 32],
     index_in_tx: u64,
+    /// Key image for this output (I = x * Hp(P)), used to detect on-chain spends.
+    key_image: [u8; 32],
     amount: u64,
     block_height: u64,
     additional_timelock: Timelock,
@@ -3592,6 +3945,8 @@ struct TrackedOutput {
     subaddress_major: u32,
     subaddress_minor: u32,
     spent: bool,
+    /// If this output has been detected as spent, record the spending txid when known.
+    spending_txid: Option<[u8; 32]>,
 }
 
 /// Minimal pending-outgoing record for UI history.
@@ -3602,6 +3957,69 @@ struct PendingOutgoingTx {
     amount: u64,
     fee: u64,
     created_at: u64,
+}
+
+/// Worker-mode spend detection record: one observed tx input key image attributed to a spending txid.
+///
+/// This is produced in the refresh worker thread and applied on the main thread to mark matching
+/// tracked outputs as spent.
+#[derive(Clone, Copy, Debug)]
+struct RefreshWorkerSpend {
+    spending_txid: [u8; 32],
+    key_image: [u8; 32],
+}
+
+/// Worker-mode refresh payload: newly discovered outputs plus spend observations.
+///
+/// NOTE: Outgoing ledger attribution (fee/net) is handled on the main thread after applying spends.
+//
+// Debug controls for spend detection logging.
+// We want always-on summaries (even when 0 spends found), but we must avoid log spam on mobile.
+// Controls:
+// - WALLETCORE_SPEND_LOG_EVERY_N_BLOCKS: emit per-block spend summary every N blocks (default 2048)
+//
+// Additional debug:
+// - WALLETCORE_DEBUG_SPEND_DETECT=1: emit detailed spend-detection summary per refresh chunk (worker-side + apply-side)
+// - WALLETCORE_SPEND_LOG_EVERY_N_BATCHES: emit per-batch output/key-image coverage summary every N batches (default 8)
+//
+// Targeted "watch" controls for diagnosing missing outgoing transactions:
+// - WALLETCORE_DEBUG_WATCH_KEY_IMAGE_HEX: if set to a 64-hex key image, log when that KI is seen and whether it matches an owned output
+// - WALLETCORE_DEBUG_WATCH_TXID_HEX: if set to a 64-hex txid, log when that spending txid is observed during spend scanning
+fn spend_log_every_n_blocks_from_env() -> u64 {
+    std::env::var("WALLETCORE_SPEND_LOG_EVERY_N_BLOCKS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2048)
+}
+
+fn spend_log_every_n_batches_from_env() -> u64 {
+    std::env::var("WALLETCORE_SPEND_LOG_EVERY_N_BATCHES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
+
+// NOTE: hex parsing helper `parse_hex_32` already exists near the top of this module.
+// Reuse it for the watch env vars to avoid duplicate definitions.
+
+fn watch_key_image_from_env() -> Option<[u8; 32]> {
+    std::env::var("WALLETCORE_DEBUG_WATCH_KEY_IMAGE_HEX")
+        .ok()
+        .and_then(|s| parse_hex_32(&s))
+}
+
+fn watch_txid_from_env() -> Option<[u8; 32]> {
+    std::env::var("WALLETCORE_DEBUG_WATCH_TXID_HEX")
+        .ok()
+        .and_then(|s| parse_hex_32(&s))
+}
+
+#[derive(Clone, Debug)]
+struct RefreshWorkerResult {
+    outputs: Vec<TrackedOutput>,
+    spends: Vec<RefreshWorkerSpend>,
 }
 
 impl TrackedOutput {
@@ -3796,6 +4214,13 @@ struct StoredWallet {
     pending_outgoing: Vec<PendingOutgoingTx>,
     tx_ledger: HashMap<String, LedgerEntry>,
 
+    /// Outputs we have quarantined because the daemon rejected them with `invalid_input=true`
+    /// during broadcast. Keyed by (tx_hash, index_in_tx).
+    ///
+    /// This is a safety net for cases where spend-detection is lagging or the node view is inconsistent.
+    /// We exclude these from future input selection and persist them in the cache.
+    invalid_input_quarantine: HashSet<([u8; 32], u64)>,
+
     // Wallet2-style bounded recent block-hash history used to build `block_ids` (short chain history)
     // for `/getblocks.bin` fast sync. This is intentionally bounded to keep cache size small.
     //
@@ -3816,6 +4241,8 @@ enum PersistedTimelock {
 struct PersistedOutput {
     tx_hash: [u8; 32],
     index_in_tx: u64,
+    /// Key image for this output, persisted so we can detect spends on refresh.
+    key_image: [u8; 32],
     amount: u64,
     block_height: u64,
     timelock: PersistedTimelock,
@@ -3823,6 +4250,8 @@ struct PersistedOutput {
     subaddress_major: u32,
     subaddress_minor: u32,
     spent: bool,
+    /// Spending txid for this output when spend attribution is known.
+    spending_txid: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3845,6 +4274,11 @@ struct PersistedWallet {
     seen_outpoints: Vec<([u8; 32], u64)>,
     pending_outgoing: Vec<PendingOutgoingTx>,
     tx_ledger: HashMap<String, LedgerEntry>,
+
+    /// Persisted invalid-input quarantine (see `StoredWallet.invalid_input_quarantine`).
+    /// Marked `serde(default)` so older cache blobs can still be deserialized.
+    #[serde(default)]
+    invalid_input_quarantine: Vec<([u8; 32], u64)>,
 
     // Bounded recent block-hash history (see `StoredWallet` for details).
     // Marked `serde(default)` so older cache blobs (which don't have these fields yet)
@@ -3883,6 +4317,7 @@ impl From<&TrackedOutput> for PersistedOutput {
         Self {
             tx_hash: output.tx_hash,
             index_in_tx: output.index_in_tx,
+            key_image: output.key_image,
             amount: output.amount,
             block_height: output.block_height,
             timelock: PersistedTimelock::from(&output.additional_timelock),
@@ -3890,6 +4325,7 @@ impl From<&TrackedOutput> for PersistedOutput {
             subaddress_major: output.subaddress_major,
             subaddress_minor: output.subaddress_minor,
             spent: output.spent,
+            spending_txid: output.spending_txid,
         }
     }
 }
@@ -3899,6 +4335,7 @@ impl From<PersistedOutput> for TrackedOutput {
         Self {
             tx_hash: output.tx_hash,
             index_in_tx: output.index_in_tx,
+            key_image: output.key_image,
             amount: output.amount,
             block_height: output.block_height,
             additional_timelock: output.timelock.into(),
@@ -3906,6 +4343,7 @@ impl From<PersistedOutput> for TrackedOutput {
             subaddress_major: output.subaddress_major,
             subaddress_minor: output.subaddress_minor,
             spent: output.spent,
+            spending_txid: output.spending_txid,
         }
     }
 }
@@ -3947,6 +4385,7 @@ impl From<&StoredWallet> for PersistedWallet {
             seen_outpoints: wallet.seen_outpoints.iter().copied().collect(),
             pending_outgoing: wallet.pending_outgoing.clone(),
             tx_ledger: wallet.tx_ledger.clone(),
+            invalid_input_quarantine: wallet.invalid_input_quarantine.iter().copied().collect(),
 
             recent_block_hashes_start_height: wallet.recent_block_hashes_start_height,
             recent_block_hashes: wallet.recent_block_hashes.clone(),
@@ -3970,31 +4409,12 @@ impl PersistedWallet {
         state.seen_outpoints = self.seen_outpoints.into_iter().collect();
         state.pending_outgoing = self.pending_outgoing;
         state.tx_ledger = self.tx_ledger;
+        state.invalid_input_quarantine = self.invalid_input_quarantine.into_iter().collect();
 
+        // Recent block hashes (wallet2-style short chain history)
         // Bounded recent block-hash history (wallet2-style chain history).
         state.recent_block_hashes_start_height = self.recent_block_hashes_start_height;
         state.recent_block_hashes = self.recent_block_hashes;
-
-        // Defensive: older caches or older runtime state may not have initialized the ledger.
-        // Ensure it exists so transfer history can be built deterministically.
-        if state.tx_ledger.is_empty() {
-            state.tx_ledger = HashMap::new();
-        }
-
-        // Invariant enforcement:
-        // Cache blobs may have been exported mid-refresh (or from older versions), which can result in
-        // tracked outputs/ledger being present while total/unlocked are stale (e.g., 0).
-        // Recompute balances from the imported tracked outputs using the imported chain height/time.
-        let mut total: u64 = 0;
-        let mut unlocked: u64 = 0;
-        for o in state.tracked_outputs.iter() {
-            total = total.saturating_add(o.amount);
-            if o.is_unlocked(state.chain_height, state.chain_time) {
-                unlocked = unlocked.saturating_add(o.amount);
-            }
-        }
-        state.total = total;
-        state.unlocked = unlocked;
     }
 }
 
@@ -4161,6 +4581,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
                 seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
                 pending_outgoing: Vec::new(),
                 tx_ledger: HashMap::new(),
+                invalid_input_quarantine: HashSet::<([u8; 32], u64)>::new(),
 
                 // Start empty; will be populated during refresh.
                 recent_block_hashes_start_height: restore_height,
@@ -4239,6 +4660,20 @@ pub extern "C" fn wallet_refresh(
 
     // Stage logging to diagnose early refresh termination
     println!("🧭 wallet_refresh stage=init wallet_id={}", id);
+
+    // Build/runtime sanity logs (useful to confirm device vs simulator, and feature flags affecting perf).
+    // Print once per process to avoid log spam.
+    static BUILD_INFO_LOGGED: std::sync::Once = std::sync::Once::new();
+    BUILD_INFO_LOGGED.call_once(|| {
+        println!(
+            "🧭 walletcore_build target_os={} target_arch={} compile_time_generators={} scanner_microprof_feature={}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            cfg!(feature = "compile-time-generators"),
+            cfg!(feature = "scanner-microprof")
+        );
+    });
+
     // Best-effort per-wallet log line (network derived once we have snapshot below; we will log again later).
 
     let arg_url = if !node_url.is_null() {
@@ -4694,7 +5129,7 @@ pub extern "C" fn wallet_refresh(
                 }
 
                 let (tx, rx) =
-                    std::sync::mpsc::channel::<Result<Vec<TrackedOutput>, (c_int, String)>>();
+                    std::sync::mpsc::channel::<Result<RefreshWorkerResult, (c_int, String)>>();
 
                 // One-time enable log
                 if effective_bulk_fetch != BulkFetchMode::PerBlock && !bulk_fetch_logged {
@@ -4723,7 +5158,6 @@ pub extern "C" fn wallet_refresh(
                         let vp = view_pair.clone();
                         let local_gap = gap_limit;
                         let id_owned_for_worker = id.to_string();
-                        let worker_effective_bulk_fetch = effective_bulk_fetch;
                         let worker_upstream_block_batch = upstream_block_batch;
 
                         std::thread::spawn(move || {
@@ -4745,13 +5179,10 @@ pub extern "C" fn wallet_refresh(
                                 }
                             }
 
-                            let mut collected: Vec<TrackedOutput> = Vec::new();
+                            // Accumulate across the full assigned span and send once.
+                            let mut collected_outputs: Vec<TrackedOutput> = Vec::new();
+                            let mut collected_spends: Vec<RefreshWorkerSpend> = Vec::new();
 
-                            // Upstream fast path: fetch contiguous scannable blocks in batches using the
-                            // monero-daemon-rpc bin RPC implementation.
-                            //
-                            // This intentionally bypasses our bespoke bulk bin fetch logic and aligns closer
-                            // to wallet2/Feather semantics as implemented in monero-oxide.
                             let start_bn = match usize::try_from(start_h) {
                                 Ok(v) => v,
                                 Err(_) => {
@@ -4777,13 +5208,14 @@ pub extern "C" fn wallet_refresh(
                                 },
                             };
 
-                            // Nothing to do
                             if start_h >= end_h_exclusive {
-                                let _ = txc.send(Ok(collected));
+                                let _ = txc.send(Ok(RefreshWorkerResult {
+                                    outputs: Vec::new(),
+                                    spends: Vec::new(),
+                                }));
                                 return;
                             }
 
-                            // Diagnostic clamp inside workers as well: fetch in smaller chunks to avoid OOM.
                             let mut cur = start_bn;
                             while cur <= end_bn_inclusive {
                                 if refresh_cancelled_for_wallet(&id_owned_for_worker) {
@@ -4846,6 +5278,7 @@ pub extern "C" fn wallet_refresh(
                                 }
 
                                 let mut th = u64::try_from(cur).unwrap_or(0);
+
                                 for scannable in scannables {
                                     if refresh_cancelled_for_wallet(&id_owned_for_worker) {
                                         let _ = txc.send(Err((
@@ -4861,6 +5294,27 @@ pub extern "C" fn wallet_refresh(
                                         if let Ok(mut map) = WALLET_STORE.lock() {
                                             if let Some(state) = map.get_mut(&id_owned_for_worker) {
                                                 push_recent_block_hash(state, th, block_hash);
+                                            }
+                                        }
+                                    }
+
+                                    // --- spend detection (worker): collect (spending_txid, key_image) pairs ---
+                                    for (tx_i, tx_ref) in scannable.transactions.iter().enumerate()
+                                    {
+                                        let spending_txid_opt =
+                                            scannable.block.transactions.get(tx_i).copied();
+                                        if let Some(spending_txid) = spending_txid_opt {
+                                            for input in &tx_ref.prefix().inputs {
+                                                if let monero_wallet::transaction::Input::ToKey {
+                                                    key_image,
+                                                    ..
+                                                } = input
+                                                {
+                                                    collected_spends.push(RefreshWorkerSpend {
+                                                        spending_txid,
+                                                        key_image: key_image.to_bytes(),
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -4885,9 +5339,61 @@ pub extern "C" fn wallet_refresh(
                                             .subaddress()
                                             .map(|idx| (idx.account(), idx.address()))
                                             .unwrap_or((0, 0));
-                                        collected.push(TrackedOutput {
+
+                                        let key_image_bytes: [u8; 32] = {
+                                            let ko_bytes: [u8; 32] =
+                                                <[u8; 32]>::from(output.key_offset());
+                                            let ko_dalek =
+                                                curve25519_dalek::Scalar::from_canonical_bytes(
+                                                    ko_bytes,
+                                                )
+                                                .into_option()
+                                                .unwrap_or(curve25519_dalek::Scalar::ZERO);
+
+                                            let a = master.spend_scalar;
+
+                                            let m_dalek = if major == 0 && minor == 0 {
+                                                curve25519_dalek::Scalar::ZERO
+                                            } else {
+                                                let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+                                                data.extend_from_slice(b"SubAddr\0");
+                                                data.extend_from_slice(&<[u8; 32]>::from(
+                                                    master.view_scalar_ed,
+                                                ));
+                                                data.extend_from_slice(&major.to_le_bytes());
+                                                data.extend_from_slice(&minor.to_le_bytes());
+                                                let m_ed: EdScalar = EdScalar::hash(&data);
+                                                let m_d: curve25519_dalek::Scalar = m_ed.into();
+                                                m_d
+                                            };
+
+                                            let x = a + ko_dalek + m_dalek;
+
+                                            let p = output.key();
+                                            let p_bytes = p.compress().to_bytes();
+                                            let hp_p =
+                                                monero_wallet::ed25519::Point::biased_hash(p_bytes);
+                                            let hp_p_bytes = hp_p.compress().to_bytes();
+
+                                            use curve25519_dalek::traits::Identity;
+
+                                            let hp_p_dalek =
+                                                curve25519_dalek::edwards::CompressedEdwardsY(
+                                                    hp_p_bytes,
+                                                )
+                                                .decompress()
+                                                .unwrap_or(
+                                                    curve25519_dalek::EdwardsPoint::identity(),
+                                                );
+
+                                            let ki = hp_p_dalek * x;
+                                            ki.compress().to_bytes()
+                                        };
+
+                                        collected_outputs.push(TrackedOutput {
                                             tx_hash: output.transaction(),
                                             index_in_tx: output.index_in_transaction(),
+                                            key_image: key_image_bytes,
                                             amount: output.commitment().amount,
                                             block_height: th,
                                             additional_timelock: output.additional_timelock(),
@@ -4895,6 +5401,7 @@ pub extern "C" fn wallet_refresh(
                                             subaddress_major: major,
                                             subaddress_minor: minor,
                                             spent: false,
+                                            spending_txid: None,
                                         });
                                     }
 
@@ -4904,8 +5411,10 @@ pub extern "C" fn wallet_refresh(
                                 cur = chunk_end.saturating_add(1);
                             }
 
-                            let _ = txc.send(Ok(collected));
-                            return;
+                            let _ = txc.send(Ok(RefreshWorkerResult {
+                                outputs: collected_outputs,
+                                spends: collected_spends,
+                            }));
                         });
                     }
 
@@ -4919,26 +5428,105 @@ pub extern "C" fn wallet_refresh(
                         }
 
                         match rx.recv_timeout(worker_timeout) {
-                            Ok(Ok(vec_outputs)) => {
+                            Ok(Ok(worker_res)) => {
                                 // Cancellation check before applying results
                                 if refresh_cancelled_for_wallet(id) {
                                     return record_error(-30, "wallet_refresh: cancelled");
                                 }
 
-                                for t in vec_outputs {
+                                // Apply outputs
+                                for t in worker_res.outputs {
                                     let key = (t.tx_hash, t.index_in_tx);
                                     if !seen_outpoints.insert(key) {
                                         continue;
                                     }
                                     working_outputs.push(t);
                                 }
+
+                                // Apply spends (mark outputs spent).
+                                //
+                                // IMPORTANT: spends observed in this worker chunk may refer to outputs that were
+                                // discovered earlier in the refresh (or even prior refreshes). Therefore, the
+                                // key-image index MUST be built from the full `working_outputs` set, not just
+                                // this worker's newly-returned outputs.
+                                //
+                                // We always build the key-image map, and then count how many observed spends
+                                // matched our known outputs. This helps diagnose cases where the daemon rejects
+                                // a supposedly-unspent output (invalid_input) but we never mark it as spent.
+                                let mut key_image_to_output_index: std::collections::HashMap<
+                                    [u8; 32],
+                                    usize,
+                                > = std::collections::HashMap::new();
+                                for (i, o) in working_outputs.iter().enumerate() {
+                                    if o.key_image != [0u8; 32] {
+                                        key_image_to_output_index.entry(o.key_image).or_insert(i);
+                                    }
+                                }
+
+                                if walletcore_debug_spend_detect_enabled() {
+                                    walletcore_log!(
+                                        id,
+                                        snapshot.network,
+                                        "🧾 spend_detect_chunk wallet_id={} known_outputs={} observed_spend_events={}",
+                                        id,
+                                        working_outputs.len(),
+                                        worker_res.spends.len()
+                                    );
+                                }
+
+                                if !worker_res.spends.is_empty() {
+                                    let mut matched: u64 = 0;
+                                    let mut unmatched: u64 = 0;
+
+                                    for s in worker_res.spends {
+                                        if let Some(out_idx) =
+                                            key_image_to_output_index.get(&s.key_image).copied()
+                                        {
+                                            matched = matched.saturating_add(1);
+                                            working_outputs[out_idx].spent = true;
+                                            working_outputs[out_idx].spending_txid =
+                                                Some(s.spending_txid);
+                                            walletcore_log!(
+                                                id,
+                                                snapshot.network,
+                                                "🧾 spend_detected(wallet_refresh_worker) wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                                id,
+                                                hex_dump_prefix(&s.spending_txid, 32),
+                                                hex_dump_prefix(&s.key_image, 32),
+                                                working_outputs[out_idx].amount,
+                                                hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                                working_outputs[out_idx].index_in_tx
+                                            );
+                                        } else {
+                                            unmatched = unmatched.saturating_add(1);
+                                            if walletcore_debug_spend_detect_enabled() {
+                                                walletcore_log!(
+                                                    id,
+                                                    snapshot.network,
+                                                    "🧾 spend_detect_unmatched wallet_id={} spending_txid={} key_image={}",
+                                                    id,
+                                                    hex_dump_prefix(&s.spending_txid, 32),
+                                                    hex_dump_prefix(&s.key_image, 32)
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if walletcore_debug_spend_detect_enabled() {
+                                        walletcore_log!(
+                                            id,
+                                            snapshot.network,
+                                            "🧾 spend_detect_chunk_summary wallet_id={} matched={} unmatched={}",
+                                            id,
+                                            matched,
+                                            unmatched
+                                        );
+                                    }
+                                }
+
                                 received += 1;
                             }
                             Ok(Err((code, msg))) => {
-                                // If bulk fetch failed inside a worker, log once and prefer falling back to
-                                // range-based bulk mode (get_blocks.bin) instead of per-block JSON.
-                                //
-                                // This keeps sync fast even when wallet2-fast decoding fails on certain daemon variants.
                                 if effective_bulk_fetch != BulkFetchMode::PerBlock
                                     && !bulk_fetch_fallback_logged
                                 {
@@ -4959,57 +5547,29 @@ pub extern "C" fn wallet_refresh(
                                     }
                                     bulk_fetch_fallback_logged = true;
                                 }
-                                // Abort on first error (including cancellation)
                                 return record_error(code, msg);
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 return record_error(
                                     -16,
                                     format!(
-                                        "wallet_refresh: parallel worker stalled (no result within {}s) while scanning heights {}..{}",
-                                        worker_timeout.as_secs(),
-                                        scan_cursor,
-                                        end_exclusive.saturating_sub(1)
+                                        "wallet_refresh: worker timed out after {:?} (received {}/{})",
+                                        worker_timeout, received, chunk.len()
                                     ),
                                 );
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                 return record_error(
                                     -16,
-                                    "wallet_refresh: parallel worker channel closed unexpectedly",
+                                    "wallet_refresh: worker channel disconnected",
                                 );
                             }
                         }
                     }
 
-                    // Update progress after draining this chunk.
-                    //
-                    // NOTE: In the span-based scheduler, `chunk` items are (start_h, end_h_exclusive) tuples.
-                    // We advance scan_cursor to the end of the last span in this chunk.
-                    if let Some(&(_span_start, span_end_exclusive)) = chunk.last() {
-                        scan_cursor = span_end_exclusive.min(daemon.height);
-                        update_scan_progress(
-                            id,
-                            scan_cursor.min(daemon.height),
-                            daemon.height,
-                            daemon.top_block_timestamp,
-                            snapshot.restore_height,
-                        );
-                    }
+                    scan_cursor = end_exclusive;
                 }
-
-                // Advance cursor to end of this batch
-                scan_cursor = end_exclusive;
-                update_scan_progress(
-                    id,
-                    scan_cursor.min(daemon.height),
-                    daemon.height,
-                    daemon.top_block_timestamp,
-                    snapshot.restore_height,
-                );
             }
-            // Ensure we align with daemon height after finishing batches
-            scan_cursor = daemon.height;
         } else {
             // Sequential scan: upstream daemon RPC + pipelined fetch.
             //
@@ -5299,6 +5859,21 @@ pub extern "C" fn wallet_refresh(
                 let mut outputs_added_in_batch: usize = 0;
                 let blocks_in_batch: usize = scannables.len();
 
+                // Spend/key-image coverage summary for this batch (throttled).
+                let mut batch_outputs_total_before_scan: u64 = working_outputs.len() as u64;
+                let mut batch_outputs_key_image_nonzero_before_scan: u64 = 0;
+                let mut batch_outputs_spent_true_before_scan: u64 = 0;
+                for o in &working_outputs {
+                    if o.key_image != [0u8; 32] {
+                        batch_outputs_key_image_nonzero_before_scan =
+                            batch_outputs_key_image_nonzero_before_scan.saturating_add(1);
+                    }
+                    if o.spent {
+                        batch_outputs_spent_true_before_scan =
+                            batch_outputs_spent_true_before_scan.saturating_add(1);
+                    }
+                }
+
                 // Debug: per-batch scannable transaction completeness stats.
                 let mut batch_txs_total: usize = 0;
                 let mut batch_txs_v1: usize = 0;
@@ -5326,6 +5901,220 @@ pub extern "C" fn wallet_refresh(
                     }
 
                     let miner_hash = scannable.block.miner_transaction().hash();
+
+                    // ---- Spend detection (inputs) ----
+                    //
+                    // For Feather-like outgoing history, we must detect spends of our outputs on-chain.
+                    // We do that by matching tx input key images against our stored output key images.
+                    //
+                    // Note: this is CPU-path only; it runs in the same loop as scanning so it sees the
+                    // exact same block/tx set.
+                    let mut inputs_seen_in_block: u64 = 0;
+                    let mut key_images_seen_in_block: u64 = 0;
+
+                    // Build a lookup from key_image -> indices into working_outputs.
+                    // Multiple outputs could theoretically share a key image only if something is wrong;
+                    // we keep first match.
+                    let mut key_image_to_output_index: std::collections::HashMap<[u8; 32], usize> =
+                        std::collections::HashMap::new();
+                    let mut outputs_total: u64 = 0;
+                    let mut outputs_with_key_image_nonzero: u64 = 0;
+                    let mut outputs_spent_true_pre: u64 = 0;
+
+                    for (i, o) in working_outputs.iter().enumerate() {
+                        outputs_total = outputs_total.saturating_add(1);
+                        if o.spent {
+                            outputs_spent_true_pre = outputs_spent_true_pre.saturating_add(1);
+                        }
+                        if o.key_image != [0u8; 32] {
+                            outputs_with_key_image_nonzero =
+                                outputs_with_key_image_nonzero.saturating_add(1);
+                            key_image_to_output_index.entry(o.key_image).or_insert(i);
+                        }
+                    }
+
+                    // Accumulate gross inputs we spend per spending txid (piconero)
+                    let mut spent_inputs_by_txid: std::collections::HashMap<[u8; 32], u64> =
+                        std::collections::HashMap::new();
+
+                    // Miner tx inputs
+                    {
+                        let tx = scannable.block.miner_transaction();
+                        for input in &tx.prefix().inputs {
+                            inputs_seen_in_block = inputs_seen_in_block.saturating_add(1);
+                            if let monero_wallet::transaction::Input::ToKey { key_image, .. } =
+                                input
+                            {
+                                key_images_seen_in_block =
+                                    key_images_seen_in_block.saturating_add(1);
+                                let ki_bytes = key_image.to_bytes();
+                                if let Some(out_idx) =
+                                    key_image_to_output_index.get(&ki_bytes).copied()
+                                {
+                                    // Mark spent + accumulate
+                                    let spent_amount = working_outputs[out_idx].amount;
+                                    working_outputs[out_idx].spent = true;
+
+                                    let spend_txid = tx.hash();
+                                    working_outputs[out_idx].spending_txid = Some(spend_txid);
+                                    let e = spent_inputs_by_txid.entry(spend_txid).or_insert(0);
+                                    *e = e.saturating_add(spent_amount);
+
+                                    walletcore_log!(
+                                        id,
+                                        snapshot.network,
+                                        "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                        id,
+                                        hex_dump_prefix(&spend_txid, 32),
+                                        hex_dump_prefix(&ki_bytes, 32),
+                                        spent_amount,
+                                        hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                        working_outputs[out_idx].index_in_tx
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Non-miner tx inputs
+                    //
+                    // Note: scannable.transactions holds pruned transactions (Transaction<Pruned>), which do not
+                    // have a direct `hash()` method. We compute the txid using the prunable hash provided by the
+                    // scannable block (when available).
+                    //
+                    // Safety fallback: if we cannot compute a txid, we still mark outputs spent, but we do not
+                    // attribute them to a spending txid (so we won't emit an outgoing ledger entry for that tx).
+                    // Read watch filters once per block to keep overhead low.
+                    let watch_ki = watch_key_image_from_env();
+                    let watch_txid = watch_txid_from_env();
+
+                    for (tx_i, tx_ref) in scannable.transactions.iter().enumerate() {
+                        // Try to compute txid from prunable hash if available.
+                        // scannable.block.transactions is the list of tx hashes for the block in order.
+                        let spend_txid_opt: Option<[u8; 32]> =
+                            scannable.block.transactions.get(tx_i).copied();
+
+                        if let (Some(watch), Some(spend_txid)) = (watch_txid, spend_txid_opt) {
+                            if watch == spend_txid {
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "🕵️ watch_spend_txid_seen wallet_id={} height={} spending_txid={}",
+                                    id,
+                                    th,
+                                    hex_dump_prefix(&spend_txid, 32)
+                                );
+                            }
+                        }
+
+                        for input in &tx_ref.prefix().inputs {
+                            inputs_seen_in_block = inputs_seen_in_block.saturating_add(1);
+                            if let monero_wallet::transaction::Input::ToKey { key_image, .. } =
+                                input
+                            {
+                                key_images_seen_in_block =
+                                    key_images_seen_in_block.saturating_add(1);
+                                let ki_bytes = key_image.to_bytes();
+
+                                if let Some(watch) = watch_ki {
+                                    if watch == ki_bytes {
+                                        let matched = key_image_to_output_index
+                                            .get(&ki_bytes)
+                                            .copied()
+                                            .is_some();
+                                        walletcore_log!(
+                                            id,
+                                            snapshot.network,
+                                            "🕵️ watch_key_image_seen wallet_id={} height={} spending_txid={} key_image={} matched_owned_output={}",
+                                            id,
+                                            th,
+                                            match spend_txid_opt {
+                                                Some(txid) => hex_dump_prefix(&txid, 32),
+                                                None => "(unknown)".to_string(),
+                                            },
+                                            hex_dump_prefix(&ki_bytes, 32),
+                                            matched
+                                        );
+                                    }
+                                }
+
+                                if let Some(out_idx) =
+                                    key_image_to_output_index.get(&ki_bytes).copied()
+                                {
+                                    let spent_amount = working_outputs[out_idx].amount;
+                                    working_outputs[out_idx].spent = true;
+
+                                    if let Some(spend_txid) = spend_txid_opt {
+                                        working_outputs[out_idx].spending_txid = Some(spend_txid);
+                                        let e = spent_inputs_by_txid.entry(spend_txid).or_insert(0);
+                                        *e = e.saturating_add(spent_amount);
+
+                                        walletcore_log!(
+                                            id,
+                                            snapshot.network,
+                                            "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                            id,
+                                            hex_dump_prefix(&spend_txid, 32),
+                                            hex_dump_prefix(&ki_bytes, 32),
+                                            spent_amount,
+                                            hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                            working_outputs[out_idx].index_in_tx
+                                        );
+                                    } else {
+                                        // Spending txid unknown for this pruned tx; we still mark spent but cannot attribute
+                                        // it to an outgoing tx row.
+                                        working_outputs[out_idx].spending_txid = None;
+                                        walletcore_log!(
+                                            id,
+                                            snapshot.network,
+                                            "🧾 spend_detected wallet_id={} spending_txid=(unknown) key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                            id,
+                                            hex_dump_prefix(&ki_bytes, 32),
+                                            spent_amount,
+                                            hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                            working_outputs[out_idx].index_in_tx
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Always emit spend detection summary periodically (even when 0 spends are found),
+                    // otherwise debugging on mobile is ambiguous.
+                    //
+                    // Throttle to avoid log spam: default every 2048 blocks (configurable via env).
+                    let spend_log_every_n_blocks = spend_log_every_n_blocks_from_env();
+                    if spend_log_every_n_blocks > 0 && (th % spend_log_every_n_blocks == 0) {
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧾 spend_detection_summary wallet_id={} height={} inputs_seen={} key_images_seen={} distinct_spend_txs={} outputs_total={} outputs_key_image_nonzero={} outputs_spent_pre={}",
+                            id,
+                            th,
+                            inputs_seen_in_block,
+                            key_images_seen_in_block,
+                            spent_inputs_by_txid.len(),
+                            outputs_total,
+                            outputs_with_key_image_nonzero,
+                            outputs_spent_true_pre
+                        );
+                    } else if !spent_inputs_by_txid.is_empty() {
+                        // Still emit immediately when we actually find spends (high-signal).
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧾 spend_detection_summary wallet_id={} height={} inputs_seen={} key_images_seen={} distinct_spend_txs={} outputs_total={} outputs_key_image_nonzero={} outputs_spent_pre={}",
+                            id,
+                            th,
+                            inputs_seen_in_block,
+                            key_images_seen_in_block,
+                            spent_inputs_by_txid.len(),
+                            outputs_total,
+                            outputs_with_key_image_nonzero,
+                            outputs_spent_true_pre
+                        );
+                    }
 
                     // Inspect transaction completeness before scanning.
                     {
@@ -5471,9 +6260,51 @@ pub extern "C" fn wallet_refresh(
                             .subaddress()
                             .map(|idx| (idx.account(), idx.address()))
                             .unwrap_or((0, 0));
+                        // Compute key image for this owned output so we can detect on-chain spends.
+                        let key_image_bytes: [u8; 32] = {
+                            // Convert monero-wallet Scalar (key_offset) into dalek scalar.
+                            let ko_bytes: [u8; 32] = <[u8; 32]>::from(output.key_offset());
+                            let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
+                                .into_option()
+                                .unwrap_or(curve25519_dalek::Scalar::ZERO);
+
+                            let a = master.spend_scalar;
+
+                            let m_dalek = if major == 0 && minor == 0 {
+                                curve25519_dalek::Scalar::ZERO
+                            } else {
+                                let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+                                data.extend_from_slice(b"SubAddr\0");
+                                data.extend_from_slice(&<[u8; 32]>::from(master.view_scalar_ed));
+                                data.extend_from_slice(&major.to_le_bytes());
+                                data.extend_from_slice(&minor.to_le_bytes());
+                                let m_ed: EdScalar = EdScalar::hash(&data);
+                                let m_d: curve25519_dalek::Scalar = m_ed.into();
+                                m_d
+                            };
+
+                            let x = a + ko_dalek + m_dalek;
+
+                            let p = output.key();
+                            let p_bytes = p.compress().to_bytes();
+                            let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
+                            let hp_p_bytes = hp_p.compress().to_bytes();
+
+                            use curve25519_dalek::traits::Identity;
+
+                            let hp_p_dalek =
+                                curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
+                                    .decompress()
+                                    .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
+
+                            let ki = hp_p_dalek * x;
+                            ki.compress().to_bytes()
+                        };
+
                         working_outputs.push(TrackedOutput {
                             tx_hash: output.transaction(),
                             index_in_tx: output.index_in_transaction(),
+                            key_image: key_image_bytes,
                             amount: output.commitment().amount,
                             block_height: th,
                             additional_timelock: output.additional_timelock(),
@@ -5481,7 +6312,9 @@ pub extern "C" fn wallet_refresh(
                             subaddress_major: major,
                             subaddress_minor: minor,
                             spent: false,
+                            spending_txid: None,
                         });
+
                         outputs_added_in_batch = outputs_added_in_batch.saturating_add(1);
                     }
 
@@ -5646,10 +6479,24 @@ pub extern "C" fn wallet_refresh(
                 // Convert nanos -> milliseconds for readability in logs
                 let ns_to_ms = |ns: u64| -> u64 { ns / 1_000_000 };
 
+                // Derived metrics:
+                // - ecdh_mul_us_per_miss: how expensive each ECDH scalar mul miss is (microseconds)
+                // - scan_us_per_output: how expensive scanning is per visited output (microseconds)
+                let ecdh_mul_us_per_miss = if mp.ecdh_cache_misses > 0 {
+                    (mp.ns_ecdh_mul as f64) / (mp.ecdh_cache_misses as f64) / 1_000.0
+                } else {
+                    0.0
+                };
+                let scan_us_per_output = if mp.outputs_visited > 0 {
+                    (mp.ns_scan_transaction as f64) / (mp.outputs_visited as f64) / 1_000.0
+                } else {
+                    0.0
+                };
+
                 walletcore_log!(
                     id,
                     snapshot.network,
-                    "🧬 scanner_microprof wallet_id={} blocks={} txs_scanned={} outputs_visited={} ecdh_derivations={} ecdh_cache_hits={} ecdh_cache_misses={} viewtag_mismatch={} commitment_verify_attempts={} commitment_verify_fail={} outputs_matched={} extra_parse_fail={} tx_keys_missing={} ms_block_setup={} ms_scan_transaction={} ms_commitment_verify={} ms_ecdh_mul={} ms_output_derivations={} ms_subaddress_lookup={}",
+                    "🧬 scanner_microprof wallet_id={} blocks={} txs_scanned={} outputs_visited={} ecdh_derivations={} ecdh_cache_hits={} ecdh_cache_misses={} viewtag_mismatch={} commitment_verify_attempts={} commitment_verify_fail={} outputs_matched={} extra_parse_fail={} tx_keys_missing={} ms_block_setup={} ms_scan_transaction={} ms_commitment_verify={} ms_ecdh_mul={} ms_ecdh_cache_lookup_hit={} ms_ecdh_cache_lookup_miss={} ms_output_derivations={} ms_subaddress_lookup={} ecdh_mul_us_per_miss={:.3} scan_us_per_output={:.3}",
                     id,
                     mp.blocks,
                     mp.txs_scanned,
@@ -5667,14 +6514,29 @@ pub extern "C" fn wallet_refresh(
                     ns_to_ms(mp.ns_scan_transaction),
                     ns_to_ms(mp.ns_commitment_verify),
                     ns_to_ms(mp.ns_ecdh_mul),
+                    ns_to_ms(mp.ns_ecdh_cache_lookup_hit),
+                    ns_to_ms(mp.ns_ecdh_cache_lookup_miss),
                     ns_to_ms(mp.ns_output_derivations),
-                    ns_to_ms(mp.ns_subaddress_lookup)
+                    ns_to_ms(mp.ns_subaddress_lookup),
+                    ecdh_mul_us_per_miss,
+                    scan_us_per_output
                 );
             }
         }
     }
 
-    working_outputs.retain(|output| !output.spent);
+    // IMPORTANT:
+    // Do NOT drop spent outputs here.
+    //
+    // If we remove spent outputs from `working_outputs`, we lose the ability to:
+    //  - show stable incoming history after an output is later spent
+    //  - compute outgoing ("-") transactions by attributing spends to their source outputs
+    //
+    // Balance computation below already naturally excludes spent outputs (we only sum unspent),
+    // but we still want spent outputs retained for history/ledger.
+    //
+    // NOTE: Any UI that shows "UTXOs" should filter by `spent == false`.
+    //working_outputs.retain(|output| !output.spent);
 
     // Overall performance log for this refresh
     if log_perf {
@@ -5690,14 +6552,74 @@ pub extern "C" fn wallet_refresh(
         }
     }
 
-    // Update stable transfer ledger based on observed outputs.
+    // Update stable transfer ledger based on observed outputs + spends.
     //
-    // - We keep history stable even after outputs are spent by persisting an aggregate per txid.
-    // - Incoming ("in"): sum all outputs seen for that txid (including coinbase).
-    // - Confirm pending outgoing ("out"):
-    //   1) heuristic: if we ever see an on-chain output with that txid (typically change), mark confirmed
-    //   2) fallback: query the daemon for tx existence by hash via json_rpc_call("get_transactions")
+    // Goals:
+    // - Keep incoming history stable even after outputs are spent (so we MUST keep spent outputs in working_outputs).
+    // - Emit outgoing ("out") entries when we detect spends via key-image matching, so the UI can show Feather-like "-" txs.
+    //
+    // Current outgoing semantics:
+    // - We record "gross spent" (sum of our inputs spent by txid) as `amount` with direction "out".
+    // - Fee attribution is not computed here yet (fee remains None).
+    //
+    // NOTE: Net-sent (subtracting change) can be added later by detecting change outputs for the same spending txid
+    // and subtracting them from gross. For now, gross provides the missing "-" rows and is a clear debugging signal.
     let mut computed_ledger: HashMap<String, LedgerEntry> = snapshot.tx_ledger.clone();
+
+    // 1) Outgoing detection from spends:
+    // If any of our outputs are marked spent and have a spending_txid, aggregate them by spending txid.
+    {
+        let mut gross_spent_by_spend_txid: HashMap<String, u64> = HashMap::new();
+
+        for o in &working_outputs {
+            if o.spent {
+                // If we can't attribute a spending txid, we can't create a stable outgoing row.
+                // (The spend detection code logs spending_txid=(unknown) in that case.)
+                if let Some(spend_txid_bytes) = o.spending_txid {
+                    let spend_txid = hex_lowercase(&spend_txid_bytes);
+                    let e = gross_spent_by_spend_txid.entry(spend_txid).or_insert(0);
+                    *e = e.saturating_add(o.amount);
+                }
+            }
+        }
+
+        for (spend_txid, gross_amount) in gross_spent_by_spend_txid {
+            match computed_ledger.get_mut(&spend_txid) {
+                Some(entry) => {
+                    // If we already have an outgoing entry (e.g., from a locally-sent pending tx), update amount if missing.
+                    if entry.direction == "out" {
+                        entry.amount = entry.amount.max(gross_amount);
+                        if entry.fee.is_none() {
+                            entry.fee = None;
+                        }
+                        // height/timestamp will be filled opportunistically below if we see any on-chain outputs for this txid.
+                    }
+                    // If it's an "in" entry (rare collision), do not overwrite direction.
+                }
+                None => {
+                    computed_ledger.insert(
+                        spend_txid.clone(),
+                        LedgerEntry {
+                            txid: spend_txid,
+                            direction: "out".to_string(),
+                            amount: gross_amount,
+                            fee: None,
+                            height: None,
+                            timestamp: None,
+                            is_pending: false,
+                            is_coinbase: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // 2) Incoming aggregation from outputs (coinbase included), and opportunistic confirmation of outgoing:
+    //
+    // - Incoming ("in"): sum all outputs seen for that txid.
+    // - Confirm pending outgoing ("out"):
+    //   If this txid exists as pending outgoing, seeing it on-chain is enough to confirm it (common case: change).
     for o in &working_outputs {
         let txid = hex_lowercase(&o.tx_hash);
 
@@ -5718,7 +6640,7 @@ pub extern "C" fn wallet_refresh(
             }
         }
 
-        // Aggregate incoming amounts (coinbase included) irrespective of spent status.
+        // Aggregate incoming amounts.
         // If an outgoing record exists, we do NOT overwrite direction; we only allow "in" creation for unknown txids.
         match computed_ledger.get_mut(&txid) {
             Some(entry) => {
@@ -6124,6 +7046,12 @@ pub extern "C" fn wallet_force_rescan_from_height(
             state.tracked_outputs.clear();
             state.seen_outpoints.clear();
 
+            // IMPORTANT: a forced rescan resets our view of wallet state. Any "pending outgoing"
+            // records are now untrustworthy (they may refer to txs we won't rediscover until refresh,
+            // or may cause us to exclude/consider outputs incorrectly). Clear them so sweep/input
+            // selection doesn't accidentally treat unconfirmed change as safely spendable.
+            state.pending_outgoing.clear();
+
             clear_last_error();
             0
         }
@@ -6162,6 +7090,28 @@ pub extern "C" fn wallet_import_cache(
     match map.get_mut(id) {
         Some(state) => {
             persisted.apply_to_state(state);
+
+            // Defensive: older caches or older runtime state may not have initialized the ledger.
+            // Ensure it exists so transfer history can be built deterministically.
+            if state.tx_ledger.is_empty() {
+                state.tx_ledger = HashMap::new();
+            }
+
+            // Invariant enforcement:
+            // Cache blobs may have been exported mid-refresh (or from older versions), which can result in
+            // tracked outputs/ledger being present while total/unlocked are stale (e.g., 0).
+            // Recompute balances from the imported tracked outputs using the imported chain height/time.
+            let mut total: u64 = 0;
+            let mut unlocked: u64 = 0;
+            for o in state.tracked_outputs.iter() {
+                total = total.saturating_add(o.amount);
+                if o.is_unlocked(state.chain_height, state.chain_time) {
+                    unlocked = unlocked.saturating_add(o.amount);
+                }
+            }
+            state.total = total;
+            state.unlocked = unlocked;
+
             clear_last_error();
             0
         }
@@ -6571,15 +7521,27 @@ pub extern "C" fn wallet_send(
         }
     }
 
-    // Choose spendable outputs (unspent and unlocked)
+    // Choose spendable outputs (unspent and unlocked), excluding any quarantined outpoints
+    // that previously triggered daemon `invalid_input=true`.
     let mut spendable = snapshot
         .tracked_outputs
         .iter()
         .cloned()
         .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| {
+            !snapshot
+                .invalid_input_quarantine
+                .contains(&(o.tx_hash, o.index_in_tx))
+        })
         .collect::<Vec<_>>();
-    // Sort by amount ascending to minimize change fragmentation
-    spendable.sort_by_key(|o| o.amount);
+
+    // Input selection order:
+    // - smallest_first (default): may create many-input txs when wallet has many small outputs
+    // - largest_first: reduces input count and fee (useful for debugging reliability)
+    match walletcore_input_select_mode() {
+        InputSelectMode::SmallestFirst => spendable.sort_by_key(|o| o.amount),
+        InputSelectMode::LargestFirst => spendable.sort_by(|a, b| b.amount.cmp(&a.amount)),
+    }
 
     // We must select enough to cover (amount + fee). Fee depends on input count, so iterate.
     let mut rng = OsRng;
@@ -6587,8 +7549,9 @@ pub extern "C" fn wallet_send(
 
     // Fetch fee rate once (upstream monero-interface)
     let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
     let fee_rate: FeeRate =
-        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
                 let code = match e {
@@ -6683,25 +7646,76 @@ pub extern "C" fn wallet_send(
                 }
             };
 
-            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-                &mut rng,
-                &rpc_client,
-                ring_len_eff,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-                wallet_out,
-            )) {
-                Ok(i) => i,
-                Err(err) => {
-                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                    let code = match err {
-                        monero_interface::TransactionsError::InterfaceError(inner) => {
-                            map_rpc_error(inner)
-                        }
-                        monero_interface::TransactionsError::TransactionNotFound => -16,
-                        monero_interface::TransactionsError::PrunedTransaction => -16,
-                    };
-                    record_error(code, "wallet_send: decoy selection failed");
-                    return ptr::null_mut();
+            // Decoy selection backend:
+            // - default: use the current upstream RPC client (may fail on some nodes)
+            // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (with histogram fallback in wallet decoys)
+            let with_decoys = if walletcore_decoy_mode_bin16() {
+                // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                let ring_len_eff: u8 = 16;
+                let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let code = map_rpc_error(e.clone());
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_send: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &daemon_iface,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_send: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
+                }
+            } else {
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &rpc_client,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                        //
+                        // IMPORTANT: match by reference so we can both map the error code and also include
+                        // a debug representation in the message without partially moving inner values.
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_send: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
                 }
             };
 
@@ -6724,6 +7738,37 @@ pub extern "C" fn wallet_send(
         ) {
             Ok(tx) => tx,
             Err(e) => {
+                // IMPORTANT: "not enough funds" here usually means "not enough inputs were selected
+                // to cover amount + fee". Fee depends on tx weight (and thus number of inputs), so
+                // this must be treated as a recoverable state by selecting more inputs and retrying.
+                let msg = e.to_string();
+                if msg.contains("not enough funds") {
+                    let mut added_any = false;
+                    for o in &spendable {
+                        if selected_tracked
+                            .iter()
+                            .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+                        {
+                            continue;
+                        }
+                        selected_tracked.push(o.clone());
+                        selected_sum = selected_sum.saturating_add(o.amount);
+                        added_any = true;
+                        break; // add one, then retry building to get an accurate fee
+                    }
+                    if !added_any {
+                        record_error(
+                            -18,
+                            format!(
+                                "wallet_send: insufficient unlocked funds for amount+fee (have {}, need at least {})",
+                                selected_sum, amount_piconero
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                    continue;
+                }
+
                 record_error(
                     -16,
                     format!("wallet_send: transaction construction failed ({e})"),
@@ -6822,25 +7867,76 @@ pub extern "C" fn wallet_send(
             }
         };
 
-        let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-            &mut rng,
-            &rpc_client,
-            ring_len_eff,
-            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-            wallet_out,
-        )) {
-            Ok(i) => i,
-            Err(err) => {
-                // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                let code = match err {
-                    monero_interface::TransactionsError::InterfaceError(inner) => {
-                        map_rpc_error(inner)
-                    }
-                    monero_interface::TransactionsError::TransactionNotFound => -16,
-                    monero_interface::TransactionsError::PrunedTransaction => -16,
-                };
-                record_error(code, "wallet_send: decoy selection failed");
-                return ptr::null_mut();
+        // Decoy selection backend:
+        // - default: use the current upstream RPC client (may fail on some nodes)
+        // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (with histogram fallback in wallet decoys)
+        let with_decoys = if walletcore_decoy_mode_bin16() {
+            // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+            let ring_len_eff: u8 = 16;
+            let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                Ok(d) => d,
+                Err(e) => {
+                    let code = map_rpc_error(e.clone());
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &daemon_iface,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_send: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        } else {
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    //
+                    // IMPORTANT: match by reference so we can both map the error code and also include
+                    // a debug representation in the message without partially moving inner values.
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_send: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
             }
         };
 
@@ -6856,7 +7952,7 @@ pub extern "C" fn wallet_send(
         Zeroizing::new(ovk),
         inputs,
         vec![(recipient_address, amount_piconero)],
-        change,
+        change.clone(),
         Vec::new(),
         fee_rate,
     ) {
@@ -6882,16 +7978,257 @@ pub extern "C" fn wallet_send(
         }
     };
 
-    // Broadcast (upstream monero-interface)
-    if let Err(err) = TOKIO_RUNTIME.block_on(rpc_client.publish_transaction(&tx)) {
-        // PublishTransactionError wraps InterfaceError for transport/protocol issues.
-        let code = match err {
-            monero_interface::PublishTransactionError::InterfaceError(inner) => {
-                map_rpc_error(inner)
+    // Broadcast: use monerod's `/send_raw_transaction` endpoint (NOT JSON-RPC),
+    // since this daemon returns "Method not found" for JSON-RPC `send_raw_transaction`.
+    let tx_blob = tx.serialize();
+    if let Err(err) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+        let code = map_rpc_error(err.clone());
+        let msg = format!("wallet_send: send_raw_transaction failed ({err})");
+
+        // Diagnostics: log the exact selected inputs so we can correlate with invalid_input and bisect results.
+        walletcore_log!(
+            id,
+            snapshot.network,
+            "🧾 send selected_inputs wallet_id={} selected_count={} selected_sum={} inputs={}",
+            id,
+            selected_tracked.len(),
+            selected_sum,
+            selected_tracked
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{}:{}@{}:{}",
+                        hex_lowercase(&o.tx_hash),
+                        o.index_in_tx,
+                        o.block_height,
+                        o.amount
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join(",")
+        );
+
+        // Optional detailed dump for diagnosing daemon invalid_input rejections.
+        walletcore_debug_dump_tracked_outputs(
+            id,
+            snapshot.network,
+            "send selected_input_dump",
+            &selected_tracked,
+            daemon.height,
+            daemon.top_block_timestamp,
+        );
+
+        // Optional: bisect to find a problematic input when the daemon rejects the tx.
+        //
+        // - Default: only bisect on `invalid_input=true` (high signal).
+        // - Optional: bisect on any `status=Failed` (some nodes don't set flags consistently).
+        let should_bisect = walletcore_send_bisect_enabled()
+            && (is_invalid_input_send_raw_tx_error(&msg)
+                || (walletcore_send_bisect_on_failed_enabled()
+                    && is_failed_send_raw_tx_error(&msg)));
+
+        if should_bisect {
+            // Bounded bisect search: attempt to construct+sign+broadcast subsets to isolate the offending input.
+            // Best-effort debugging; we stop after a short time budget.
+            let start = Instant::now();
+            let budget = Duration::from_secs(20);
+
+            // Prefer larger inputs first so subsets are more likely to be constructible.
+            let mut all = selected_tracked.clone();
+            all.sort_by(|a, b| b.amount.cmp(&a.amount));
+
+            // Helper: try broadcasting a tx built from a candidate subset of tracked outputs.
+            let mut try_subset = |subset: &[TrackedOutput]| -> Result<(), String> {
+                // Build inputs with decoys (reconstruct wallet outputs from chain).
+                let mut rng = OsRng;
+                let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+
+                for t in subset {
+                    let block_number = usize::try_from(t.block_height)
+                        .map_err(|_| "block number conversion overflow".to_string())?;
+                    let scannable = TOKIO_RUNTIME
+                        .block_on(rpc_client.scannable_block_by_number(block_number))
+                        .map_err(|e| {
+                            format!(
+                                "RPC block fetch failed at height {} ({})",
+                                t.block_height, e
+                            )
+                        })?;
+                    let outputs = scanner
+                        .scan(scannable)
+                        .map_err(|_| format!("scanner failed at height {}", t.block_height))?
+                        .ignore_additional_timelock();
+                    let wallet_out = outputs
+                        .into_iter()
+                        .find(|wo| {
+                            wo.transaction() == t.tx_hash
+                                && wo.index_in_transaction() == t.index_in_tx
+                        })
+                        .ok_or_else(|| "failed to reconstruct selected output".to_string())?;
+
+                    let with_decoys = if walletcore_decoy_mode_bin16() {
+                        // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                        let ring_len_eff: u8 = 16;
+                        let daemon_iface = TOKIO_RUNTIME
+                            .block_on(make_bin_decoy_daemon(&base_url))
+                            .map_err(|e| {
+                                format!("failed to construct bin16 decoy daemon ({})", e)
+                            })?;
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut rng,
+                                &daemon_iface,
+                                ring_len_eff,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed ({:?})", e))?
+                    } else {
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut rng,
+                                &rpc_client,
+                                ring_len_eff,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed ({:?})", e))?
+                    };
+
+                    inputs.push(with_decoys);
+                }
+
+                // New OVK each attempt (matches the main send path behavior)
+                let mut ovk = [0u8; 32];
+                rng.fill_bytes(&mut ovk);
+
+                // Build a candidate tx. If subset doesn't have enough funds for amount+fee, treat as non-signal.
+                let intent = monero_wallet::send::SignableTransaction::new(
+                    monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+                    Zeroizing::new(ovk),
+                    inputs,
+                    vec![(recipient_address, amount_piconero)],
+                    change.clone(),
+                    Vec::new(),
+                    fee_rate,
+                )
+                .map_err(|e| format!("construct failed ({e})"))?;
+
+                // Sign using the same mechanism as the main send path.
+                let spend_key =
+                    Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+                let mut signer_rng = OsRng;
+                let tx = intent
+                    .sign(&mut signer_rng, &spend_key)
+                    .map_err(|e| format!("sign failed ({e})"))?;
+
+                let tx_blob = tx.serialize();
+                match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(format!(
+                        "broadcast failed ({}): {}",
+                        if is_invalid_input_send_raw_tx_error(&format!("{e}")) {
+                            "invalid_input"
+                        } else if walletcore_send_bisect_on_failed_enabled()
+                            && is_failed_send_raw_tx_error(&format!("{e}"))
+                        {
+                            "failed"
+                        } else {
+                            "other"
+                        },
+                        e
+                    )),
+                }
+            };
+
+            // Bisect: find a smallest subset which reproduces invalid_input. Ignore non-signal failures.
+            let mut lo = 0usize;
+            let mut hi = all.len();
+            let mut last_err: Option<String> = None;
+
+            while start.elapsed() < budget && lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                let subset = &all[..mid];
+                match try_subset(subset) {
+                    Ok(()) => {
+                        // This subset did not reproduce invalid_input; move to the other half.
+                        lo = mid.max(lo + 1);
+                    }
+                    Err(e) => {
+                        let is_signal = e.contains("broadcast failed (invalid_input):")
+                            || (walletcore_send_bisect_on_failed_enabled()
+                                && e.contains("broadcast failed (failed):"));
+
+                        if is_signal {
+                            last_err = Some(e);
+                            hi = mid.max(lo + 1);
+                        } else {
+                            // Not our signal; skip past this chunk.
+                            lo = mid.max(lo + 1);
+                        }
+                    }
+                }
             }
-            _ => -16,
-        };
-        record_error(code, "wallet_send: publish_transaction failed");
+
+            if hi <= all.len() && hi > 0 {
+                let bad = &all[hi - 1];
+                walletcore_log!(
+                    id,
+                    snapshot.network,
+                    "🧨 send_bisect: candidate invalid_input output wallet_id={} txid={} index_in_tx={} height={} amount_piconero={} err={}",
+                    id,
+                    hex_dump_prefix(&bad.tx_hash, 32),
+                    bad.index_in_tx,
+                    bad.block_height,
+                    bad.amount,
+                    last_err.clone().unwrap_or_else(|| "(none)".to_string())
+                );
+
+                // Quarantine this outpoint so future sends/fee previews avoid it.
+                // This is a safety net: if spend detection is lagging or the node view is inconsistent,
+                // we still want the wallet to make progress by skipping toxic inputs.
+                let mut newly_inserted = false;
+                if let Ok(mut map) = WALLET_STORE.lock() {
+                    if let Some(state) = map.get_mut(id) {
+                        let key = (bad.tx_hash, bad.index_in_tx);
+                        newly_inserted = state.invalid_input_quarantine.insert(key);
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧾 invalid_input_quarantine {} wallet_id={} out={} quarantine_size={}",
+                            if newly_inserted {
+                                "added"
+                            } else {
+                                "already_present"
+                            },
+                            id,
+                            format!("{}:{}", hex_lowercase(&bad.tx_hash), bad.index_in_tx),
+                            state.invalid_input_quarantine.len()
+                        );
+                    }
+                }
+
+                // One-shot retry: if we quarantined something, try once more.
+                // This avoids bricking the user on a single toxic input.
+                if newly_inserted {
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧾 wallet_send retrying after invalid_input quarantine wallet_id={} quarantined_out={}",
+                        id,
+                        format!("{}:{}", hex_lowercase(&bad.tx_hash), bad.index_in_tx)
+                    );
+
+                    record_error(
+                        code,
+                        "wallet_send: broadcast failed with invalid_input; quarantined offending outpoint; retry send",
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        }
+
+        record_error(code, msg);
         return ptr::null_mut();
     }
 
@@ -6929,6 +8266,18 @@ pub extern "C" fn wallet_send(
                 fee: fee_piconero,
                 created_at: state.chain_time,
             });
+
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧾 pending_outgoing recorded wallet_id={} txid={} amount_piconero={} fee_piconero={} created_at={} pending_outgoing_count={}",
+                id,
+                hex,
+                amount_piconero,
+                fee_piconero,
+                state.chain_time,
+                state.pending_outgoing.len()
+            );
 
             // Update stable transfer ledger (outgoing is pending until confirmed by refresh).
             state.tx_ledger.insert(
@@ -7132,7 +8481,23 @@ pub extern "C" fn wallet_preview_fee(
         .iter()
         .cloned()
         .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| {
+            !snapshot
+                .invalid_input_quarantine
+                .contains(&(o.tx_hash, o.index_in_tx))
+        })
         .collect::<Vec<_>>();
+    spendable.sort_by_key(|o| o.amount);
+
+    // Optional diagnostics: show the universe of spendable outputs the preview selection will draw from.
+    walletcore_debug_dump_tracked_outputs(
+        id,
+        snapshot.network,
+        "preview_fee spendable_input_dump",
+        &spendable,
+        daemon.height,
+        daemon.top_block_timestamp,
+    );
     spendable.sort_by_key(|o| o.amount);
 
     // Build inputs with decoys
@@ -7141,8 +8506,9 @@ pub extern "C" fn wallet_preview_fee(
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
     let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
     let fee_rate: FeeRate =
-        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
                 let code = match e {
@@ -7153,6 +8519,59 @@ pub extern "C" fn wallet_preview_fee(
                 return ptr::null_mut();
             }
         };
+
+    // Debug toggle: allow preview flows to run without fetching decoys so we can isolate
+    // decoy-selection failures vs other RPC/scan issues.
+    if walletcore_disable_decoys() {
+        walletcore_log!(
+        id,
+        snapshot.network,
+        "🧪 WALLETCORE_DISABLE_DECOYS=1: preview_fee returning placeholder fee without decoy selection wallet_id={} base_url={}",
+        id,
+        base_url
+    );
+        let placeholder_fee: u64 = 30_700_000; // 0.000030700000 XMR in piconero (deterministic placeholder)
+        let json = match serde_json::to_string(&serde_json::json!({ "fee": placeholder_fee })) {
+            Ok(s) => s,
+            Err(err) => {
+                record_error(
+                    -16,
+                    format!("wallet_preview_fee: result JSON serialization failed ({err})"),
+                );
+                return ptr::null_mut();
+            }
+        };
+        return match CString::new(json) {
+            Ok(cstr) => {
+                clear_last_error();
+                cstr.into_raw()
+            }
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_preview_fee: result JSON contained interior null bytes",
+                );
+                ptr::null_mut()
+            }
+        };
+    }
+
+    // Decoy provider mode toggle (bin16).
+    //
+    // When enabled, we switch decoy selection to the monero-daemon-rpc provider which uses
+    // binary RPC (bin_rpc) for decoy selection (get_output_distribution.bin + get_outs.bin).
+    //
+    // This keeps transaction building in monero-wallet intact while swapping only the decoy
+    // provider backend, matching wallet2/CLI behavior.
+    if walletcore_decoy_mode_bin16() {
+        walletcore_log!(
+            id,
+            snapshot.network,
+            "🧪 WALLETCORE_DECOY_MODE=bin16 enabled: preview_fee will use monero-daemon-rpc (bin_rpc) decoy provider wallet_id={} base_url={}",
+            id,
+            base_url
+        );
+    }
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
@@ -7167,6 +8586,19 @@ pub extern "C" fn wallet_preview_fee(
     let mut last_needed_total: Option<u64> = None;
 
     for round in 0..max_selection_rounds {
+        if walletcore_debug_input_dump_enabled() {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧾 preview_fee selection_round wallet_id={} round={} selected_count={} selected_sum={} total_needed={}",
+                id,
+                round,
+                selected.len(),
+                selected_sum,
+                total_needed
+            );
+        }
+
         // Ensure we have at least enough selected for the destination totals on first pass.
         if selected.is_empty() {
             for o in &spendable {
@@ -7186,6 +8618,16 @@ pub extern "C" fn wallet_preview_fee(
                 );
                 return ptr::null_mut();
             }
+
+            // Optional diagnostics: show the initial selection used to begin iterative fee convergence.
+            walletcore_debug_dump_tracked_outputs(
+                id,
+                snapshot.network,
+                "preview_fee selected_input_dump (initial)",
+                &selected,
+                daemon.height,
+                daemon.top_block_timestamp,
+            );
         }
 
         // Rebuild inputs for current selection (needed to estimate fee accurately)
@@ -7239,25 +8681,143 @@ pub extern "C" fn wallet_preview_fee(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-                &mut rng,
-                &rpc_client,
-                ring_len_eff,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-                wallet_out,
-            )) {
-                Ok(i) => i,
-                Err(err) => {
-                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                    let code = match err {
-                        monero_interface::TransactionsError::InterfaceError(inner) => {
-                            map_rpc_error(inner)
+            // Decoy selection backend:
+            // - default: use the current upstream RPC client (may fail on some nodes)
+            // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (wallet2-style decoys)
+            let with_decoys = if walletcore_decoy_mode_bin16() {
+                // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                let ring_len_eff: u8 = 16;
+                let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let code = map_rpc_error(e.clone());
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_preview_fee: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+
+                // Diagnostics: prove what concrete type we constructed and whether its decoy methods work.
+                walletcore_log!(
+                    id,
+                    snapshot.network,
+                    "🧪 bin16 daemon_iface type wallet_id={} type={}",
+                    id,
+                    core::any::type_name_of_val(&daemon_iface)
+                );
+
+                // Probe: ringct output distribution for a tiny range. This should exercise bin_rpc.
+                // We keep it small and ignore the result beyond logging.
+                //
+                // If it fails (some daemons return -5 "Failed to get output distribution"), we
+                // fetch output_histogram(total_instances) and (in the next step) will use that as
+                // the bound for uniform decoy sampling.
+                match TOKIO_RUNTIME
+                    .block_on(daemon_iface.ringct_output_distribution(0usize..=1usize))
+                {
+                    Ok(dist) => {
+                        let last = dist.last().copied().unwrap_or(0);
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧪 bin16 ringct_output_distribution ok wallet_id={} len={} last={}",
+                            id,
+                            dist.len(),
+                            last
+                        );
+                    }
+                    Err(e) => {
+                        walletcore_log!(
+                            id,
+                            snapshot.network,
+                            "🧪 bin16 ringct_output_distribution err wallet_id={} err={}",
+                            id,
+                            e
+                        );
+
+                        match TOKIO_RUNTIME
+                            .block_on(ringct_total_instances_via_histogram(&daemon_iface))
+                        {
+                            Ok(total_instances) => {
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "⚠️ bin16 decoys: falling back to output_histogram total_instances={} wallet_id={}",
+                                    total_instances,
+                                    id
+                                );
+                                // NOTE: This value will be used as the `[0, N)` bound for uniform
+                                // decoy sampling in the bin16 fallback provider.
+                                let _ = total_instances;
+                            }
+                            Err(e2) => {
+                                walletcore_log!(
+                                    id,
+                                    snapshot.network,
+                                    "⚠️ bin16 decoys: output_histogram fallback failed wallet_id={} err={}",
+                                    id,
+                                    e2
+                                );
+                            }
                         }
-                        monero_interface::TransactionsError::TransactionNotFound => -16,
-                        monero_interface::TransactionsError::PrunedTransaction => -16,
-                    };
-                    record_error(code, "wallet_preview_fee: decoy selection failed");
-                    return ptr::null_mut();
+                    }
+                }
+
+                // Proceed with transaction construction attempt regardless of probe result.
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &daemon_iface,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_preview_fee: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
+                }
+            } else {
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &rpc_client,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                        //
+                        // IMPORTANT: match by reference so we can both map the error code and also include
+                        // a debug representation in the message without partially moving inner values.
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_preview_fee: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
                 }
             };
             inputs.push(with_decoys);
@@ -7278,8 +8838,47 @@ pub extern "C" fn wallet_preview_fee(
         ) {
             Ok(tx) => tx,
             Err(e) => {
-                // If we fail due to not enough funds, we can try selecting more.
-                // For other construction errors, surface the error.
+                // If we fail due to "not enough funds", that's a *recoverable* intermediate state
+                // during fee estimation (we may simply need to add more inputs).
+                //
+                // Do NOT call `record_error` for this case, otherwise the UI can show an error even
+                // if a later iteration succeeds and returns a fee.
+                let msg = e.to_string();
+                if msg.contains("not enough funds") {
+                    // Add one more input (if available) and retry. We intentionally avoid trying to
+                    // compute a meaningful `needed_total` here since fee depends on tx weight; the
+                    // next iteration will recompute fee with the expanded selection.
+                    let mut added_any = false;
+                    for o in &spendable {
+                        if selected
+                            .iter()
+                            .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+                        {
+                            continue;
+                        }
+                        selected.push(o.clone());
+                        selected_sum = selected_sum.saturating_add(o.amount);
+                        added_any = true;
+                        break;
+                    }
+
+                    if !added_any {
+                        // We exhausted all spendable inputs. At this point we can’t improve the input
+                        // set, so this preview must fail. Record a consistent message and return.
+                        record_error(
+                            -18,
+                            format!(
+                                "wallet_preview_fee: insufficient unlocked funds for amount+fee (have {}, need at least {})",
+                                selected_sum, total_needed
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+
+                    // Retry with expanded selection.
+                    continue;
+                }
+
                 record_error(
                     -16,
                     format!("wallet_preview_fee: transaction construction failed ({e})"),
@@ -7293,6 +8892,18 @@ pub extern "C" fn wallet_preview_fee(
 
         // If we already cover amount+fee, we're done: return fee.
         if selected_sum >= needed_total {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "✅ wallet_preview_fee ok wallet_id={} inputs_selected={} inputs_sum={} total_needed={} fee={} needed_total={}",
+                id,
+                selected.len(),
+                selected_sum,
+                total_needed,
+                fee,
+                needed_total
+            );
+
             let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
                 Ok(s) => s,
                 Err(err) => {
@@ -7346,6 +8957,7 @@ pub extern "C" fn wallet_preview_fee(
         }
 
         if !added_any {
+            // We exhausted all spendable inputs. Report the last computed (amount+fee) requirement.
             record_error(
                 -18,
                 format!(
@@ -7559,7 +9171,13 @@ pub extern "C" fn wallet_send_with_filter(
             spendable.retain(|o| o.subaddress_major == 0 && o.subaddress_minor == minor);
         }
     }
-    spendable.sort_by_key(|o| o.amount);
+    // Input selection order:
+    // - smallest_first (default): may create many-input txs when wallet has many small outputs
+    // - largest_first: reduces input count and fee (useful for debugging reliability)
+    match walletcore_input_select_mode() {
+        InputSelectMode::SmallestFirst => spendable.sort_by_key(|o| o.amount),
+        InputSelectMode::LargestFirst => spendable.sort_by(|a, b| b.amount.cmp(&a.amount)),
+    }
 
     // IMPORTANT: select enough inputs to cover (destinations + fee).
     // Fee depends on input count, so selection is iterative until it stabilizes.
@@ -7568,8 +9186,9 @@ pub extern "C" fn wallet_send_with_filter(
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
     let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
     let fee_rate: FeeRate =
-        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
                 let code = match e {
@@ -7665,25 +9284,76 @@ pub extern "C" fn wallet_send_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-                &mut rng,
-                &rpc_client,
-                ring_len_eff,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-                wallet_out,
-            )) {
-                Ok(i) => i,
-                Err(err) => {
-                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                    let code = match err {
-                        monero_interface::TransactionsError::InterfaceError(inner) => {
-                            map_rpc_error(inner)
-                        }
-                        monero_interface::TransactionsError::TransactionNotFound => -16,
-                        monero_interface::TransactionsError::PrunedTransaction => -16,
-                    };
-                    record_error(code, "wallet_send_with_filter: decoy selection failed");
-                    return ptr::null_mut();
+            // Decoy selection backend:
+            // - default: use the current upstream RPC client (may fail on some nodes)
+            // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (with histogram fallback in wallet decoys)
+            let with_decoys = if walletcore_decoy_mode_bin16() {
+                // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                let ring_len_eff: u8 = 16;
+                let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let code = map_rpc_error(e.clone());
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_send_with_filter: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &daemon_iface,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_send_with_filter: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
+                }
+            } else {
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &rpc_client,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                        //
+                        // IMPORTANT: match by reference so we can both map the error code and also include
+                        // a debug representation in the message without partially moving inner values.
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!("wallet_send_with_filter: decoy selection failed ({err:?})"),
+                        );
+                        return ptr::null_mut();
+                    }
                 }
             };
             inputs.push(with_decoys);
@@ -7704,6 +9374,40 @@ pub extern "C" fn wallet_send_with_filter(
         ) {
             Ok(tx) => tx,
             Err(e) => {
+                // IMPORTANT: "not enough funds" here usually means "not enough inputs were selected
+                // to cover destinations + fee". Fee depends on tx weight (and thus number of inputs),
+                // so this must be treated as a recoverable state by selecting more inputs and retrying.
+                let msg = e.to_string();
+                if msg.contains("not enough funds") {
+                    let mut added_any = false;
+                    for o in &spendable {
+                        // Skip already selected
+                        if selected
+                            .iter()
+                            .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+                        {
+                            continue;
+                        }
+                        selected.push(o.clone());
+                        selected_sum = selected_sum.saturating_add(o.amount);
+                        added_any = true;
+                        break; // add one, then retry building to get an accurate fee
+                    }
+
+                    if !added_any {
+                        record_error(
+                            -18,
+                            format!(
+                                "wallet_send_with_filter: insufficient unlocked funds for amount+fee (have {}, need at least {})",
+                                selected_sum, total_needed
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+
+                    continue;
+                }
+
                 record_error(
                     -16,
                     format!("wallet_send_with_filter: transaction construction failed ({e})"),
@@ -7802,39 +9506,93 @@ pub extern "C" fn wallet_send_with_filter(
                 return ptr::null_mut();
             }
         };
-        let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-            &mut rng,
-            &rpc_client,
-            ring_len_eff,
-            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-            wallet_out,
-        )) {
-            Ok(i) => i,
-            Err(err) => {
-                // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                let code = match err {
-                    monero_interface::TransactionsError::InterfaceError(inner) => {
-                        map_rpc_error(inner)
-                    }
-                    monero_interface::TransactionsError::TransactionNotFound => -16,
-                    monero_interface::TransactionsError::PrunedTransaction => -16,
-                };
-                record_error(code, "wallet_send_with_filter: decoy selection failed");
-                return ptr::null_mut();
+
+        // Decoy selection backend:
+        // - default: use the current upstream RPC client (may fail on some nodes)
+        // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (with histogram fallback in wallet decoys)
+        let with_decoys = if walletcore_decoy_mode_bin16() {
+            // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+            let ring_len_eff: u8 = 16;
+            let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                Ok(d) => d,
+                Err(e) => {
+                    let code = map_rpc_error(e.clone());
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send_with_filter: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &daemon_iface,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_send_with_filter: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        } else {
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                    //
+                    // IMPORTANT: match by reference so we can both map the error code and also include
+                    // a debug representation in the message without partially moving inner values.
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_send_with_filter: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
             }
         };
+
         inputs.push(with_decoys);
     }
 
     let mut ovk = [0u8; 32];
     rng.fill_bytes(&mut ovk);
 
+    // NOTE: Keep `destinations` and `change` available for optional send-bisect debugging below.
     let intent = match monero_wallet::send::SignableTransaction::new(
         monero_wallet::ringct::RctType::ClsagBulletproofPlus,
         Zeroizing::new(ovk),
         inputs,
-        destinations,
-        change,
+        destinations.clone(),
+        change.clone(),
         Vec::new(),
         fee_rate,
     ) {
@@ -7862,15 +9620,168 @@ pub extern "C" fn wallet_send_with_filter(
         }
     };
 
-    if let Err(err) = TOKIO_RUNTIME.block_on(rpc_client.publish_transaction(&tx)) {
-        // PublishTransactionError wraps InterfaceError for transport/protocol issues.
-        let code = match err {
-            monero_interface::PublishTransactionError::InterfaceError(inner) => {
-                map_rpc_error(inner)
+    // Broadcast: use monerod's `/send_raw_transaction` endpoint (NOT JSON-RPC),
+    // since this daemon returns "Method not found" for JSON-RPC `send_raw_transaction`.
+    let tx_blob = tx.serialize();
+    if let Err(err) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+        let code = map_rpc_error(err.clone());
+        let msg = format!("wallet_send_with_filter: send_raw_transaction failed ({err})");
+
+        // Optional: bisect to find a problematic input when the daemon reports invalid_input=true.
+        if walletcore_send_bisect_enabled() && is_invalid_input_send_raw_tx_error(&msg) {
+            // Bounded bisect search: attempt to construct+sign+broadcast subsets to isolate the offending input.
+            // Best-effort debugging; we stop after a short time budget.
+            let start = Instant::now();
+            let budget = Duration::from_secs(20);
+
+            // Prefer larger inputs first so subsets are more likely to be constructible.
+            let mut all = selected.clone();
+            all.sort_by(|a, b| b.amount.cmp(&a.amount));
+
+            // Helper: try broadcasting a tx built from a candidate subset of tracked outputs.
+            let mut try_subset = |subset: &[TrackedOutput]| -> Result<(), String> {
+                // Build inputs with decoys (reconstruct wallet outputs from chain).
+                let mut rng = OsRng;
+                let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+
+                for t in subset {
+                    let block_number = usize::try_from(t.block_height)
+                        .map_err(|_| "block number conversion overflow".to_string())?;
+                    let scannable = TOKIO_RUNTIME
+                        .block_on(rpc_client.scannable_block_by_number(block_number))
+                        .map_err(|e| {
+                            format!(
+                                "RPC block fetch failed at height {} ({})",
+                                t.block_height, e
+                            )
+                        })?;
+                    let outputs = scanner
+                        .scan(scannable)
+                        .map_err(|_| format!("scanner failed at height {}", t.block_height))?
+                        .ignore_additional_timelock();
+                    let wallet_out = outputs
+                        .into_iter()
+                        .find(|wo| {
+                            wo.transaction() == t.tx_hash
+                                && wo.index_in_transaction() == t.index_in_tx
+                        })
+                        .ok_or_else(|| "failed to reconstruct selected output".to_string())?;
+
+                    let with_decoys = if walletcore_decoy_mode_bin16() {
+                        // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                        let ring_len_eff: u8 = 16;
+                        let daemon_iface = TOKIO_RUNTIME
+                            .block_on(make_bin_decoy_daemon(&base_url))
+                            .map_err(|e| {
+                                format!("failed to construct bin16 decoy daemon ({})", e)
+                            })?;
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut rng,
+                                &daemon_iface,
+                                ring_len_eff,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed ({:?})", e))?
+                    } else {
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut rng,
+                                &rpc_client,
+                                ring_len_eff,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed ({:?})", e))?
+                    };
+
+                    inputs.push(with_decoys);
+                }
+
+                // New OVK each attempt
+                let mut ovk = [0u8; 32];
+                rng.fill_bytes(&mut ovk);
+
+                // Build a candidate tx. If subset doesn't have enough funds for amount+fee, treat as non-signal.
+                let intent = monero_wallet::send::SignableTransaction::new(
+                    monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+                    Zeroizing::new(ovk),
+                    inputs,
+                    destinations.clone(),
+                    change.clone(),
+                    Vec::new(),
+                    fee_rate,
+                )
+                .map_err(|e| format!("construct failed ({e})"))?;
+
+                // Sign using the same mechanism as the main send path (SignableTransaction::sign).
+                let spend_key =
+                    Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+                let mut signer_rng = OsRng;
+                let tx = intent
+                    .sign(&mut signer_rng, &spend_key)
+                    .map_err(|e| format!("sign failed ({e})"))?;
+
+                let tx_blob = tx.serialize();
+                match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(format!(
+                        "broadcast failed ({}): {}",
+                        if is_invalid_input_send_raw_tx_error(&format!("{e}")) {
+                            "invalid_input"
+                        } else {
+                            "other"
+                        },
+                        e
+                    )),
+                }
+            };
+
+            // Bisect: find a smallest subset which reproduces invalid_input. Ignore non-signal failures.
+            let mut lo = 0usize;
+            let mut hi = all.len();
+            let mut last_err: Option<String> = None;
+
+            while lo < hi && start.elapsed() <= budget {
+                let mid = (lo + hi) / 2;
+                let test: Vec<TrackedOutput> = all[lo..mid.max(lo + 1)].to_vec();
+
+                match try_subset(&test) {
+                    Ok(()) => {
+                        // This subset did not reproduce invalid_input; move to the other half.
+                        lo = mid.max(lo + 1);
+                    }
+                    Err(e) => {
+                        if e.contains("broadcast failed (invalid_input):") {
+                            last_err = Some(e);
+                            hi = mid.max(lo + 1);
+                        } else {
+                            // Not our signal; skip past this chunk.
+                            lo = mid.max(lo + 1);
+                        }
+                    }
+                }
+
+                if hi - lo == 1 {
+                    let bad = &all[lo];
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧨 send_bisect: candidate invalid_input output wallet_id={} txid={} index_in_tx={} height={} amount_piconero={} err={}",
+                        id,
+                        hex_dump_prefix(&bad.tx_hash, 32),
+                        bad.index_in_tx,
+                        bad.block_height,
+                        bad.amount,
+                        last_err.clone().unwrap_or_else(|| "(none)".to_string())
+                    );
+                    break;
+                }
             }
-            _ => -16,
-        };
-        record_error(code, "wallet_send_with_filter: publish_transaction failed");
+        }
+
+        record_error(code, msg);
         return ptr::null_mut();
     }
 
@@ -7931,6 +9842,8 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
     ring_len: u8,
 ) -> *mut c_char {
     clear_last_error();
+
+    // Debug: prove which daemon URL this sweep preview is actually using (important when sync/broadcast differ).
 
     if wallet_id.is_null() || to_address.is_null() {
         record_error(-11, "wallet_preview_sweep_with_filter: null argument(s)");
@@ -8012,6 +9925,20 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🔎 sweep_preview context wallet_id={} base_url={} ring_len={} gap_limit={} filter_subaddr_minor={}",
+        id,
+        base_url,
+        ring_len,
+        snapshot.gap_limit,
+        match filter.as_ref().and_then(|f| f.subaddress_minor) {
+            Some(v) => v.to_string(),
+            None => "(none)".to_string(),
+        }
+    );
+
     let rpc_client = match TOKIO_RUNTIME.block_on(
         monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
     ) {
@@ -8027,6 +9954,12 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
         }
     };
 
+    // Debug: note on daemon capabilities.
+    //
+    // This transport does not currently expose a `get_info()` helper in this build, so we cannot
+    // directly log `restricted` here. We *do* log the selected `base_url` and the derived
+    // `daemon_height` below, which is sufficient to prove which daemon the sweep preview is using.
+
     let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
         Ok(n) => n.saturating_add(1) as u64,
         Err(e) => {
@@ -8039,6 +9972,15 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
             return ptr::null_mut();
         }
     };
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🔎 sweep_preview daemon_height wallet_id={} base_url={} daemon_height={}",
+        id,
+        base_url,
+        daemon_height
+    );
 
     let daemon = DaemonStatus {
         height: daemon_height,
@@ -8090,12 +10032,84 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
     }
 
     // Spendable == unlocked & unspent only (sweep uses unlocked-only)
+    //
+    // IMPORTANT: exclude outputs that originate from *pending outgoing* txids. Those include
+    // change outputs created by a tx we just broadcasted. Attempting to spend them in the same
+    // session can yield daemon `invalid_input=true` even if the wallet thinks they're unlocked.
+    let pending_txids: std::collections::HashSet<String> = snapshot
+        .pending_outgoing
+        .iter()
+        .map(|p| p.txid.trim().to_ascii_lowercase())
+        .collect();
+
+    // Always log pending-outgoing context (even when empty) so we can prove whether the filter
+    // can possibly exclude anything in this session.
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep_preview pending_outgoing context wallet_id={} pending_txids_count={} pending_txids_sample={}",
+        id,
+        pending_txids.len(),
+        pending_txids
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(",")
+    );
+
     let mut spendable: Vec<TrackedOutput> = snapshot
         .tracked_outputs
         .iter()
         .cloned()
         .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| {
+            if pending_txids.is_empty() {
+                return true;
+            }
+            let txid = hex_lowercase(&o.tx_hash);
+            !pending_txids.contains(&txid)
+        })
         .collect();
+
+    // Always log exclusion summary (even when zero) so we can see whether the txids match.
+    let excluded_pending = snapshot
+        .tracked_outputs
+        .iter()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| pending_txids.contains(&hex_lowercase(&o.tx_hash)))
+        .count();
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep_preview pending_outgoing exclusion wallet_id={} excluded_count={} pending_txids_count={}",
+        id,
+        excluded_pending,
+        pending_txids.len()
+    );
+
+    if !pending_txids.is_empty() {
+        // Log exclusion summary for debugging "invalid_input" sweeps.
+        // Note: this is after the initial selection (unspent/unlocked), before subaddress filtering.
+        let excluded_pending = snapshot
+            .tracked_outputs
+            .iter()
+            .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+            .filter(|o| pending_txids.contains(&hex_lowercase(&o.tx_hash)))
+            .count();
+
+        if excluded_pending > 0 {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧹 sweep_preview excluded pending outgoing outputs wallet_id={} excluded_count={} pending_txids_count={}",
+                id,
+                excluded_pending,
+                pending_txids.len()
+            );
+        }
+    }
 
     if let Some(f) = &filter {
         if let Some(minor) = f.subaddress_minor {
@@ -8119,8 +10133,9 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
 
     // Fee rate once
     let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
     let fee_rate: FeeRate =
-        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
                 let code = match e {
@@ -8132,84 +10147,302 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
             }
         };
 
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "💸 fee_rate wallet_id={} base_url={} priority={:?} max_per_weight={} fee_rate={:?}",
+        id,
+        base_url,
+        fee_priority,
+        max_per_weight,
+        fee_rate
+    );
+
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
 
-    // Iteratively decide how many inputs to sweep, and compute amount = sum(inputs) - fee.
-    let mut selected: Vec<TrackedOutput> = Vec::new();
-    let mut selected_sum: u64 = 0;
+    // Sweep preview ("Send Max"):
+    // - select *all* unlocked/unspent spendable outputs (optionally filtered by subaddress)
+    // - filter out "dust" outputs which cost more to spend than they're worth
+    // - compute amount = sum(inputs) - fee, where fee depends on tx weight
+    //
+    // This avoids an expensive "try adding one more input" search loop which can take a long time
+    // and appear stuck in the UI.
+    let min_input = walletcore_sweep_min_input_piconero();
+    let mut selected: Vec<TrackedOutput> = spendable
+        .iter()
+        .cloned()
+        .filter(|o| o.amount >= min_input)
+        .collect();
 
-    let max_selection_rounds: usize = 24;
-    let mut last_amount: Option<u64> = None;
+    let skipped_count = spendable.len().saturating_sub(selected.len());
+    let skipped_sum: u64 = spendable
+        .iter()
+        .filter(|o| o.amount < min_input)
+        .map(|o| o.amount)
+        .sum();
 
-    for _round in 0..max_selection_rounds {
-        // Add one more input each round until it stops increasing the computed sendable amount.
-        if selected.len() < spendable.len() {
-            let next = spendable[selected.len()].clone();
-            selected_sum = selected_sum.saturating_add(next.amount);
-            selected.push(next);
-        } else if selected.is_empty() {
-            record_error(
-                -18,
-                "wallet_preview_sweep_with_filter: no unlocked funds to sweep",
+    let selected_sum: u64 = selected.iter().map(|o| o.amount).sum();
+
+    if selected.is_empty() {
+        record_error(
+            -18,
+            format!(
+                "wallet_preview_sweep_with_filter: no unlocked funds to sweep (all outputs below min_input_piconero={} skipped_count={} skipped_sum={})",
+                min_input, skipped_count, skipped_sum
+            ),
+        );
+        return ptr::null_mut();
+    }
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep_preview dust filter wallet_id={} min_input_piconero={} selected_count={} selected_sum={} skipped_count={} skipped_sum={}",
+        id,
+        min_input,
+        selected.len(),
+        selected_sum,
+        skipped_count,
+        skipped_sum
+    );
+
+    // Build inputs with decoys
+    //
+    // Debug toggle: allow sweep preview to run without fetching decoys so we can isolate
+    // decoy-selection failures vs other RPC/scan issues.
+    if walletcore_disable_decoys() {
+        walletcore_log!(
+                id,
+                snapshot.network,
+                "🧪 WALLETCORE_DISABLE_DECOYS=1: sweep_preview returning placeholder (amount, fee) without decoy selection wallet_id={} base_url={}",
+                id,
+                base_url
             );
-            return ptr::null_mut();
-        }
-
-        // Build inputs with decoys
-        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
-        for t in &selected {
-            let block_number = match usize::try_from(t.block_height) {
-                Ok(value) => value,
-                Err(_) => {
-                    record_error(
+        // Deterministic placeholder fee; amount is computed as selected_sum - fee.
+        let placeholder_fee: u64 = 30_700_000; // 0.000030700000 XMR in piconero
+        let amount = selected_sum.saturating_sub(placeholder_fee);
+        let json = match serde_json::to_string(&serde_json::json!({
+            "amount": amount,
+            "fee": placeholder_fee
+        })) {
+            Ok(s) => s,
+            Err(err) => {
+                record_error(
                         -16,
-                        "wallet_preview_sweep_with_filter: block number conversion overflow",
+                        format!("wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"),
                     );
-                    return ptr::null_mut();
-                }
-            };
-            let scannable =
-                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
-                    Ok(block) => block,
-                    Err(err) => {
-                        let code = map_rpc_error(err);
-                        record_error(
-                            code,
-                            format!(
+                return ptr::null_mut();
+            }
+        };
+        return match CString::new(json) {
+            Ok(cstr) => {
+                clear_last_error();
+                cstr.into_raw()
+            }
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
+                );
+                ptr::null_mut()
+            }
+        };
+    }
+
+    // Debug probe: attempt a single decoy selection and log rich context. This is intended to
+    // help validate upcoming wallet2-style decoy selection and to distinguish node issues from
+    // transport/parameter issues.
+    //
+    // Enable with: WALLETCORE_DECOY_PROBE=1
+    if walletcore_decoy_probe_enabled() {
+        walletcore_log!(
+                id,
+                snapshot.network,
+                "🧪 WALLETCORE_DECOY_PROBE=1: running decoy probe wallet_id={} base_url={} ring_len_eff={} selected_inputs={}",
+                id,
+                base_url,
+                ring_len_eff,
+                selected.len()
+            );
+    }
+
+    // Decoy mode toggle (bin16) for sweep preview.
+    //
+    // When enabled, we switch decoy selection to the monero-daemon-rpc provider which uses
+    // binary RPC (bin_rpc) for decoy selection (get_output_distribution.bin + get_outs.bin).
+    if walletcore_decoy_mode_bin16() {
+        walletcore_log!(
+                id,
+                snapshot.network,
+                "🧪 WALLETCORE_DECOY_MODE=bin16 enabled: sweep_preview will use monero-daemon-rpc (bin_rpc) decoy provider wallet_id={} base_url={}",
+                id,
+                base_url
+            );
+    }
+
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+    for t in &selected {
+        walletcore_log!(
+                id,
+                snapshot.network,
+                "🔎 sweep_preview selecting_input wallet_id={} base_url={} real_out_height={} real_out_txid={} real_out_index_in_tx={} real_out_amount_piconero={} daemon_height={}",
+                id,
+                base_url,
+                t.block_height,
+                hex_dump_prefix(&t.tx_hash, 32),
+                t.index_in_tx,
+                t.amount,
+                daemon.height
+            );
+
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_preview_sweep_with_filter: block number conversion overflow",
+                );
+                return ptr::null_mut();
+            }
+        };
+        let scannable =
+            match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
                             "wallet_preview_sweep_with_filter: RPC block fetch failed at height {}",
                             t.block_height
                         ),
-                        );
-                        return ptr::null_mut();
-                    }
-                };
-            let outputs = match scanner.scan(scannable) {
-                Ok(result) => result.ignore_additional_timelock(),
-                Err(_) => {
+                    );
+                    return ptr::null_mut();
+                }
+            };
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_preview_sweep_with_filter: scanner failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_preview_sweep_with_filter: failed to reconstruct selected output",
+                );
+                return ptr::null_mut();
+            }
+        };
+        // Decoy selection backend:
+        // - default: use the current upstream RPC client (may fail on some nodes)
+        // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (wallet2-style decoys)
+        let with_decoys = if walletcore_decoy_mode_bin16() {
+            // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+            let ring_len_eff: u8 = 16;
+            let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                Ok(d) => d,
+                Err(e) => {
+                    let code = map_rpc_error(e.clone());
                     record_error(
-                        -16,
+                            code,
+                            format!(
+                                "wallet_preview_sweep_with_filter: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                            ),
+                        );
+                    return ptr::null_mut();
+                }
+            };
+
+            // Diagnostics: prove what concrete type we constructed and whether its decoy methods work.
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧪 bin16 daemon_iface type wallet_id={} type={}",
+                id,
+                core::any::type_name_of_val(&daemon_iface)
+            );
+
+            // Probe: ringct output distribution for a tiny range. This should exercise bin_rpc.
+            match TOKIO_RUNTIME.block_on(daemon_iface.ringct_output_distribution(0usize..=1usize)) {
+                Ok(dist) => {
+                    let last = dist.last().copied().unwrap_or(0);
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧪 bin16 ringct_output_distribution ok wallet_id={} len={} last={}",
+                        id,
+                        dist.len(),
+                        last
+                    );
+                }
+                Err(e) => {
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧪 bin16 ringct_output_distribution err wallet_id={} err={}",
+                        id,
+                        e
+                    );
+                }
+            }
+
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &daemon_iface,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+
+                    if walletcore_decoy_probe_enabled() {
+                        walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧪 WALLETCORE_DECOY_PROBE=1: decoy selection failed wallet_id={} base_url={} daemon_height={} real_out_height={} real_out_txid={} real_out_index_in_tx={} ring_len_eff={} err={:?}",
+                                id,
+                                base_url,
+                                daemon.height,
+                                t.block_height,
+                                hex_dump_prefix(&t.tx_hash, 32),
+                                t.index_in_tx,
+                                ring_len_eff,
+                                err
+                            );
+                    }
+
+                    record_error(
+                        code,
                         format!(
-                            "wallet_preview_sweep_with_filter: scanner failed at height {}",
-                            t.block_height
+                            "wallet_preview_sweep_with_filter: decoy selection failed ({err:?})"
                         ),
                     );
                     return ptr::null_mut();
                 }
-            };
-            let maybe_out = outputs.into_iter().find(|wo| {
-                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
-            });
-            let wallet_out = match maybe_out {
-                Some(wo) => wo,
-                None => {
-                    record_error(
-                        -16,
-                        "wallet_preview_sweep_with_filter: failed to reconstruct selected output",
-                    );
-                    return ptr::null_mut();
-                }
-            };
-            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+            }
+        } else {
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
@@ -8219,161 +10452,132 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
                 Ok(i) => i,
                 Err(err) => {
                     // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                    let code = match err {
+                    //
+                    // IMPORTANT: match by reference so we can both map the error code and also include
+                    // a debug representation in the message without partially moving inner values.
+                    let code = match &err {
                         monero_interface::TransactionsError::InterfaceError(inner) => {
-                            map_rpc_error(inner)
+                            map_rpc_error(inner.clone())
                         }
                         monero_interface::TransactionsError::TransactionNotFound => -16,
                         monero_interface::TransactionsError::PrunedTransaction => -16,
                     };
+
+                    if walletcore_decoy_probe_enabled() {
+                        walletcore_log!(
+                                id,
+                                snapshot.network,
+                                "🧪 WALLETCORE_DECOY_PROBE=1: decoy selection failed wallet_id={} base_url={} daemon_height={} real_out_height={} real_out_txid={} real_out_index_in_tx={} ring_len_eff={} err={:?}",
+                                id,
+                                base_url,
+                                daemon.height,
+                                t.block_height,
+                                hex_dump_prefix(&t.tx_hash, 32),
+                                t.index_in_tx,
+                                ring_len_eff,
+                                err
+                            );
+                    }
+
                     record_error(
                         code,
-                        "wallet_preview_sweep_with_filter: decoy selection failed",
-                    );
-                    return ptr::null_mut();
-                }
-            };
-            inputs.push(with_decoys);
-        }
-
-        // Compute a consistent sweep amount via fixed-point iteration:
-        // amount = selected_sum - fee(amount), because fee depends on tx weight which depends on amount encoding.
-        // This prevents constructing impossible txs where outputs ~= inputs with no room for fee.
-        let mut amount_guess: u64 = selected_sum;
-        let mut fee: u64 = 0;
-
-        // Small bound; this should converge quickly because fee changes are small and monotonic-ish with size.
-        let max_amount_iters: usize = 12;
-
-        for _ in 0..max_amount_iters {
-            let mut ovk = [0u8; 32];
-            rng.fill_bytes(&mut ovk);
-
-            // If fee >= selected_sum, sweep is impossible with this selection.
-            // Clamp to zero to force failure handling below.
-            let candidate_amount = selected_sum.saturating_sub(fee);
-
-            let intent = match monero_wallet::send::SignableTransaction::new(
-                monero_wallet::ringct::RctType::ClsagBulletproofPlus,
-                Zeroizing::new(ovk),
-                inputs.clone(),
-                vec![(recipient_address, candidate_amount)],
-                change.clone(),
-                Vec::new(),
-                fee_rate,
-            ) {
-                Ok(tx) => tx,
-                Err(e) => {
-                    record_error(
-                        -16,
                         format!(
-                            "wallet_preview_sweep_with_filter: transaction construction failed ({e})"
+                            "wallet_preview_sweep_with_filter: decoy selection failed ({err:?})"
                         ),
                     );
                     return ptr::null_mut();
                 }
-            };
-
-            let new_fee = intent.necessary_fee();
-            let new_amount = selected_sum.saturating_sub(new_fee);
-
-            // Converged: amount consistent with fee
-            if new_amount == amount_guess && new_fee == fee {
-                fee = new_fee;
-                amount_guess = new_amount;
-                break;
             }
+        };
+        inputs.push(with_decoys);
+    }
 
-            fee = new_fee;
-            amount_guess = new_amount;
-        }
+    // Compute sweep amount via fixed-point iteration:
+    // amount = selected_sum - fee(amount), because fee depends on tx weight which depends on amount encoding.
+    let mut fee_guess: u64 = 0;
 
-        if fee >= selected_sum || amount_guess == 0 {
-            // This selection can't pay its own fee; try adding more inputs, otherwise fail.
-            if selected.len() >= spendable.len() {
+    // Small bound; this should converge quickly.
+    let max_amount_iters: usize = 8;
+
+    for _ in 0..max_amount_iters {
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        let candidate_amount = selected_sum.saturating_sub(fee_guess);
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs.clone(),
+            vec![(recipient_address, candidate_amount)],
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not enough funds") {
+                    // candidate_amount was too high (not leaving enough room for fee)
+                    fee_guess = fee_guess.saturating_add(50_000_000);
+                    continue;
+                }
                 record_error(
-                    -18,
+                    -16,
                     format!(
-                        "wallet_preview_sweep_with_filter: insufficient unlocked funds to pay fee (inputs {}, necessary_fee {})",
-                        selected_sum, fee
+                        "wallet_preview_sweep_with_filter: transaction construction failed ({e})"
                     ),
                 );
                 return ptr::null_mut();
             }
-            continue;
+        };
+
+        let new_fee = intent.necessary_fee();
+        if new_fee == fee_guess {
+            break;
         }
-
-        let amount = amount_guess;
-
-        // Stop when amount stops improving (adding more inputs would mostly increase fee).
-        if let Some(prev) = last_amount {
-            if amount <= prev {
-                // Use previous best result
-                let json = match serde_json::to_string(
-                    &serde_json::json!({ "amount": prev, "fee": selected_sum.saturating_sub(prev) }),
-                ) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        record_error(
-                            -16,
-                            format!("wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"),
-                        );
-                        return ptr::null_mut();
-                    }
-                };
-                match CString::new(json) {
-                    Ok(cstr) => {
-                        clear_last_error();
-                        return cstr.into_raw();
-                    }
-                    Err(_) => {
-                        record_error(
-                            -16,
-                            "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
-                        );
-                        return ptr::null_mut();
-                    }
-                }
-            }
-        }
-
-        last_amount = Some(amount);
-
-        // If we've already swept all unlocked outputs, return best.
-        if selected.len() >= spendable.len() {
-            let json = match serde_json::to_string(
-                &serde_json::json!({ "amount": amount, "fee": fee }),
-            ) {
-                Ok(s) => s,
-                Err(err) => {
-                    record_error(
-                        -16,
-                        format!("wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"),
-                    );
-                    return ptr::null_mut();
-                }
-            };
-            match CString::new(json) {
-                Ok(cstr) => {
-                    clear_last_error();
-                    return cstr.into_raw();
-                }
-                Err(_) => {
-                    record_error(
-                        -16,
-                        "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
-                    );
-                    return ptr::null_mut();
-                }
-            }
-        }
+        fee_guess = new_fee;
     }
 
-    record_error(
-        -16,
-        "wallet_preview_sweep_with_filter: fee estimation did not converge (too many selection rounds)",
-    );
-    ptr::null_mut()
+    let fee = fee_guess;
+    let amount = selected_sum.saturating_sub(fee);
+
+    if fee >= selected_sum || amount == 0 {
+        record_error(
+                -18,
+                format!(
+                    "wallet_preview_sweep_with_filter: insufficient unlocked funds to pay fee (inputs {}, necessary_fee {})",
+                    selected_sum, fee
+                ),
+            );
+        return ptr::null_mut();
+    }
+
+    let json = match serde_json::to_string(&serde_json::json!({ "amount": amount, "fee": fee })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!(
+                    "wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"
+                ),
+            );
+            return ptr::null_mut();
+        }
+    };
+    return match CString::new(json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    };
 }
 
 #[no_mangle]
@@ -8391,139 +10595,744 @@ pub extern "C" fn wallet_sweep_with_filter(
         return ptr::null_mut();
     }
 
-    // First, preview to get computed amount+fee (unlocked-only).
-    let preview_ptr =
-        wallet_preview_sweep_with_filter(wallet_id, node_url, to_address, filter_json, ring_len);
-    if preview_ptr.is_null() {
-        // wallet_preview_sweep_with_filter already recorded last_error
-        return ptr::null_mut();
-    }
-    let preview_str = unsafe { CStr::from_ptr(preview_ptr) }
-        .to_string_lossy()
-        .to_string();
-    let _ = walletcore_free_cstr(preview_ptr);
-
-    #[derive(Deserialize)]
-    struct SweepPreviewResult {
-        amount: u64,
-    }
-
-    let preview: SweepPreviewResult = match serde_json::from_str(&preview_str) {
-        Ok(v) => v,
-        Err(err) => {
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
             record_error(
-                -16,
-                format!("wallet_sweep_with_filter: failed to decode preview result ({err})"),
+                -10,
+                "wallet_sweep_with_filter: wallet_id contained invalid UTF-8",
             );
             return ptr::null_mut();
         }
     };
 
-    if preview.amount == 0 {
+    let to_addr_str = match unsafe { CStr::from_ptr(to_address) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_sweep_with_filter: to_address contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(s) => s.clone(),
+            None => {
+                record_error(
+                    -13,
+                    format!("wallet_sweep_with_filter: wallet '{id}' not registered"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    // Parse optional filter: only supports subaddress_minor at the moment (account 0)
+    #[derive(Deserialize)]
+    struct InputFilter {
+        subaddress_minor: Option<u32>,
+    }
+
+    let filter: Option<InputFilter> = if !filter_json.is_null() {
+        unsafe { CStr::from_ptr(filter_json) }
+            .to_str()
+            .ok()
+            .and_then(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str::<InputFilter>(s).ok()
+                }
+            })
+    } else {
+        None
+    };
+
+    let base_url = match unsafe { CStr::from_ptr(node_url) }.to_str() {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_sweep_with_filter: node_url contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let recipient_address = match MoneroAddress::from_str(snapshot.network, to_addr_str) {
+        Ok(a) => a,
+        Err(_) => {
+            record_error(-10, "wallet_sweep_with_filter: invalid destination address");
+            return ptr::null_mut();
+        }
+    };
+
+    let rpc_client = match TOKIO_RUNTIME.block_on(
+        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: failed to connect daemon '{base_url}': {e}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let daemon_height = match TOKIO_RUNTIME.block_on(rpc_client.latest_block_number()) {
+        Ok(h) => h,
+        Err(e) => {
+            record_error(
+                -16,
+                format!(
+                    "wallet_sweep_with_filter: failed to query daemon height '{base_url}': {e}"
+                ),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let daemon = DaemonStatus {
+        height: daemon_height as u64,
+        top_block_timestamp: 0,
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(code, "wallet_sweep_with_filter: unable to parse mnemonic");
+            return ptr::null_mut();
+        }
+    };
+
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_sweep_with_filter: failed to construct view pair",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    // Select ALL unlocked/unspent spendable outputs (optionally filtered).
+    // Filter out "dust" outputs which cost more to spend than they're worth.
+    //
+    // IMPORTANT: exclude outputs that originate from *pending outgoing* txids. Those include
+    // change outputs created by a tx we just broadcasted. Attempting to spend them in the same
+    // session can yield daemon `invalid_input=true` even if the wallet thinks they're unlocked.
+    let pending_txids: std::collections::HashSet<String> = snapshot
+        .pending_outgoing
+        .iter()
+        .map(|p| p.txid.trim().to_ascii_lowercase())
+        .collect();
+
+    // Always log pending-outgoing context (even when empty) so we can prove whether the filter
+    // can possibly exclude anything in this session.
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep pending_outgoing context wallet_id={} pending_txids_count={} pending_txids_sample={}",
+        id,
+        pending_txids.len(),
+        pending_txids
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(",")
+    );
+
+    let mut spendable: Vec<TrackedOutput> = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| {
+            if pending_txids.is_empty() {
+                return true;
+            }
+            let txid = hex_lowercase(&o.tx_hash);
+            !pending_txids.contains(&txid)
+        })
+        .collect();
+
+    // Always log exclusion summary (even when zero) so we can see whether the txids match.
+    let excluded_pending = snapshot
+        .tracked_outputs
+        .iter()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .filter(|o| pending_txids.contains(&hex_lowercase(&o.tx_hash)))
+        .count();
+
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep pending_outgoing exclusion wallet_id={} excluded_count={} pending_txids_count={}",
+        id,
+        excluded_pending,
+        pending_txids.len()
+    );
+
+    if !pending_txids.is_empty() {
+        // Log exclusion summary for debugging "invalid_input" sweeps.
+        let excluded_pending = snapshot
+            .tracked_outputs
+            .iter()
+            .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+            .filter(|o| pending_txids.contains(&hex_lowercase(&o.tx_hash)))
+            .count();
+
+        if excluded_pending > 0 {
+            walletcore_log!(
+                id,
+                snapshot.network,
+                "🧹 sweep excluded pending outgoing outputs wallet_id={} excluded_count={} pending_txids_count={}",
+                id,
+                excluded_pending,
+                pending_txids.len()
+            );
+        }
+    }
+
+    if let Some(f) = &filter {
+        if let Some(minor) = f.subaddress_minor {
+            spendable.retain(|o| o.subaddress_major == 0 && o.subaddress_minor == minor);
+        }
+    }
+
+    let min_input = walletcore_sweep_min_input_piconero();
+    let skipped_count = spendable.iter().filter(|o| o.amount < min_input).count();
+    let skipped_sum: u64 = spendable
+        .iter()
+        .filter(|o| o.amount < min_input)
+        .map(|o| o.amount)
+        .sum();
+    spendable.retain(|o| o.amount >= min_input);
+
+    if spendable.is_empty() {
         record_error(
             -18,
-            "wallet_sweep_with_filter: computed sweep amount is zero",
+            format!(
+                "wallet_sweep_with_filter: no unlocked funds to sweep (all outputs below min_input_piconero={} skipped_count={} skipped_sum={})",
+                min_input, skipped_count, skipped_sum
+            ),
         );
         return ptr::null_mut();
     }
 
-    // Use existing send_with_filter by constructing destinations JSON.
-    let dest_json = match serde_json::to_string(&vec![serde_json::json!({
-        "address": unsafe { CStr::from_ptr(to_address) }.to_string_lossy().to_string(),
-        "amount": preview.amount
-    })]) {
-        Ok(s) => s,
-        Err(err) => {
-            record_error(
-                -16,
-                format!("wallet_sweep_with_filter: destinations JSON serialization failed ({err})"),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    let send_ptr = CString::new(dest_json).ok();
-    let send_cstr = match send_ptr {
-        Some(c) => c,
-        None => {
-            record_error(
-                -16,
-                "wallet_sweep_with_filter: destinations JSON contained interior null bytes",
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    let raw = wallet_send_with_filter(
-        wallet_id,
-        node_url,
-        send_cstr.as_ptr(),
-        filter_json,
-        ring_len,
+    walletcore_log!(
+        id,
+        snapshot.network,
+        "🧹 sweep dust filter wallet_id={} min_input_piconero={} selected_count={} selected_sum={} skipped_count={} skipped_sum={}",
+        id,
+        min_input,
+        spendable.len(),
+        spendable.iter().map(|o| o.amount).sum::<u64>(),
+        skipped_count,
+        skipped_sum
     );
-    if raw.is_null() {
+
+    // Fee rate once (use same env-controlled priority).
+    let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
+    let fee_rate: FeeRate =
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
+            Ok(fr) => fr,
+            Err(e) => {
+                let code = match e {
+                    FeeError::InterfaceError(inner) => map_rpc_error(inner),
+                    _ => -16,
+                };
+                record_error(code, "wallet_sweep_with_filter: fee_rate failed");
+                return ptr::null_mut();
+            }
+        };
+
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+
+    // Build inputs with decoys for ALL selected outputs.
+    let mut rng = OsRng;
+    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+
+    for t in &spendable {
+        let block_number = match usize::try_from(t.block_height) {
+            Ok(value) => value,
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_sweep_with_filter: block number conversion overflow",
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let scannable =
+            match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_sweep_with_filter: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+        let outputs = match scanner.scan(scannable) {
+            Ok(result) => result.ignore_additional_timelock(),
+            Err(_) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_sweep_with_filter: scanner failed at height {}",
+                        t.block_height
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let maybe_out = outputs
+            .into_iter()
+            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
+
+        let wallet_out = match maybe_out {
+            Some(wo) => wo,
+            None => {
+                record_error(
+                    -16,
+                    "wallet_sweep_with_filter: failed to reconstruct selected output",
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let with_decoys = if walletcore_decoy_mode_bin16() {
+            let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                Ok(d) => d,
+                Err(e) => {
+                    let code = map_rpc_error(e.clone());
+                    record_error(
+                        code,
+                        format!("wallet_sweep_with_filter: failed to construct bin16 decoy daemon for '{base_url}': {e}"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &daemon_iface,
+                16,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_sweep_with_filter: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        } else {
+            match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = match &err {
+                        monero_interface::TransactionsError::InterfaceError(inner) => {
+                            map_rpc_error(inner.clone())
+                        }
+                        monero_interface::TransactionsError::TransactionNotFound => -16,
+                        monero_interface::TransactionsError::PrunedTransaction => -16,
+                    };
+                    record_error(
+                        code,
+                        format!("wallet_sweep_with_filter: decoy selection failed ({err:?})"),
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        };
+
+        inputs.push(with_decoys);
+    }
+
+    let inputs_sum: u64 = spendable.iter().map(|t| t.amount).sum();
+
+    // Fixed-point fee convergence at send time (authoritative).
+    let mut fee_guess: u64 = 0;
+    let max_iters: usize = 8;
+
+    let mut final_amount: u64 = 0;
+    let mut final_fee: u64 = 0;
+    let mut final_intent: Option<monero_wallet::send::SignableTransaction> = None;
+
+    for _ in 0..max_iters {
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        let candidate_amount = inputs_sum.saturating_sub(fee_guess);
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs.clone(),
+            vec![(recipient_address, candidate_amount)],
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not enough funds") {
+                    fee_guess = fee_guess.saturating_add(50_000_000);
+                    continue;
+                }
+                record_error(
+                    -16,
+                    format!("wallet_sweep_with_filter: transaction construction failed ({e})"),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let fee = intent.necessary_fee();
+        if fee == fee_guess {
+            final_fee = fee;
+            final_amount = inputs_sum.saturating_sub(fee);
+            final_intent = Some(intent);
+            break;
+        }
+        fee_guess = fee;
+        final_fee = fee;
+        final_amount = inputs_sum.saturating_sub(fee);
+        final_intent = Some(intent);
+    }
+
+    if final_amount == 0 || final_fee >= inputs_sum {
+        record_error(
+            -18,
+            format!(
+                "wallet_sweep_with_filter: insufficient unlocked funds to pay fee (inputs {}, necessary_fee {})",
+                inputs_sum, final_fee
+            ),
+        );
         return ptr::null_mut();
     }
 
-    let send_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().to_string();
-    let _ = walletcore_free_cstr(raw);
-
-    #[derive(Deserialize)]
-    struct SendResult {
-        txid: String,
-        fee: u64,
-    }
-    let send_res: SendResult = match serde_json::from_str(&send_str) {
-        Ok(v) => v,
-        Err(err) => {
+    let intent = match final_intent {
+        Some(i) => i,
+        None => {
             record_error(
                 -16,
-                format!("wallet_sweep_with_filter: failed to decode send result ({err})"),
+                "wallet_sweep_with_filter: fee estimation did not converge",
             );
             return ptr::null_mut();
         }
     };
 
-    // Note: `fee` is used below; keep it as part of the decoded struct to avoid relying on string parsing.
+    // Sign and broadcast.
+    let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+    let mut signer_rng = OsRng;
+    let tx = match intent.sign(&mut signer_rng, &spend_key) {
+        Ok(tx) => tx,
+        Err(e) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: signing failed ({e})"),
+            );
+            return ptr::null_mut();
+        }
+    };
 
-    // Record a pending outgoing tx for UI history.
-    {
-        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-        // wallet_send_with_filter already used `wallet_id`, so we can reuse it here.
-        let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
-            Ok(s) => s.trim(),
-            Err(_) => "",
-        };
-        if !id.is_empty() {
-            if let Some(state) = map.get_mut(id) {
-                state.pending_outgoing.push(PendingOutgoingTx {
-                    txid: send_res.txid.clone(),
-                    amount: preview.amount,
-                    fee: send_res.fee,
-                    created_at: state.chain_time,
-                });
+    let tx_blob = tx.serialize();
+    if let Err(err) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+        let code = map_rpc_error(err.clone());
+        let msg = format!("wallet_sweep_with_filter: send_raw_transaction failed ({err})");
 
-                // Update stable transfer ledger (outgoing is pending until confirmed by refresh).
-                state.tx_ledger.insert(
-                    send_res.txid.clone(),
-                    LedgerEntry {
-                        txid: send_res.txid.clone(),
-                        direction: "out".to_string(),
-                        amount: preview.amount,
-                        fee: Some(send_res.fee),
-                        height: None,
-                        timestamp: Some(state.chain_time),
-                        is_pending: true,
-                        is_coinbase: false,
-                    },
-                );
+        // Optional: bisect to find a problematic input when the daemon reports invalid_input=true.
+        if walletcore_sweep_bisect_enabled() && is_invalid_input_send_raw_tx_error(&msg) {
+            // We do a bounded bisect search by attempting to construct+sign+broadcast candidate subsets.
+            // This is best-effort debugging: we stop after a short time budget.
+            let start = Instant::now();
+            let budget = Duration::from_secs(20);
+
+            // Work on a local copy of spendable outputs (already filtered/unlocked above).
+            let all = spendable.clone();
+
+            // Helper to try a subset: build inputs+decoys for subset, converge fee, sign, broadcast.
+            let mut try_subset = |subset: &Vec<TrackedOutput>| -> Result<(), String> {
+                if subset.is_empty() {
+                    return Err("empty subset".to_string());
+                }
+
+                let inputs_sum: u64 = subset.iter().map(|t| t.amount).sum();
+
+                // Rebuild inputs with decoys for this subset.
+                let mut local_inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+                let mut local_rng = OsRng;
+
+                for t in subset {
+                    if start.elapsed() > budget {
+                        return Err("bisect budget exceeded".to_string());
+                    }
+
+                    let block_number = usize::try_from(t.block_height)
+                        .map_err(|_| "block number overflow".to_string())?;
+                    let scannable = TOKIO_RUNTIME
+                        .block_on(rpc_client.scannable_block_by_number(block_number))
+                        .map_err(|e| format!("block fetch failed: {e}"))?;
+                    let outputs = scanner
+                        .scan(scannable)
+                        .map_err(|_| "scanner failed".to_string())?
+                        .ignore_additional_timelock();
+
+                    let wallet_out = outputs
+                        .into_iter()
+                        .find(|wo| {
+                            wo.transaction() == t.tx_hash
+                                && wo.index_in_transaction() == t.index_in_tx
+                        })
+                        .ok_or_else(|| "failed to reconstruct selected output".to_string())?;
+
+                    let with_decoys = if walletcore_decoy_mode_bin16() {
+                        let daemon_iface = TOKIO_RUNTIME
+                            .block_on(make_bin_decoy_daemon(&base_url))
+                            .map_err(|e| format!("failed to construct bin16 decoy daemon: {e}"))?;
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut local_rng,
+                                &daemon_iface,
+                                16,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed: {e:?}"))?
+                    } else {
+                        TOKIO_RUNTIME
+                            .block_on(monero_wallet::OutputWithDecoys::new(
+                                &mut local_rng,
+                                &rpc_client,
+                                ring_len_eff,
+                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                wallet_out,
+                            ))
+                            .map_err(|e| format!("decoy selection failed: {e:?}"))?
+                    };
+
+                    local_inputs.push(with_decoys);
+                }
+
+                // Fee convergence (small bound).
+                //
+                // IMPORTANT: During sweep bisect we are *only* interested in reproducing the daemon's
+                // `invalid_input=true` broadcast failure. A subset may legitimately fail to construct
+                // due to fees (e.g. if it contains only tiny outputs), and that should NOT be treated
+                // as "bad input" for purposes of this bisect.
+                let mut fee_guess: u64 = 0;
+                let mut final_intent: Option<monero_wallet::send::SignableTransaction> = None;
+                for _ in 0..8 {
+                    if start.elapsed() > budget {
+                        return Err("bisect budget exceeded".to_string());
+                    }
+
+                    let mut ovk = [0u8; 32];
+                    local_rng.fill_bytes(&mut ovk);
+                    let candidate_amount = inputs_sum.saturating_sub(fee_guess);
+
+                    let intent = match monero_wallet::send::SignableTransaction::new(
+                        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+                        Zeroizing::new(ovk),
+                        local_inputs.clone(),
+                        vec![(recipient_address, candidate_amount)],
+                        change.clone(),
+                        Vec::new(),
+                        fee_rate,
+                    ) {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("not enough funds") {
+                                // Fee drift / insufficient for this subset: not a "bad input" signal.
+                                return Err(format!("subset cannot pay fee: {msg}"));
+                            }
+                            return Err(format!("tx construction failed: {msg}"));
+                        }
+                    };
+
+                    let fee = intent.necessary_fee();
+                    final_intent = Some(intent);
+                    if fee == fee_guess {
+                        break;
+                    }
+                    fee_guess = fee;
+                }
+
+                let intent = final_intent.ok_or_else(|| "fee convergence failed".to_string())?;
+                let spend_key =
+                    Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
+                let mut srng = OsRng;
+                let tx = intent
+                    .sign(&mut srng, &spend_key)
+                    .map_err(|e| format!("sign failed: {e}"))?;
+                let tx_blob = tx.serialize();
+
+                match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let emsg = e.to_string();
+                        if is_invalid_input_send_raw_tx_error(&emsg) {
+                            Err(format!("broadcast failed (invalid_input): {emsg}"))
+                        } else {
+                            // Not the failure mode we're bisecting; treat as non-signal.
+                            Err(format!("broadcast failed (non-signal): {emsg}"))
+                        }
+                    }
+                }
+            };
+
+            // Bisect loop.
+            let mut lo = 0usize;
+            let mut hi = all.len();
+            let mut last_err: Option<String> = None;
+
+            // We try to find a smallest subset which reproduces the daemon's invalid_input broadcast failure.
+            // Subsets which fail to construct due to fee insufficiency are NOT evidence of a bad input.
+            while lo < hi && start.elapsed() <= budget {
+                let mid = (lo + hi) / 2;
+                let test: Vec<TrackedOutput> = all[lo..mid.max(lo + 1)].to_vec();
+
+                match try_subset(&test) {
+                    Ok(()) => {
+                        // This subset *did not* reproduce invalid_input; move to the other half.
+                        lo = mid.max(lo + 1);
+                    }
+                    Err(e) => {
+                        // Only treat "invalid_input" broadcast failures as a bisect signal.
+                        if e.contains("broadcast failed (invalid_input):") {
+                            last_err = Some(e);
+                            hi = mid.max(lo + 1);
+                        } else {
+                            // Not our signal (e.g. fee insufficiency); skip past this chunk.
+                            lo = mid.max(lo + 1);
+                        }
+                    }
+                }
+
+                if hi - lo == 1 {
+                    let bad = &all[lo];
+                    walletcore_log!(
+                        id,
+                        snapshot.network,
+                        "🧨 sweep_bisect: candidate invalid_input output wallet_id={} txid={} index_in_tx={} height={} amount_piconero={} err={}",
+                        id,
+                        hex_dump_prefix(&bad.tx_hash, 32),
+                        bad.index_in_tx,
+                        bad.block_height,
+                        bad.amount,
+                        last_err.clone().unwrap_or_else(|| "(none)".to_string())
+                    );
+                    break;
+                }
             }
         }
+
+        record_error(code, msg);
+        return ptr::null_mut();
     }
+
+    // Mark spent outputs in memory, adjust totals (best-effort).
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        if let Some(state) = map.get_mut(id) {
+            for t in &spendable {
+                if let Some(o) = state
+                    .tracked_outputs
+                    .iter_mut()
+                    .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
+                {
+                    o.spent = true;
+                }
+            }
+            state.total = state.total.saturating_sub(inputs_sum);
+            state.unlocked = state.unlocked.saturating_sub(inputs_sum);
+        }
+    }
+
+    // Record pending outgoing tx.
+    let tx_hash = tx.hash();
+    let hex = hex_lowercase(&tx_hash);
+
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        if let Some(state) = map.get_mut(id) {
+            state.pending_outgoing.push(PendingOutgoingTx {
+                txid: hex.clone(),
+                amount: final_amount,
+                fee: final_fee,
+                created_at: state.chain_time,
+            });
+
+            state.tx_ledger.insert(
+                hex.clone(),
+                LedgerEntry {
+                    txid: hex.clone(),
+                    direction: "out".to_string(),
+                    amount: final_amount,
+                    fee: Some(final_fee),
+                    height: None,
+                    timestamp: Some(state.chain_time),
+                    is_pending: true,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+
     let result_json = match serde_json::to_string(&serde_json::json!({
-        "txid": send_res.txid,
-        "amount": preview.amount,
-        "fee": send_res.fee
+        "txid": hex,
+        "amount": final_amount,
+        "fee": final_fee
     })) {
         Ok(s) => s,
         Err(err) => {
@@ -8764,8 +11573,9 @@ pub extern "C" fn wallet_preview_fee_with_filter(
 
     // Fetch fee rate once (depends on daemon policy/height, not our selection)
     let max_per_weight = fee_rate_max_per_weight_cap();
+    let fee_priority = walletcore_fee_priority();
     let fee_rate: FeeRate =
-        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(FeePriority::Normal, max_per_weight)) {
+        match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
                 let code = match e {
@@ -8800,12 +11610,22 @@ pub extern "C" fn wallet_preview_fee_with_filter(
                 record_error(
                     -18,
                     format!(
-                        "wallet_preview_fee_with_filter: insufficient unlocked funds (have {}, need {})",
+                        "wallet_preview_fee: insufficient unlocked funds (have {}, need {})",
                         selected_sum, total_needed
                     ),
                 );
                 return ptr::null_mut();
             }
+
+            // Optional diagnostics: show the initial selection used to begin iterative fee convergence.
+            walletcore_debug_dump_tracked_outputs(
+                id,
+                snapshot.network,
+                "preview_fee selected_input_dump (initial)",
+                &selected,
+                daemon.height,
+                daemon.top_block_timestamp,
+            );
         }
 
         // Build decoy-selected inputs for the current selection (needed to estimate fee accurately)
@@ -8862,28 +11682,80 @@ pub extern "C" fn wallet_preview_fee_with_filter(
                     return ptr::null_mut();
                 }
             };
-            let with_decoys = match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
-                &mut rng,
-                &rpc_client,
-                ring_len_eff,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-                wallet_out,
-            )) {
-                Ok(i) => i,
-                Err(err) => {
-                    // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
-                    let code = match err {
-                        monero_interface::TransactionsError::InterfaceError(inner) => {
-                            map_rpc_error(inner)
-                        }
-                        monero_interface::TransactionsError::TransactionNotFound => -16,
-                        monero_interface::TransactionsError::PrunedTransaction => -16,
-                    };
-                    record_error(
-                        code,
-                        "wallet_preview_fee_with_filter: decoy selection failed",
-                    );
-                    return ptr::null_mut();
+            // Decoy selection backend:
+            // - default: use the current upstream RPC client (may fail on some nodes)
+            // - bin16: use monero-daemon-rpc's bin_rpc-backed MoneroDaemon (with histogram fallback in wallet decoys)
+            let with_decoys = if walletcore_decoy_mode_bin16() {
+                // Force ring size to 16 for the initial bin-rpc implementation to reduce surface area.
+                let ring_len_eff: u8 = 16;
+                let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let code = map_rpc_error(e.clone());
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_preview_fee_with_filter: failed to construct bin16 decoy daemon for '{base_url}': {e}"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &daemon_iface,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_preview_fee_with_filter: decoy selection failed ({err:?})"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                }
+            } else {
+                match TOKIO_RUNTIME.block_on(monero_wallet::OutputWithDecoys::new(
+                    &mut rng,
+                    &rpc_client,
+                    ring_len_eff,
+                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    wallet_out,
+                )) {
+                    Ok(i) => i,
+                    Err(err) => {
+                        // OutputWithDecoys::new returns TransactionsError; map it to our error codes.
+                        //
+                        // IMPORTANT: match by reference so we can both map the error code and also include
+                        // a debug representation in the message without partially moving inner values.
+                        let code = match &err {
+                            monero_interface::TransactionsError::InterfaceError(inner) => {
+                                map_rpc_error(inner.clone())
+                            }
+                            monero_interface::TransactionsError::TransactionNotFound => -16,
+                            monero_interface::TransactionsError::PrunedTransaction => -16,
+                        };
+                        record_error(
+                            code,
+                            format!(
+                                "wallet_preview_fee_with_filter: decoy selection failed ({err:?})"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
                 }
             };
             inputs.push(with_decoys);
