@@ -1009,43 +1009,19 @@ pub extern "C" fn wallet_refresh(
                         .unwrap_or((0, 0));
 
                     // Compute key image for this owned output so we can detect on-chain spends.
-                    let key_image_bytes: [u8; 32] = {
-                        let ko_bytes: [u8; 32] = <[u8; 32]>::from(output.key_offset());
-                        let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
-                            .into_option()
-                            .unwrap_or(curve25519_dalek::Scalar::ZERO);
-
-                        let a = master.spend_scalar;
-
-                        let m_dalek = if major == 0 && minor == 0 {
-                            curve25519_dalek::Scalar::ZERO
-                        } else {
-                            let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
-                            data.extend_from_slice(b"SubAddr\0");
-                            data.extend_from_slice(&<[u8; 32]>::from(master.view_scalar_ed));
-                            data.extend_from_slice(&major.to_le_bytes());
-                            data.extend_from_slice(&minor.to_le_bytes());
-                            let m_ed: monero_wallet::ed25519::Scalar =
-                                monero_wallet::ed25519::Scalar::hash(&data);
-                            let m_d: curve25519_dalek::Scalar = m_ed.into();
-                            m_d
-                        };
-
-                        let x = a + ko_dalek + m_dalek;
-
-                        let p = output.key();
-                        let p_bytes = p.compress().to_bytes();
-                        let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
-                        let hp_p_bytes = hp_p.compress().to_bytes();
-
-                        use curve25519_dalek::traits::Identity;
-                        let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
-                            .decompress()
-                            .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
-
-                        let ki = hp_p_dalek * x;
-                        ki.compress().to_bytes()
-                    };
+                    //
+                    // IMPORTANT: We must use the exact same derivation as the send path; otherwise
+                    // we cannot correlate daemon `is_key_image_spent` results back to tracked outputs,
+                    // and sends can fail with confusing double_spend/invalid_input behavior.
+                    //
+                    // Use the shared helper (also used by send) to keep this consistent.
+                    let key_image_bytes: [u8; 32] = derive_key_image_bytes(
+                        &output,
+                        master.spend_scalar,
+                        master.view_scalar_ed,
+                        major,
+                        minor,
+                    );
 
                     working_outputs.push(TrackedOutput {
                         tx_hash: output.transaction(),

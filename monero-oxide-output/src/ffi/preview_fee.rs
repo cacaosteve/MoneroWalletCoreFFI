@@ -401,7 +401,8 @@ pub extern "C" fn wallet_preview_fee(
                     &mut rng,
                     &daemon_iface,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -425,7 +426,8 @@ pub extern "C" fn wallet_preview_fee(
                     &mut rng,
                     &rpc_client,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -961,22 +963,21 @@ pub extern "C" fn wallet_preview_fee_with_filter(
                 }
             };
 
-            let scannable = match TOKIO_RUNTIME
-                .block_on(rpc_client.scannable_block_by_number(block_number))
-            {
-                Ok(block) => block,
-                Err(err) => {
-                    let code = map_rpc_error(err);
-                    record_error(
-                        code,
-                        format!(
+            let scannable =
+                match TOKIO_RUNTIME.block_on(rpc_client.scannable_block_by_number(block_number)) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        let code = map_rpc_error(err);
+                        record_error(
+                            code,
+                            format!(
                             "wallet_preview_fee_with_filter: RPC block fetch failed at height {}",
                             t.block_height
                         ),
-                    );
-                    return ptr::null_mut();
-                }
-            };
+                        );
+                        return ptr::null_mut();
+                    }
+                };
 
             let outputs = match scanner.scan(scannable) {
                 Ok(result) => result.ignore_additional_timelock(),

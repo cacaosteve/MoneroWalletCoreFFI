@@ -40,6 +40,9 @@ pub(crate) use crate::{
     set_refresh_cancel_for_wallet,
     spend_log_every_n_batches_from_env,
     spend_log_every_n_blocks_from_env,
+    // Shared key image derivation helper (used by refresh + send).
+    support::key_image::derive_key_image_bytes,
+
     update_scan_progress,
     // Debugging helpers.
     walletcore_debug_dump_tracked_outputs,

@@ -14,6 +14,7 @@
 
 pub(crate) mod bulk_bin;
 pub(crate) mod bulk_models;
+pub(crate) mod key_image;
 pub(crate) mod reexports;
 pub(crate) mod rpc;
 

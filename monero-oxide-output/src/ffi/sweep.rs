@@ -566,7 +566,8 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
                 &mut rng,
                 &daemon_iface,
                 16,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                usize::try_from(daemon.height.saturating_sub(1))
+                    .unwrap_or(daemon.height.saturating_sub(1) as usize),
                 wallet_out,
             )) {
                 Ok(i) => i,
@@ -611,7 +612,8 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
                 &mut rng,
                 &rpc_client,
                 ring_len_eff,
-                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                usize::try_from(daemon.height.saturating_sub(1))
+                    .unwrap_or(daemon.height.saturating_sub(1) as usize),
                 wallet_out,
             )) {
                 Ok(i) => i,

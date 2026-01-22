@@ -11,7 +11,9 @@ use crate::support::*;
 use core::ffi::c_char;
 use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
+use serde_json;
 use std::{
+    collections::HashSet,
     ffi::{CStr, CString},
     ptr,
     time::{Duration, Instant},
@@ -22,6 +24,118 @@ use zeroize::Zeroizing;
 use monero_address::MoneroAddress;
 use monero_interface::{FeeError, FeeRate};
 use monero_wallet::Scanner;
+
+// Treat any broadcast failure tagged as `double_spend` as requiring spent-evidence before we
+// quarantine a candidate output.
+fn is_double_spend_tagged_broadcast_error(s: &str) -> bool {
+    // We tag failures as: `broadcast failed (double_spend): ...`
+    s.contains("broadcast failed (double_spend):")
+}
+
+/// Derive key image bytes using the *exact* signer semantics from `monero-oxide`
+/// (`SignableTransaction::sign`):
+///
+/// - input_secret = a + key_offset
+/// - key_image = input_secret * Hp(P)
+///
+/// This intentionally ignores any subaddress `m` term; the signer does not include it.
+fn signer_key_image_bytes_from_wallet_out(
+    wallet_out: &monero_wallet::WalletOutput,
+    spend_scalar_dalek: curve25519_dalek::Scalar,
+) -> [u8; 32] {
+    use curve25519_dalek::traits::Identity as _;
+    use monero_wallet::ed25519;
+
+    // key_offset: monero_wallet::ed25519::Scalar -> [u8;32] -> dalek scalar
+    let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
+    let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
+        .into_option()
+        .unwrap_or(curve25519_dalek::Scalar::ZERO);
+
+    // x = a + key_offset
+    let x = spend_scalar_dalek + ko_dalek;
+
+    // Hp(P)
+    let p = wallet_out.key();
+    let p_bytes = p.compress().to_bytes();
+    let hp_p = ed25519::Point::biased_hash(p_bytes);
+    let hp_p_bytes = hp_p.compress().to_bytes();
+
+    let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
+        .decompress()
+        .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
+
+    // I = x * Hp(P)
+    (hp_p_dalek * x).compress().to_bytes()
+}
+
+/// Query daemon for key image spent status via *non-JSON* RPC route (`/is_key_image_spent`).
+///
+/// Returns a vector aligned with `key_images` where:
+/// - `0` means unspent
+/// - `1` means spent in blockchain
+/// - `2` means spent in pool
+///
+/// If the daemon doesn't support this endpoint or the response shape is unexpected, returns an
+/// error string.
+///
+/// Note: this is **not** a JSON-RPC method. It must be called via the regular RPC route, not
+/// `/json_rpc`.
+fn rpc_is_key_image_spent(
+    rpc_client: &RpcClient,
+    key_images: &[[u8; 32]],
+) -> Result<Vec<u8>, String> {
+    #[derive(Debug, Deserialize)]
+    struct KiResp {
+        // monerod returns `spent_status` as an array of integers (0/1/2), aligned with request order.
+        spent_status: Vec<u8>,
+        // `status` is usually "OK" on success; keep it optional to be tolerant of proxies.
+        status: Option<String>,
+    }
+
+    if key_images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build params JSON in the shape monerod expects for the *route* call:
+    // { "key_images": ["<hex>", ...] }
+    //
+    // We build this manually to avoid introducing new serialization dependencies here.
+    let mut kis = String::new();
+    for (i, ki) in key_images.iter().enumerate() {
+        if i != 0 {
+            kis.push(',');
+        }
+        kis.push('"');
+        kis.push_str(&hex_dump_prefix(ki, 32).replace(' ', ""));
+        kis.push('"');
+    }
+    let params = format!(r#"{{"key_images":[{kis}]}}"#);
+
+    // Call the non-JSON RPC route and parse the returned JSON.
+    let raw = TOKIO_RUNTIME
+        .block_on(rpc_client.rpc_call("is_key_image_spent", Some(params), 0))
+        .map_err(|e| format!("is_key_image_spent rpc failed: {e}"))?;
+
+    let resp: KiResp =
+        serde_json::from_str(&raw).map_err(|e| format!("is_key_image_spent parse failed: {e}"))?;
+
+    if resp.spent_status.len() != key_images.len() {
+        return Err(format!(
+            "is_key_image_spent returned {} entries, expected {}",
+            resp.spent_status.len(),
+            key_images.len()
+        ));
+    }
+
+    if let Some(status) = resp.status.as_deref() {
+        if status != "OK" {
+            return Err(format!("is_key_image_spent returned status={}", status));
+        }
+    }
+
+    Ok(resp.spent_status)
+}
 
 /// Auto-retry configuration for the send path.
 ///
@@ -162,17 +276,80 @@ pub extern "C" fn wallet_send(
         }
     };
 
-    // Prepare scanner with registered subaddresses up to gap_limit
+    // Prepare scanner with registered subaddresses.
+    //
+    // IMPORTANT: For sends we must be able to reconstruct the spend key offset for *any* selected
+    // output. Limiting registration to just `gap_limit` can cause us to fail to derive outputs
+    // received on higher minor indices (e.g. 0:21), which can manifest as daemon `invalid_input`
+    // on broadcast due to an incorrect key image.
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
-    if let Some(i0) = SubaddressIndex::new(0, 0) {
-        scanner.register_subaddress(i0);
-    }
-    for minor in 1..=gap_limit {
+
+    // Register up to the max minor index we actually have outputs for (plus a small cushion),
+    // and also respect gap_limit (whichever is larger).
+    let max_minor_in_wallet = snapshot
+        .tracked_outputs
+        .iter()
+        .map(|o| o.subaddress_minor)
+        .max()
+        .unwrap_or(0);
+    let register_up_to = gap_limit.max(max_minor_in_wallet.saturating_add(5));
+
+    for minor in 0..=register_up_to {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
         }
     }
+
+    // Consistency checker: derive key image from reconstructed `WalletOutput` using the *same*
+    // derivation as refresh uses to populate `TrackedOutput.key_image`.
+    //
+    // If these diverge, spending will likely be rejected by the daemon with `invalid_input` even
+    // though the key image is not spent.
+    let derive_key_image_bytes = |wallet_out: &monero_wallet::WalletOutput,
+                                  spend_scalar_dalek: curve25519_dalek::Scalar,
+                                  view_scalar_ed: monero_wallet::ed25519::Scalar,
+                                  subaddress_major: u32,
+                                  subaddress_minor: u32|
+     -> [u8; 32] {
+        // key_offset: monero_wallet::ed25519::Scalar -> [u8;32] -> dalek scalar
+        let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
+        let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
+            .into_option()
+            .unwrap_or(curve25519_dalek::Scalar::ZERO);
+
+        // subaddress scalar m (dalek), matches refresh
+        let m_dalek = if subaddress_major == 0 && subaddress_minor == 0 {
+            curve25519_dalek::Scalar::ZERO
+        } else {
+            let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+            data.extend_from_slice(b"SubAddr\0");
+            data.extend_from_slice(&<[u8; 32]>::from(view_scalar_ed));
+            data.extend_from_slice(&subaddress_major.to_le_bytes());
+            data.extend_from_slice(&subaddress_minor.to_le_bytes());
+            let m_ed: monero_wallet::ed25519::Scalar = monero_wallet::ed25519::Scalar::hash(&data);
+            let m_d: curve25519_dalek::Scalar = m_ed.into();
+            m_d
+        };
+
+        // x = a + key_offset + m
+        let x = spend_scalar_dalek + ko_dalek + m_dalek;
+
+        // Hp(P)
+        let p = wallet_out.key();
+        let p_bytes = p.compress().to_bytes();
+        let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
+        let hp_p_bytes = hp_p.compress().to_bytes();
+
+        use curve25519_dalek::traits::Identity;
+        let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
+            .decompress()
+            .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
+
+        // I = x * Hp(P)
+        let ki = hp_p_dalek * x;
+        ki.compress().to_bytes()
+    };
 
     // Fee rate (once)
     let max_per_weight = fee_rate_max_per_weight_cap();
@@ -241,6 +418,95 @@ pub extern "C" fn wallet_send(
             })
             .collect::<Vec<_>>();
 
+        // Preflight: ask daemon whether these key images are already spent (chain or pool).
+        //
+        // If spend detection is lagging or cache is stale, this prevents constructing/broadcasting
+        // a tx which the daemon rejects with `invalid_input`.
+        if !spendable.is_empty() {
+            let key_images: Vec<[u8; 32]> = spendable.iter().map(|o| o.key_image).collect();
+            match rpc_is_key_image_spent(&rpc_client, &key_images) {
+                Ok(statuses) => {
+                    // quarantine spent ones and exclude them from spendable
+                    let mut newly_quarantined: usize = 0;
+                    for (o, st) in spendable.iter().zip(statuses.iter()) {
+                        if *st != 0 {
+                            newly_quarantined += 1;
+                            let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+                            if let Some(state) = map.get_mut(id) {
+                                state
+                                    .invalid_input_quarantine
+                                    .insert((o.tx_hash, o.index_in_tx));
+                            }
+                        }
+                    }
+
+                    if newly_quarantined > 0 {
+                        // Log which outputs were quarantined by preflight so we can correlate with
+                        // later `invalid_input` failures.
+                        if walletcore_decoy_probe_enabled() {
+                            for (o, st) in spendable.iter().zip(statuses.iter()) {
+                                if *st != 0 {
+                                    walletcore_log_line(
+                                        id,
+                                        snapshot.network,
+                                        &format!(
+                                            "🧪 preflight is_key_image_spent: quarantining wallet_id={} out={} key_image={} spent_status={}",
+                                            id,
+                                            format!(
+                                                "{}:{}",
+                                                hex_dump_prefix(&o.tx_hash, 32),
+                                                o.index_in_tx
+                                            ),
+                                            hex_dump_prefix(&o.key_image, 32),
+                                            st
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
+                        quarantined_this_call =
+                            quarantined_this_call.saturating_add(newly_quarantined);
+                        // Re-pull snapshot so we use the updated quarantine set, then rebuild spendable list.
+                        snapshot = {
+                            let map = WALLET_STORE.lock().expect("wallet store poisoned");
+                            match map.get(id) {
+                                Some(state) => state.clone(),
+                                None => {
+                                    record_error(
+                                        -13,
+                                        format!("wallet_send: wallet '{id}' not registered"),
+                                    );
+                                    return ptr::null_mut();
+                                }
+                            }
+                        };
+                        spendable = snapshot
+                            .tracked_outputs
+                            .iter()
+                            .cloned()
+                            .filter(|o| {
+                                !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp)
+                            })
+                            .filter(|o| {
+                                !snapshot
+                                    .invalid_input_quarantine
+                                    .contains(&(o.tx_hash, o.index_in_tx))
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                }
+                Err(e) => {
+                    // Don't hard-fail send if daemon doesn't support it; just log for debugging.
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!("🧪 preflight is_key_image_spent unavailable/failed: wallet_id={} err={}", id, e),
+                    );
+                }
+            }
+        }
+
         // Input selection order
         match walletcore_input_select_mode() {
             InputSelectMode::SmallestFirst => spendable.sort_by_key(|o| o.amount),
@@ -251,6 +517,10 @@ pub extern "C" fn wallet_send(
         let mut selected_tracked: Vec<TrackedOutput> = Vec::new();
         let mut selected_sum: u64 = 0;
         let max_selection_rounds: usize = 24;
+
+        // If we quarantine due to key-image mismatch, we must restart the *outer attempt loop*
+        // so we rebuild `snapshot`/`spendable` with the updated quarantine set.
+        let mut restart_outer_attempt = false;
 
         for _round in 0..max_selection_rounds {
             if selected_tracked.is_empty() {
@@ -276,6 +546,19 @@ pub extern "C" fn wallet_send(
 
             // Reconstruct wallet outputs + decoys for current selection
             let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+            let mut restart_attempt = false;
+
+            // Diagnostics: capture wallet_out-derived KIs for this attempt, aligned to the signer formula.
+            // This is used to compare:
+            // - tracked KI (from refresh)
+            // - reconstructed-output-derived KI (our helper)
+            // - signer-aligned KI computed from the reconstructed output
+            //
+            // NOTE: This must live across selection rounds so it can be logged later even if we rebuild
+            // inputs/decoys multiple times before broadcasting.
+            let mut diag_reconstructed_signer_kis: Vec<([u8; 32], u64, [u8; 32], [u8; 32])> =
+                Vec::new();
+
             for t in &selected_tracked {
                 let block_number = match usize::try_from(t.block_height) {
                     Ok(value) => value,
@@ -325,6 +608,89 @@ pub extern "C" fn wallet_send(
                     }
                 };
 
+                // Key image consistency check: ensure the reconstructed output corresponds to the same
+                // key image we tracked during refresh. If not, this output is not safely spendable
+                // with our current snapshot (reorg/stale cache/subaddress mismatch/etc.).
+                //
+                // IMPORTANT:
+                // Use signer-aligned derivation for the spendability check. Our historical helper
+                // (`derive_key_image_bytes`) has proven to disagree with the signer in some cases.
+                // The signer-aligned KI must match the tracked KI; if it doesn't, we quarantine.
+                let derived_ki = derive_key_image_bytes(
+                    &wallet_out,
+                    master.spend_scalar,
+                    master.view_scalar_ed,
+                    t.subaddress_major,
+                    t.subaddress_minor,
+                );
+
+                // Signer-aligned KI computed from the reconstructed output's key/key_offset.
+                // This is the formula used by `monero-oxide` in `SignableTransaction::sign`.
+                let signer_ki =
+                    signer_key_image_bytes_from_wallet_out(&wallet_out, master.spend_scalar);
+
+                // Record for later correlation (even if we fail early).
+                diag_reconstructed_signer_kis.push((
+                    t.tx_hash,
+                    t.index_in_tx,
+                    derived_ki,
+                    signer_ki,
+                ));
+
+                if signer_ki != t.key_image {
+                    // This is a real spendability invariant violation: the signer would produce a
+                    // different key image than what we tracked during refresh.
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={} signer_key_image={}",
+                            id,
+                            hex_dump_prefix(&t.tx_hash, 32),
+                            t.index_in_tx,
+                            t.subaddress_major,
+                            t.subaddress_minor,
+                            hex_dump_prefix(&t.key_image, 32),
+                            hex_dump_prefix(&derived_ki, 32),
+                            hex_dump_prefix(&signer_ki, 32)
+                        ),
+                    );
+
+                    // Quarantine this outpoint and restart selection so we don't attempt to spend it.
+                    {
+                        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+                        if let Some(state) = map.get_mut(id) {
+                            state
+                                .invalid_input_quarantine
+                                .insert((t.tx_hash, t.index_in_tx));
+                        }
+                    }
+
+                    quarantined_this_call = quarantined_this_call.saturating_add(1);
+                    inputs.clear();
+                    restart_attempt = true;
+                    restart_outer_attempt = true;
+                    break;
+                } else if walletcore_decoy_probe_enabled() && derived_ki != t.key_image {
+                    // Diagnostic only: our legacy helper disagrees, but the signer matches tracked.
+                    // Do NOT quarantine in this case.
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 key_image_derived_mismatch_ignored wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={} signer_key_image={}",
+                            id,
+                            hex_dump_prefix(&t.tx_hash, 32),
+                            t.index_in_tx,
+                            t.subaddress_major,
+                            t.subaddress_minor,
+                            hex_dump_prefix(&t.key_image, 32),
+                            hex_dump_prefix(&derived_ki, 32),
+                            hex_dump_prefix(&signer_ki, 32)
+                        ),
+                    );
+                }
+
                 let with_decoys = if walletcore_decoy_mode_bin16() {
                     let ring_len_eff: u8 = 16;
                     let daemon_iface = match TOKIO_RUNTIME
@@ -347,7 +713,8 @@ pub extern "C" fn wallet_send(
                         &mut rng,
                         &daemon_iface,
                         ring_len_eff,
-                        usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                        usize::try_from(daemon.height.saturating_sub(1))
+                            .unwrap_or(daemon.height.saturating_sub(1) as usize),
                         wallet_out,
                     )) {
                         Ok(i) => i,
@@ -371,7 +738,8 @@ pub extern "C" fn wallet_send(
                         &mut rng,
                         &rpc_client,
                         ring_len_eff,
-                        usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                        usize::try_from(daemon.height.saturating_sub(1))
+                            .unwrap_or(daemon.height.saturating_sub(1) as usize),
                         wallet_out,
                     )) {
                         Ok(i) => i,
@@ -393,6 +761,13 @@ pub extern "C" fn wallet_send(
                 };
 
                 inputs.push(with_decoys);
+            }
+
+            if restart_attempt {
+                // A key-image mismatch was detected and quarantined.
+                // Break out of selection rounds and restart the *outer attempt loop* so we rebuild
+                // `snapshot` and `spendable` with the updated quarantine set.
+                break;
             }
 
             // New OVK seed each attempt
@@ -484,7 +859,19 @@ pub extern "C" fn wallet_send(
             }
         }
 
+        if restart_outer_attempt {
+            // Restart the outer attempt loop. This ensures we re-pull the snapshot and rebuild
+            // `spendable` after the quarantine mutation.
+            continue;
+        }
+
         // Rebuild inputs one last time for final tx
+        //
+        // NOTE: Reset signer KI diagnostics for the final build of inputs so the later log block
+        // uses values corresponding to the actual attempted broadcast.
+        let diag_reconstructed_signer_kis: Vec<([u8; 32], u64, [u8; 32], [u8; 32])> = Vec::new();
+        let mut diag_reconstructed_signer_kis = diag_reconstructed_signer_kis;
+
         let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
         for t in &selected_tracked {
             let block_number = match usize::try_from(t.block_height) {
@@ -534,6 +921,27 @@ pub extern "C" fn wallet_send(
                 }
             };
 
+            // Populate signer-aligned KI diagnostics for the final broadcast attempt.
+            // This allows the later `🧪 ki_diag ...` log block to compare tracked vs derived vs signer KIs
+            // for the exact reconstructed outputs used to build inputs/decoys.
+            {
+                let derived_ki = derive_key_image_bytes(
+                    &wallet_out,
+                    master.spend_scalar,
+                    master.view_scalar_ed,
+                    t.subaddress_major,
+                    t.subaddress_minor,
+                );
+                let signer_ki =
+                    signer_key_image_bytes_from_wallet_out(&wallet_out, master.spend_scalar);
+                diag_reconstructed_signer_kis.push((
+                    t.tx_hash,
+                    t.index_in_tx,
+                    derived_ki,
+                    signer_ki,
+                ));
+            }
+
             let with_decoys = if walletcore_decoy_mode_bin16() {
                 let ring_len_eff: u8 = 16;
                 let daemon_iface = match TOKIO_RUNTIME.block_on(make_bin_decoy_daemon(&base_url)) {
@@ -554,7 +962,8 @@ pub extern "C" fn wallet_send(
                     &mut rng,
                     &daemon_iface,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -578,7 +987,8 @@ pub extern "C" fn wallet_send(
                     &mut rng,
                     &rpc_client,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -644,6 +1054,89 @@ pub extern "C" fn wallet_send(
         {
             let code = map_rpc_error(err.clone());
             let msg = format!("wallet_send: send_raw_transaction failed ({err})");
+            let err_text = format!("{err}");
+
+            // If the daemon reports invalid_input or double_spend, dump ring/key-image invariants
+            // to help diagnose issues like duplicate key images, duplicate ring members, or malformed rings.
+            if walletcore_decoy_probe_enabled()
+                && (is_invalid_input_send_raw_tx_error(&err_text)
+                    || crate::is_double_spend_send_raw_tx_error(&err_text))
+            {
+                // Extract key images from tx prefix inputs
+                let mut key_images_hex: Vec<String> = Vec::new();
+                let mut key_images_set: HashSet<String> = HashSet::new();
+                let mut dup_key_images: Vec<String> = Vec::new();
+
+                // Note: `tx.prefix().inputs` contains `Input::ToKey { key_offsets, key_image, .. }`
+                // where `key_offsets` are relative offsets (Monero encoding).
+                for input in tx.prefix().inputs.iter() {
+                    if let monero_wallet::transaction::Input::ToKey {
+                        key_offsets,
+                        key_image,
+                        ..
+                    } = input
+                    {
+                        let ki_hex = hex_dump_prefix(&key_image.to_bytes(), 32).replace(' ', "");
+                        if !key_images_set.insert(ki_hex.clone()) {
+                            dup_key_images.push(ki_hex.clone());
+                        }
+                        key_images_hex.push(ki_hex.clone());
+
+                        // Check for duplicate absolute ring members (after converting relative offsets)
+                        let mut abs: Vec<u64> = Vec::with_capacity(key_offsets.len());
+                        let mut cur: u64 = 0;
+                        for off in key_offsets {
+                            cur = cur.saturating_add(*off);
+                            abs.push(cur);
+                        }
+                        let mut seen: HashSet<u64> = HashSet::new();
+                        let mut dup_members: Vec<u64> = Vec::new();
+                        for a in &abs {
+                            if !seen.insert(*a) {
+                                dup_members.push(*a);
+                            }
+                        }
+
+                        if !dup_members.is_empty() {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "🧪 ring_sanity: duplicate ring members detected wallet_id={} key_image={} dup_members={:?} ring_len={} first_members={:?}",
+                                    id,
+                                    ki_hex,
+                                    dup_members,
+                                    abs.len(),
+                                    abs.iter().take(8).copied().collect::<Vec<u64>>()
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                if !dup_key_images.is_empty() {
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 ring_sanity: duplicate key images detected wallet_id={} dup_key_images={:?}",
+                            id,
+                            dup_key_images
+                        ),
+                    );
+                }
+
+                walletcore_log_line(
+                    id,
+                    snapshot.network,
+                    &format!(
+                        "🧪 ring_sanity: tx_inputs={} key_images_count={} (hex, no-spaces) key_images_prefix={}",
+                        tx.prefix().inputs.len(),
+                        key_images_hex.len(),
+                        key_images_hex.iter().take(8).cloned().collect::<Vec<_>>().join(",")
+                    ),
+                );
+            }
 
             // Log selected inputs for correlation
             walletcore_log_line(
@@ -670,6 +1163,51 @@ pub extern "C" fn wallet_send(
                 ),
             );
 
+            // Signer-aligned KI diagnostics: for each selected input, show
+            // - tracked KI (refresh)
+            // - derived KI (our helper from reconstructed output)
+            // - signer KI (computed from reconstructed output exactly like monero-oxide signer)
+            //
+            // This helps determine whether the mismatch is:
+            // - refresh tracking (tracked != signer),
+            // - reconstruction/derivation (derived != signer),
+            // - or something deeper (none match).
+            if walletcore_decoy_probe_enabled() {
+                for t in &selected_tracked {
+                    let tracked = t.key_image;
+                    let mut derived_opt: Option<[u8; 32]> = None;
+                    let mut signer_opt: Option<[u8; 32]> = None;
+
+                    for (txh, idx, derived, signer) in diag_reconstructed_signer_kis.iter() {
+                        if *txh == t.tx_hash && *idx == t.index_in_tx {
+                            derived_opt = Some(*derived);
+                            signer_opt = Some(*signer);
+                            break;
+                        }
+                    }
+
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 ki_diag wallet_id={} out={}:{} tracked_key_image={} derived_key_image={} signer_key_image={}",
+                            id,
+                            hex_dump_prefix(&t.tx_hash, 32),
+                            t.index_in_tx,
+                            hex_dump_prefix(&tracked, 32),
+                            match derived_opt {
+                                Some(v) => hex_dump_prefix(&v, 32),
+                                None => "(none)".to_string(),
+                            },
+                            match signer_opt {
+                                Some(v) => hex_dump_prefix(&v, 32),
+                                None => "(none)".to_string(),
+                            },
+                        ),
+                    );
+                }
+            }
+
             walletcore_debug_dump_tracked_outputs(
                 id,
                 snapshot.network,
@@ -679,11 +1217,146 @@ pub extern "C" fn wallet_send(
                 daemon.top_block_timestamp,
             );
 
-            // Optional: bisect on invalid_input, and optionally on status=Failed.
+            // If the daemon reports a double spend, proactively check the daemon's view of the
+            // tx key images and quarantine any matching *selected inputs* whose key images are
+            // spent in chain or pool.
+            //
+            // IMPORTANT: only quarantine when we have spent evidence (`spent_status` 1/2). If the
+            // daemon reports double-spend but `is_key_image_spent` returns all unspent, we should
+            // not quarantine random outputs.
+            if crate::is_double_spend_send_raw_tx_error(&err_text) {
+                // Extract all key images from the signed tx.
+                let mut tx_key_images: Vec<[u8; 32]> = Vec::new();
+                for input in tx.prefix().inputs.iter() {
+                    if let monero_wallet::transaction::Input::ToKey { key_image, .. } = input {
+                        tx_key_images.push(key_image.to_bytes());
+                    }
+                }
+
+                match rpc_is_key_image_spent(&rpc_client, &tx_key_images) {
+                    Ok(statuses) => {
+                        let mut newly_quarantined: usize = 0;
+
+                        // For each spent key image in the tx, quarantine the matching selected output.
+                        for (ki, st) in tx_key_images.iter().zip(statuses.iter()) {
+                            if *st == 0 {
+                                continue;
+                            }
+
+                            for o in selected_tracked.iter() {
+                                if &o.key_image != ki {
+                                    continue;
+                                }
+
+                                newly_quarantined += 1;
+
+                                // Quarantine the outpoint.
+                                {
+                                    let mut map =
+                                        WALLET_STORE.lock().expect("wallet store poisoned");
+                                    if let Some(state) = map.get_mut(id) {
+                                        state
+                                            .invalid_input_quarantine
+                                            .insert((o.tx_hash, o.index_in_tx));
+                                        // Also mark as spent if the daemon says it's spent in blockchain.
+                                        if *st == 1 {
+                                            if let Some(out) =
+                                                state.tracked_outputs.iter_mut().find(|x| {
+                                                    x.tx_hash == o.tx_hash
+                                                        && x.index_in_tx == o.index_in_tx
+                                                })
+                                            {
+                                                out.spent = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if walletcore_decoy_probe_enabled() {
+                                    walletcore_log_line(
+                                        id,
+                                        snapshot.network,
+                                        &format!(
+                                            "🧪 double_spend sweep: quarantining wallet_id={} out={}:{} key_image={} spent_status={}",
+                                            id,
+                                            hex_dump_prefix(&o.tx_hash, 32),
+                                            o.index_in_tx,
+                                            hex_dump_prefix(&o.key_image, 32),
+                                            st
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
+                        if newly_quarantined > 0 {
+                            quarantined_this_call =
+                                quarantined_this_call.saturating_add(newly_quarantined);
+                        } else {
+                            // Important diagnostic: if we observed spent key images for this tx but none
+                            // matched our selected inputs, we cannot quarantine and will likely loop.
+                            // Log this even when probe is off, since it's a correctness signal.
+                            let any_spent = statuses.iter().any(|st| *st != 0);
+                            if any_spent {
+                                walletcore_log_line(
+                                    id,
+                                    snapshot.network,
+                                    &format!(
+                                        "🧪 double_spend sweep: spent key images had no match in selected_tracked (selected_inputs={} tx_inputs={}) wallet_id={}",
+                                        selected_tracked.len(),
+                                        tx_key_images.len(),
+                                        id
+                                    ),
+                                );
+                            } else if walletcore_decoy_probe_enabled() {
+                                walletcore_log_line(
+                                    id,
+                                    snapshot.network,
+                                    &format!(
+                                        "🧪 double_spend sweep: daemon reported double_spend but is_key_image_spent returned all unspent (tx_inputs={}) wallet_id={}",
+                                        tx_key_images.len(),
+                                        id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if walletcore_decoy_probe_enabled() {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "🧪 double_spend sweep is_key_image_spent failed: wallet_id={} err={}",
+                                    id, e
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Optional: bisect/quarantine when the daemon signals either:
+            // - invalid_input=true
+            // - double_spend=true
+            //
+            // We explicitly do NOT bisect on generic `status=Failed` as it can quarantine good inputs.
+            //
+            // IMPORTANT:
+            // - Bisect is now *opt-in only* via `WALLETCORE_SEND_BISECT=1`.
+            // - If we already quarantined any selected inputs based on direct spent evidence (wallet2-like),
+            //   do NOT run bisect in the same failure path. Bisect can otherwise "hunt" and quarantine
+            //   unrelated good outputs, making state worse.
+            //
+            // NOTE: Classify based on the daemon error text itself (`err_text`), not the wrapper `msg`.
             let should_bisect = walletcore_send_bisect_enabled()
-                && (is_invalid_input_send_raw_tx_error(&msg)
-                    || (walletcore_send_bisect_on_failed_enabled()
-                        && is_failed_send_raw_tx_error(&msg)));
+                && std::env::var("WALLETCORE_SEND_BISECT")
+                    .ok()
+                    .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                && quarantined_this_call == 0
+                && (is_invalid_input_send_raw_tx_error(&err_text)
+                    || crate::is_double_spend_send_raw_tx_error(&err_text));
 
             // If we're not bisecting (or can't quarantine), just return the error.
             if !should_bisect {
@@ -736,7 +1409,8 @@ pub extern "C" fn wallet_send(
                                 &mut rng,
                                 &daemon_iface,
                                 ring_len_eff,
-                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                usize::try_from(daemon.height.saturating_sub(1))
+                                    .unwrap_or(daemon.height.saturating_sub(1) as usize),
                                 wallet_out,
                             ))
                             .map_err(|e| format!("decoy selection failed ({:?})", e))?
@@ -746,7 +1420,8 @@ pub extern "C" fn wallet_send(
                                 &mut rng,
                                 &rpc_client,
                                 ring_len_eff,
-                                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                                usize::try_from(daemon.height.saturating_sub(1))
+                                    .unwrap_or(daemon.height.saturating_sub(1) as usize),
                                 wallet_out,
                             ))
                             .map_err(|e| format!("decoy selection failed ({:?})", e))?
@@ -780,15 +1455,139 @@ pub extern "C" fn wallet_send(
                 match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
                     Ok(()) => Ok(()),
                     Err(e) => {
-                        let tag = if is_invalid_input_send_raw_tx_error(&format!("{e}")) {
+                        let e_text = format!("{e}");
+                        let tag = if is_invalid_input_send_raw_tx_error(&e_text) {
                             "invalid_input"
-                        } else if walletcore_send_bisect_on_failed_enabled()
-                            && is_failed_send_raw_tx_error(&format!("{e}"))
-                        {
-                            "failed"
+                        } else if crate::is_double_spend_send_raw_tx_error(&e_text) {
+                            "double_spend"
                         } else {
                             "other"
                         };
+
+                        // On double-spend, sweep *all tx input key images* and report what the daemon says.
+                        // If any are spent (chain=1 or pool=2), quarantine the *matching selected outputs*.
+                        //
+                        // IMPORTANT (wallet2-like behavior):
+                        // - Always do this sweep on double-spend (not gated on probe mode).
+                        // - Treat spent-in-chain (1) and spent-in-pool (2) the same for input selection:
+                        //   both must not be selected again.
+                        if crate::is_double_spend_send_raw_tx_error(&e_text) {
+                            let mut tx_key_images: Vec<[u8; 32]> = Vec::new();
+                            for input in tx.prefix().inputs.iter() {
+                                if let monero_wallet::transaction::Input::ToKey {
+                                    key_image, ..
+                                } = input
+                                {
+                                    tx_key_images.push(key_image.to_bytes());
+                                }
+                            }
+
+                            match rpc_is_key_image_spent(&rpc_client, &tx_key_images) {
+                                Ok(statuses) => {
+                                    let mut any_spent = false;
+
+                                    for (ki, st) in tx_key_images.iter().zip(statuses.iter()) {
+                                        if *st == 0 {
+                                            continue;
+                                        }
+                                        any_spent = true;
+
+                                        walletcore_log_line(
+                                            id,
+                                            snapshot.network,
+                                            &format!(
+                                                "🧪 try_subset double_spend sweep: key_image={} spent_status={}",
+                                                hex_dump_prefix(ki, 32),
+                                                st
+                                            ),
+                                        );
+
+                                        // Quarantine matching outputs in the *current selection* (the attempted tx inputs),
+                                        // not just the bisect subset.
+                                        //
+                                        // Rationale: bisect subsets are a debugging tool and may not include all
+                                        // inputs of the failing tx in later rounds; we still must quarantine the
+                                        // actually-spent inputs to converge.
+                                        let mut matched_any = false;
+                                        for o in selected_tracked.iter() {
+                                            if &o.key_image != ki {
+                                                continue;
+                                            }
+                                            matched_any = true;
+
+                                            let mut map =
+                                                WALLET_STORE.lock().expect("wallet store poisoned");
+                                            if let Some(state) = map.get_mut(id) {
+                                                state
+                                                    .invalid_input_quarantine
+                                                    .insert((o.tx_hash, o.index_in_tx));
+
+                                                // If daemon confirms spent-in-chain, also mark as spent so refresh/spend-detect
+                                                // state converges quickly.
+                                                if *st == 1 {
+                                                    if let Some(out) =
+                                                        state.tracked_outputs.iter_mut().find(|x| {
+                                                            x.tx_hash == o.tx_hash
+                                                                && x.index_in_tx == o.index_in_tx
+                                                        })
+                                                    {
+                                                        out.spent = true;
+                                                    }
+                                                }
+                                            }
+
+                                            walletcore_log_line(
+                                                id,
+                                                snapshot.network,
+                                                &format!(
+                                                    "🧪 try_subset double_spend sweep: quarantined_out wallet_id={} out={}:{} key_image={} spent_status={}",
+                                                    id,
+                                                    hex_dump_prefix(&o.tx_hash, 32),
+                                                    o.index_in_tx,
+                                                    hex_dump_prefix(&o.key_image, 32),
+                                                    st
+                                                ),
+                                            );
+                                        }
+
+                                        if !matched_any {
+                                            walletcore_log_line(
+                                                id,
+                                                snapshot.network,
+                                                &format!(
+                                                    "🧪 try_subset double_spend sweep: spent key_image had no match in selected_tracked set (selected_inputs={}) key_image={} spent_status={}",
+                                                    selected_tracked.len(),
+                                                    hex_dump_prefix(ki, 32),
+                                                    st
+                                                ),
+                                            );
+                                        }
+                                    }
+
+                                    if !any_spent {
+                                        walletcore_log_line(
+                                            id,
+                                            snapshot.network,
+                                            &format!(
+                                                "🧪 try_subset double_spend sweep: daemon reported double_spend but is_key_image_spent returned all unspent (tx_inputs={})",
+                                                tx_key_images.len()
+                                            ),
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    walletcore_log_line(
+                                        id,
+                                        snapshot.network,
+                                        &format!(
+                                            "🧪 try_subset double_spend sweep is_key_image_spent failed: err={}",
+                                            err
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
                         Err(format!("broadcast failed ({}): {}", tag, e))
                     }
                 }
@@ -807,8 +1606,7 @@ pub extern "C" fn wallet_send(
                     }
                     Err(e) => {
                         let is_signal = e.contains("broadcast failed (invalid_input):")
-                            || (walletcore_send_bisect_on_failed_enabled()
-                                && e.contains("broadcast failed (failed):"));
+                            || e.contains("broadcast failed (double_spend):");
                         if is_signal {
                             last_err = Some(e);
                             hi = mid.max(lo + 1);
@@ -828,37 +1626,119 @@ pub extern "C" fn wallet_send(
                     id,
                     snapshot.network,
                     &format!(
-                        "🧨 send_bisect: candidate invalid_input output wallet_id={} txid={} index_in_tx={} height={} amount_piconero={} err={}",
+                        "🧨 send_bisect: candidate invalid_input output wallet_id={} txid={} index_in_tx={} height={} amount_piconero={} key_image={} err={}",
                         id,
                         hex_dump_prefix(&bad.tx_hash, 32),
                         bad.index_in_tx,
                         bad.block_height,
                         bad.amount,
+                        hex_dump_prefix(&bad.key_image, 32),
                         last_err.clone().unwrap_or_else(|| "(none)".to_string())
                     ),
                 );
 
-                if let Ok(mut map) = WALLET_STORE.lock() {
-                    if let Some(state) = map.get_mut(id) {
-                        let key = (bad.tx_hash, bad.index_in_tx);
-                        newly_inserted = state.invalid_input_quarantine.insert(key);
-                        quarantined_out =
-                            Some((hex_lowercase(&bad.tx_hash), bad.index_in_tx as u32));
-                        walletcore_log_line(
-                            id,
-                            snapshot.network,
-                            &format!(
-                                "🧾 invalid_input_quarantine {} wallet_id={} out={} quarantine_size={}",
-                                if newly_inserted {
-                                    "added"
-                                } else {
-                                    "already_present"
-                                },
+                // Extra probe: check the daemon's view of this candidate key image before quarantining.
+                // This helps distinguish "actually spent/in-pool" from "reconstruction mismatch".
+                //
+                // For double_spend, avoid quarantining unless we have spent evidence (status 1/2).
+                let mut candidate_spent_status: Option<u8> = None;
+                if walletcore_decoy_probe_enabled() {
+                    match rpc_is_key_image_spent(&rpc_client, &[bad.key_image]) {
+                        Ok(statuses) => {
+                            let st = statuses.get(0).copied().unwrap_or(255);
+                            candidate_spent_status = Some(st);
+                            walletcore_log_line(
                                 id,
-                                format!("{}:{}", hex_lowercase(&bad.tx_hash), bad.index_in_tx),
-                                state.invalid_input_quarantine.len()
-                            ),
-                        );
+                                snapshot.network,
+                                &format!(
+                                    "🧪 bisect candidate is_key_image_spent: wallet_id={} out={}:{} key_image={} spent_status={}",
+                                    id,
+                                    hex_dump_prefix(&bad.tx_hash, 32),
+                                    bad.index_in_tx,
+                                    hex_dump_prefix(&bad.key_image, 32),
+                                    st
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "🧪 bisect candidate is_key_image_spent failed: wallet_id={} out={}:{} key_image={} err={}",
+                                    id,
+                                    hex_dump_prefix(&bad.tx_hash, 32),
+                                    bad.index_in_tx,
+                                    hex_dump_prefix(&bad.key_image, 32),
+                                    e
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                // Gate quarantine for double_spend: only quarantine when the daemon also reports
+                // the candidate key image as spent (in chain or pool). Otherwise, we risk
+                // quarantining valid inputs due to inconsistent daemon views.
+                //
+                // NOTE: Some errors may be tagged `invalid_input` yet still include `double_spend=true`.
+                // Treat any double-spend tag as requiring spent evidence.
+                let last_err_is_double_spend = last_err.as_deref().is_some_and(|e| {
+                    is_double_spend_tagged_broadcast_error(e)
+                        || crate::is_double_spend_send_raw_tx_error(e)
+                });
+                let allow_quarantine = if last_err_is_double_spend {
+                    matches!(candidate_spent_status, Some(1) | Some(2))
+                } else {
+                    true
+                };
+
+                if allow_quarantine {
+                    if let Ok(mut map) = WALLET_STORE.lock() {
+                        if let Some(state) = map.get_mut(id) {
+                            let key = (bad.tx_hash, bad.index_in_tx);
+                            newly_inserted = state.invalid_input_quarantine.insert(key);
+                            quarantined_out =
+                                Some((hex_lowercase(&bad.tx_hash), bad.index_in_tx as u32));
+                        }
+                    }
+                } else if walletcore_decoy_probe_enabled() {
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 double_spend bisect: not quarantining candidate (no spent evidence) wallet_id={} out={}:{} key_image={} spent_status={:?} err={}",
+                            id,
+                            hex_dump_prefix(&bad.tx_hash, 32),
+                            bad.index_in_tx,
+                            hex_dump_prefix(&bad.key_image, 32),
+                            candidate_spent_status,
+                            last_err.clone().unwrap_or_else(|| "(none)".to_string())
+                        ),
+                    );
+                }
+
+                // Keep quarantine logging inside the allow_quarantine branch so it doesn't reference
+                // `state` out of scope and doesn't run when we chose not to quarantine.
+                if allow_quarantine {
+                    if let Ok(map) = WALLET_STORE.lock() {
+                        if let Some(state) = map.get(id) {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "🧾 invalid_input_quarantine {} wallet_id={} out={} quarantine_size={}",
+                                    if newly_inserted {
+                                        "added"
+                                    } else {
+                                        "already_present"
+                                    },
+                                    id,
+                                    format!("{}:{}", hex_lowercase(&bad.tx_hash), bad.index_in_tx),
+                                    state.invalid_input_quarantine.len()
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -1160,12 +2040,22 @@ pub extern "C" fn wallet_send_with_filter(
         }
     };
 
+    // Prepare scanner with registered subaddresses.
+    //
+    // Same rationale as `wallet_send`: we must be able to reconstruct any selected output
+    // even if it was received on a higher subaddress minor index than `gap_limit`.
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
-    if let Some(i0) = SubaddressIndex::new(0, 0) {
-        scanner.register_subaddress(i0);
-    }
-    for minor in 1..=gap_limit {
+
+    let max_minor_in_wallet = snapshot
+        .tracked_outputs
+        .iter()
+        .map(|o| o.subaddress_minor)
+        .max()
+        .unwrap_or(0);
+    let register_up_to = gap_limit.max(max_minor_in_wallet.saturating_add(5));
+
+    for minor in 0..=register_up_to {
         if let Some(index) = SubaddressIndex::new(0, minor) {
             scanner.register_subaddress(index);
         }
@@ -1303,13 +2193,98 @@ pub extern "C" fn wallet_send_with_filter(
             }) {
                 Some(wo) => wo,
                 None => {
-                    record_error(
-                        -16,
-                        "wallet_send_with_filter: failed to reconstruct selected output",
-                    );
+                    record_error(-16, "wallet_send: failed to reconstruct selected output");
                     return ptr::null_mut();
                 }
             };
+
+            // Define the key image derivation helper locally for this send-with-filter path.
+            // This mirrors the refresh computation used to populate `TrackedOutput.key_image`.
+            let derive_key_image_bytes = |wallet_out: &monero_wallet::WalletOutput,
+                                          spend_scalar_dalek: curve25519_dalek::Scalar,
+                                          view_scalar_ed: monero_wallet::ed25519::Scalar,
+                                          subaddress_major: u32,
+                                          subaddress_minor: u32|
+             -> [u8; 32] {
+                let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
+                let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
+                    .into_option()
+                    .unwrap_or(curve25519_dalek::Scalar::ZERO);
+
+                let m_dalek = if subaddress_major == 0 && subaddress_minor == 0 {
+                    curve25519_dalek::Scalar::ZERO
+                } else {
+                    let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+                    data.extend_from_slice(b"SubAddr\0");
+                    data.extend_from_slice(&<[u8; 32]>::from(view_scalar_ed));
+                    data.extend_from_slice(&subaddress_major.to_le_bytes());
+                    data.extend_from_slice(&subaddress_minor.to_le_bytes());
+                    let m_ed: monero_wallet::ed25519::Scalar =
+                        monero_wallet::ed25519::Scalar::hash(&data);
+                    let m_d: curve25519_dalek::Scalar = m_ed.into();
+                    m_d
+                };
+
+                let x = spend_scalar_dalek + ko_dalek + m_dalek;
+
+                let p = wallet_out.key();
+                let p_bytes = p.compress().to_bytes();
+                let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
+                let hp_p_bytes = hp_p.compress().to_bytes();
+
+                use curve25519_dalek::traits::Identity;
+                let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
+                    .decompress()
+                    .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
+
+                let ki = hp_p_dalek * x;
+                ki.compress().to_bytes()
+            };
+
+            // Key image consistency check: ensure the reconstructed output corresponds to the same
+            // key image we tracked during refresh. If not, this output is not safely spendable
+            // with our current snapshot (reorg/stale cache/subaddress mismatch/etc.).
+            let derived_ki = derive_key_image_bytes(
+                &wallet_out,
+                master.spend_scalar,
+                master.view_scalar_ed,
+                t.subaddress_major,
+                t.subaddress_minor,
+            );
+            if derived_ki != t.key_image {
+                if walletcore_decoy_probe_enabled() {
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={}",
+                            id,
+                            hex_dump_prefix(&t.tx_hash, 32),
+                            t.index_in_tx,
+                            t.subaddress_major,
+                            t.subaddress_minor,
+                            hex_dump_prefix(&t.key_image, 32),
+                            hex_dump_prefix(&derived_ki, 32)
+                        ),
+                    );
+                }
+
+                // Quarantine this outpoint and restart selection so we don't attempt to spend it.
+                {
+                    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+                    if let Some(state) = map.get_mut(id) {
+                        state
+                            .invalid_input_quarantine
+                            .insert((t.tx_hash, t.index_in_tx));
+                    }
+                }
+
+                // In the filtered send path we don't have the bounded auto-retry loop state.
+                // We still quarantine the outpoint to prevent repeated invalid spends.
+                // Force a retry loop iteration by breaking out so selection is rebuilt.
+                inputs.clear();
+                break;
+            }
 
             let with_decoys = if walletcore_decoy_mode_bin16() {
                 let ring_len_eff: u8 = 16;
@@ -1331,7 +2306,8 @@ pub extern "C" fn wallet_send_with_filter(
                     &mut rng,
                     &daemon_iface,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -1355,7 +2331,8 @@ pub extern "C" fn wallet_send_with_filter(
                     &mut rng,
                     &rpc_client,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    usize::try_from(daemon.height.saturating_sub(1))
+                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
                     wallet_out,
                 )) {
                     Ok(i) => i,
