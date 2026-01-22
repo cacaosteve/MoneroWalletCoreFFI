@@ -363,6 +363,16 @@ int32_t wallet_force_rescan_from_height(
     uint64_t new_restore_height
 );
 
+/*
+ * Reset tracked outputs and invalid-input quarantine without changing restore height.
+ *
+ * Intended for cache invalidation / self-heal when persisted state becomes incompatible
+ * (e.g., key image derivation changes) and the app wants to force a clean rebuild on next refresh.
+ *
+ * Returns 0 on success.
+ */
+int32_t wallet_reset_tracked_outputs(const char* wallet_id);
+
 WALLETCORE_EXTERN_C_END
 
 #endif /* MONEROWALLETCORE_H */

@@ -17,6 +17,11 @@ use core::ffi::{c_char, c_int};
 use core::{ptr, slice};
 use std::ffi::CStr;
 
+// Cache compatibility version.
+// Bump this when the persisted cache format OR the semantics of persisted fields change
+// in a way that makes old caches unsafe to import (e.g. key image derivation changes).
+const WALLETCORE_CACHE_VERSION: u32 = 2;
+
 #[no_mangle]
 pub extern "C" fn wallet_import_cache(
     wallet_id: *const c_char,
@@ -45,6 +50,22 @@ pub extern "C" fn wallet_import_cache(
             )
         }
     };
+
+    // Cache compatibility gate.
+    //
+    // We persist key images inside `tracked_outputs`. If the derivation logic ever changes,
+    // importing old caches becomes unsafe and can lead to `key_image_mismatch` quarantine spirals
+    // and confusing send failures. Reject incompatible blobs so the app can delete the file
+    // and rebuild via refresh/rescan.
+    if persisted.cache_version != WALLETCORE_CACHE_VERSION {
+        return record_error(
+            -16,
+            format!(
+                "wallet_import_cache: incompatible cache version (have {}, want {})",
+                persisted.cache_version, WALLETCORE_CACHE_VERSION
+            ),
+        );
+    }
 
     let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
     match map.get_mut(id) {

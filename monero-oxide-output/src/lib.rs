@@ -47,6 +47,12 @@ enum BulkFetchMode {
 
 const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 
+/// Persisted cache schema / compatibility version.
+///
+/// Bump this when the persisted cache format or the semantics of persisted fields change
+/// in a way that makes old caches unsafe to import (e.g. key image derivation changes).
+const WALLETCORE_CACHE_VERSION: u32 = 2;
+
 fn walletcore_disable_decoys() -> bool {
     matches!(
         std::env::var("WALLETCORE_DISABLE_DECOYS").ok().as_deref(),
@@ -232,6 +238,7 @@ async fn broadcast_send_raw_transaction(
         overspend: Option<bool>,
         not_relayed: Option<bool>,
         sanity_check_failed: Option<bool>,
+        double_spend: Option<bool>,
     }
 
     let tx_as_hex = hex_lowercase(tx_bytes);
@@ -258,13 +265,35 @@ async fn broadcast_send_raw_transaction(
         )
     })?;
 
-    let status = res.status.unwrap_or_else(|| "UNKNOWN".to_string());
+    let status = res.status.clone().unwrap_or_else(|| "UNKNOWN".to_string());
     if status.eq_ignore_ascii_case("OK") {
         return Ok(());
     }
 
+    // Under probe mode, include the raw daemon response JSON to make it possible to diagnose
+    // cases where `reason` is missing/empty or the daemon returns non-standard fields.
+    if matches!(
+        std::env::var("WALLETCORE_DECOY_PROBE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    ) {
+        return Err(monero_interface::InterfaceError::InterfaceError(format!(
+            "send_raw_transaction raw_response={} parsed_status={} parsed_reason={} fee_too_low={:?} too_big={:?} invalid_input={:?} invalid_output={:?} overspend={:?} not_relayed={:?} sanity_check_failed={:?} double_spend={:?}",
+            raw,
+            status,
+            res.reason.clone().unwrap_or_else(|| "(none)".to_string()),
+            res.fee_too_low,
+            res.too_big,
+            res.invalid_input,
+            res.invalid_output,
+            res.overspend,
+            res.not_relayed,
+            res.sanity_check_failed,
+            res.double_spend
+        )));
+    }
+
     Err(monero_interface::InterfaceError::InterfaceError(format!(
-        "send_raw_transaction status={} reason={} fee_too_low={:?} too_big={:?} invalid_input={:?} invalid_output={:?} overspend={:?} not_relayed={:?} sanity_check_failed={:?}",
+        "send_raw_transaction status={} reason={} fee_too_low={:?} too_big={:?} invalid_input={:?} invalid_output={:?} overspend={:?} not_relayed={:?} sanity_check_failed={:?} double_spend={:?}",
         status,
         res.reason.unwrap_or_else(|| "(none)".to_string()),
         res.fee_too_low,
@@ -273,7 +302,8 @@ async fn broadcast_send_raw_transaction(
         res.invalid_output,
         res.overspend,
         res.not_relayed,
-        res.sanity_check_failed
+        res.sanity_check_failed,
+        res.double_spend
     )))
 }
 
@@ -794,19 +824,32 @@ pub(crate) fn is_invalid_input_send_raw_tx_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     // We currently bubble errors up in a few different string shapes (depending on which layer created them).
     // Make this matcher resilient so bisect triggers reliably.
-    m.contains("send_raw_transaction status=failed") && m.contains("invalid_input=some(true)")
+    //
+    // Examples we may see:
+    // - `... send_raw_transaction status=Failed ... invalid_input=Some(true) ...`
+    // - `... raw_response={...,"invalid_input":true,...} ...`
+    m.contains("invalid_input=some(true)") || m.contains(r#""invalid_input":true"#)
 }
 
-pub(crate) fn is_failed_send_raw_tx_error(msg: &str) -> bool {
+pub(crate) fn is_double_spend_send_raw_tx_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    m.contains("send_raw_transaction status=failed")
+    // Examples we may see:
+    // - `... send_raw_transaction status=Failed ... double_spend=Some(true) ...`
+    // - `... raw_response={...,"double_spend":true,...} ...`
+    m.contains("double_spend=some(true)") || m.contains(r#""double_spend":true"#)
+}
+
+pub(crate) fn is_failed_send_raw_tx_error(_msg: &str) -> bool {
+    // Intentionally disabled: we no longer bisect/quarantine on generic
+    // `send_raw_transaction status=Failed` because it causes false positives.
+    // Only quarantine on `invalid_input=Some(true)` (or explicit spent preflight).
+    false
 }
 
 pub(crate) fn walletcore_send_bisect_on_failed_enabled() -> bool {
-    std::env::var("WALLETCORE_SEND_BISECT_ON_FAILED")
-        .ok()
-        .map(|v| v != "0")
-        .unwrap_or(false)
+    // Deprecated/ignored: bisecting on generic failed broadcasts is unsafe and can quarantine
+    // valid inputs. Keep the env var for backward compatibility but disable behavior.
+    false
 }
 
 /// Env toggle: enable bisect debugging on *normal sends* when daemon broadcast reports invalid_input=true.
@@ -2300,6 +2343,13 @@ pub(crate) enum PersistedNetwork {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedWallet {
+    /// Cache compatibility version for this blob.
+    ///
+    /// Marked `serde(default)` so older cache blobs can still be deserialized; old blobs
+    /// will deserialize with version 0 and be rejected by import logic.
+    #[serde(default)]
+    cache_version: u32,
+
     network: PersistedNetwork,
     restore_height: u64,
     last_scanned: u64,
@@ -2407,6 +2457,8 @@ impl From<&PersistedNetwork> for MoneroNetwork {
 impl From<&StoredWallet> for PersistedWallet {
     fn from(wallet: &StoredWallet) -> Self {
         Self {
+            cache_version: WALLETCORE_CACHE_VERSION,
+
             network: wallet.network.into(),
             restore_height: wallet.restore_height,
             last_scanned: wallet.last_scanned,
@@ -2433,6 +2485,21 @@ impl From<&StoredWallet> for PersistedWallet {
 
 impl PersistedWallet {
     pub(crate) fn apply_to_state(self, state: &mut StoredWallet) {
+        // Cache compatibility gate:
+        // If the cache version is missing (older blob => 0) or doesn't match our current schema,
+        // reject applying it to avoid subtle corruption (e.g. stale/wrong key images).
+        if self.cache_version != WALLETCORE_CACHE_VERSION {
+            // Use last-error channel so callers (Swift) can surface it and delete the on-disk cache.
+            record_error(
+                -16,
+                format!(
+                    "wallet_import_cache: incompatible cache version (have {}, want {})",
+                    self.cache_version, WALLETCORE_CACHE_VERSION
+                ),
+            );
+            return;
+        }
+
         state.last_scanned = self.last_scanned.max(state.restore_height);
         state.total = self.total;
         state.unlocked = self.unlocked;
@@ -2875,6 +2942,54 @@ pub use crate::ffi::sweep::wallet_sweep;
 pub use crate::ffi::sweep::wallet_sweep_with_filter;
 pub use crate::ffi::transfers::wallet_export_outputs_json;
 pub use crate::ffi::transfers::wallet_list_transfers_json;
+
+#[no_mangle]
+pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_int {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        return record_error(
+            -11,
+            "wallet_reset_tracked_outputs: wallet_id pointer was null",
+        );
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_reset_tracked_outputs: wallet_id contained invalid UTF-8",
+            );
+        }
+    };
+
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    match map.get_mut(id) {
+        Some(state) => {
+            // Drop output bookkeeping and quarantine without changing restore height.
+            // This allows the app to "heal" after derivation changes or inconsistent node behavior,
+            // while keeping the user's restore height hint intact.
+            state.tracked_outputs.clear();
+            state.seen_outpoints.clear();
+            state.invalid_input_quarantine.clear();
+
+            // Pending outgoing may refer to now-untracked outputs/change; clear for safety.
+            state.pending_outgoing.clear();
+
+            // Balances will be recomputed on next refresh.
+            state.total = 0;
+            state.unlocked = 0;
+
+            clear_last_error();
+            0
+        }
+        None => record_error(
+            -13,
+            format!("wallet_reset_tracked_outputs: wallet '{id}' not opened"),
+        ),
+    }
+}
 
 // (moved to src/ffi/sweep.rs)
 

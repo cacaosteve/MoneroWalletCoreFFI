@@ -18,3 +18,7 @@ pub(crate) type RpcClient =
 pub(crate) use monero_interface::{
     ProvidesBlockchainMeta as _, ProvidesFeeRates as _, ProvidesScannableBlocks as _,
 };
+
+// Bring MoneroDaemon's JSON-RPC helper into scope for callers which need bespoke daemon methods
+// (e.g. `is_key_image_spent` preflight).
+pub(crate) use monero_daemon_rpc::MoneroDaemon as _;

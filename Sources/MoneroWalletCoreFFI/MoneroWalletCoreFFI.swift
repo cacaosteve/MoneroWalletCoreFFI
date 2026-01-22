@@ -212,6 +212,17 @@ public enum WalletCoreFFIClient {
         try checkRC(rc, context: "wallet_force_rescan_from_height")
     }
 
+    /// Reset tracked outputs and invalid-input quarantine without changing restore height.
+    ///
+    /// Intended for cache invalidation / self-heal when persisted state becomes incompatible
+    /// (e.g., key image derivation changes) and the app wants to force a clean rebuild on next refresh.
+    public static func resetTrackedOutputs(walletId: String) throws {
+        let rc = walletId.withCString { cId in
+            wallet_reset_tracked_outputs(cId)
+        }
+        try checkRC(rc, context: "wallet_reset_tracked_outputs")
+    }
+
     public static func startZmqListener(endpoint: String) throws {
 #if canImport(CLibMoneroWalletCore)
         let rc = endpoint.withCString { cEndpoint in
