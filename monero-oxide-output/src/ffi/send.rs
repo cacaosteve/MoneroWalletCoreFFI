@@ -39,35 +39,8 @@ fn is_double_spend_tagged_broadcast_error(s: &str) -> bool {
 /// - key_image = input_secret * Hp(P)
 ///
 /// This intentionally ignores any subaddress `m` term; the signer does not include it.
-fn signer_key_image_bytes_from_wallet_out(
-    wallet_out: &monero_wallet::WalletOutput,
-    spend_scalar_dalek: curve25519_dalek::Scalar,
-) -> [u8; 32] {
-    use curve25519_dalek::traits::Identity as _;
-    use monero_wallet::ed25519;
-
-    // key_offset: monero_wallet::ed25519::Scalar -> [u8;32] -> dalek scalar
-    let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
-    let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
-        .into_option()
-        .unwrap_or(curve25519_dalek::Scalar::ZERO);
-
-    // x = a + key_offset
-    let x = spend_scalar_dalek + ko_dalek;
-
-    // Hp(P)
-    let p = wallet_out.key();
-    let p_bytes = p.compress().to_bytes();
-    let hp_p = ed25519::Point::biased_hash(p_bytes);
-    let hp_p_bytes = hp_p.compress().to_bytes();
-
-    let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
-        .decompress()
-        .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
-
-    // I = x * Hp(P)
-    (hp_p_dalek * x).compress().to_bytes()
-}
+// NOTE: signer-aligned key image derivation is provided by shared support (`derive_key_image_bytes`)
+// and should not be duplicated in this module.
 
 /// Query daemon for key image spent status via *non-JSON* RPC route (`/is_key_image_spent`).
 ///
@@ -612,11 +585,8 @@ pub extern "C" fn wallet_send(
                 // key image we tracked during refresh. If not, this output is not safely spendable
                 // with our current snapshot (reorg/stale cache/subaddress mismatch/etc.).
                 //
-                // IMPORTANT:
-                // Use signer-aligned derivation for the spendability check. Our historical helper
-                // (`derive_key_image_bytes`) has proven to disagree with the signer in some cases.
-                // The signer-aligned KI must match the tracked KI; if it doesn't, we quarantine.
-                let derived_ki = derive_key_image_bytes(
+                // The shared helper is signer-aligned; compute once and compare to tracked.
+                let signer_ki = derive_key_image_bytes(
                     &wallet_out,
                     master.spend_scalar,
                     master.view_scalar_ed,
@@ -624,34 +594,27 @@ pub extern "C" fn wallet_send(
                     t.subaddress_minor,
                 );
 
-                // Signer-aligned KI computed from the reconstructed output's key/key_offset.
-                // This is the formula used by `monero-oxide` in `SignableTransaction::sign`.
-                let signer_ki =
-                    signer_key_image_bytes_from_wallet_out(&wallet_out, master.spend_scalar);
-
-                // Record for later correlation (even if we fail early).
+                // Record for later correlation.
                 diag_reconstructed_signer_kis.push((
                     t.tx_hash,
                     t.index_in_tx,
-                    derived_ki,
+                    signer_ki,
                     signer_ki,
                 ));
 
                 if signer_ki != t.key_image {
-                    // This is a real spendability invariant violation: the signer would produce a
-                    // different key image than what we tracked during refresh.
+                    // Real invariant violation: the signer would produce a different key image than what we tracked.
                     walletcore_log_line(
                         id,
                         snapshot.network,
                         &format!(
-                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={} signer_key_image={}",
+                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
                             id,
                             hex_dump_prefix(&t.tx_hash, 32),
                             t.index_in_tx,
                             t.subaddress_major,
                             t.subaddress_minor,
                             hex_dump_prefix(&t.key_image, 32),
-                            hex_dump_prefix(&derived_ki, 32),
                             hex_dump_prefix(&signer_ki, 32)
                         ),
                     );
@@ -671,24 +634,6 @@ pub extern "C" fn wallet_send(
                     restart_attempt = true;
                     restart_outer_attempt = true;
                     break;
-                } else if walletcore_decoy_probe_enabled() && derived_ki != t.key_image {
-                    // Diagnostic only: our legacy helper disagrees, but the signer matches tracked.
-                    // Do NOT quarantine in this case.
-                    walletcore_log_line(
-                        id,
-                        snapshot.network,
-                        &format!(
-                            "🧪 key_image_derived_mismatch_ignored wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={} signer_key_image={}",
-                            id,
-                            hex_dump_prefix(&t.tx_hash, 32),
-                            t.index_in_tx,
-                            t.subaddress_major,
-                            t.subaddress_minor,
-                            hex_dump_prefix(&t.key_image, 32),
-                            hex_dump_prefix(&derived_ki, 32),
-                            hex_dump_prefix(&signer_ki, 32)
-                        ),
-                    );
                 }
 
                 let with_decoys = if walletcore_decoy_mode_bin16() {
@@ -925,19 +870,18 @@ pub extern "C" fn wallet_send(
             // This allows the later `🧪 ki_diag ...` log block to compare tracked vs derived vs signer KIs
             // for the exact reconstructed outputs used to build inputs/decoys.
             {
-                let derived_ki = derive_key_image_bytes(
+                let signer_ki = derive_key_image_bytes(
                     &wallet_out,
                     master.spend_scalar,
                     master.view_scalar_ed,
                     t.subaddress_major,
                     t.subaddress_minor,
                 );
-                let signer_ki =
-                    signer_key_image_bytes_from_wallet_out(&wallet_out, master.spend_scalar);
+                // Store in both slots for compatibility with existing diagnostic consumers.
                 diag_reconstructed_signer_kis.push((
                     t.tx_hash,
                     t.index_in_tx,
-                    derived_ki,
+                    signer_ki,
                     signer_ki,
                 ));
             }
@@ -2149,6 +2093,7 @@ pub extern "C" fn wallet_send_with_filter(
         }
 
         let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        let mut restart_round = false;
         for t in &selected {
             let block_number = match usize::try_from(t.block_height) {
                 Ok(value) => value,
@@ -2198,76 +2143,35 @@ pub extern "C" fn wallet_send_with_filter(
                 }
             };
 
-            // Define the key image derivation helper locally for this send-with-filter path.
-            // This mirrors the refresh computation used to populate `TrackedOutput.key_image`.
-            let derive_key_image_bytes = |wallet_out: &monero_wallet::WalletOutput,
-                                          spend_scalar_dalek: curve25519_dalek::Scalar,
-                                          view_scalar_ed: monero_wallet::ed25519::Scalar,
-                                          subaddress_major: u32,
-                                          subaddress_minor: u32|
-             -> [u8; 32] {
-                let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
-                let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
-                    .into_option()
-                    .unwrap_or(curve25519_dalek::Scalar::ZERO);
-
-                let m_dalek = if subaddress_major == 0 && subaddress_minor == 0 {
-                    curve25519_dalek::Scalar::ZERO
-                } else {
-                    let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
-                    data.extend_from_slice(b"SubAddr\0");
-                    data.extend_from_slice(&<[u8; 32]>::from(view_scalar_ed));
-                    data.extend_from_slice(&subaddress_major.to_le_bytes());
-                    data.extend_from_slice(&subaddress_minor.to_le_bytes());
-                    let m_ed: monero_wallet::ed25519::Scalar =
-                        monero_wallet::ed25519::Scalar::hash(&data);
-                    let m_d: curve25519_dalek::Scalar = m_ed.into();
-                    m_d
-                };
-
-                let x = spend_scalar_dalek + ko_dalek + m_dalek;
-
-                let p = wallet_out.key();
-                let p_bytes = p.compress().to_bytes();
-                let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
-                let hp_p_bytes = hp_p.compress().to_bytes();
-
-                use curve25519_dalek::traits::Identity;
-                let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
-                    .decompress()
-                    .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
-
-                let ki = hp_p_dalek * x;
-                ki.compress().to_bytes()
-            };
-
             // Key image consistency check: ensure the reconstructed output corresponds to the same
             // key image we tracked during refresh. If not, this output is not safely spendable
             // with our current snapshot (reorg/stale cache/subaddress mismatch/etc.).
-            let derived_ki = derive_key_image_bytes(
+            //
+            // IMPORTANT:
+            // Use the shared, signer-aligned key image helper and compare it directly against the tracked KI.
+            let signer_ki = derive_key_image_bytes(
                 &wallet_out,
                 master.spend_scalar,
                 master.view_scalar_ed,
                 t.subaddress_major,
                 t.subaddress_minor,
             );
-            if derived_ki != t.key_image {
-                if walletcore_decoy_probe_enabled() {
-                    walletcore_log_line(
+            if signer_ki != t.key_image {
+                // Always emit a diagnostic line for this invariant violation.
+                walletcore_log_line(
+                    id,
+                    snapshot.network,
+                    &format!(
+                        "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
                         id,
-                        snapshot.network,
-                        &format!(
-                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} derived_key_image={}",
-                            id,
-                            hex_dump_prefix(&t.tx_hash, 32),
-                            t.index_in_tx,
-                            t.subaddress_major,
-                            t.subaddress_minor,
-                            hex_dump_prefix(&t.key_image, 32),
-                            hex_dump_prefix(&derived_ki, 32)
-                        ),
-                    );
-                }
+                        hex_dump_prefix(&t.tx_hash, 32),
+                        t.index_in_tx,
+                        t.subaddress_major,
+                        t.subaddress_minor,
+                        hex_dump_prefix(&t.key_image, 32),
+                        hex_dump_prefix(&signer_ki, 32)
+                    ),
+                );
 
                 // Quarantine this outpoint and restart selection so we don't attempt to spend it.
                 {
@@ -2279,10 +2183,10 @@ pub extern "C" fn wallet_send_with_filter(
                     }
                 }
 
-                // In the filtered send path we don't have the bounded auto-retry loop state.
-                // We still quarantine the outpoint to prevent repeated invalid spends.
-                // Force a retry loop iteration by breaking out so selection is rebuilt.
+                // Restart selection rounds in this send_with_filter attempt.
+                // We cannot mutate `selected` while iterating it, so set a flag and break.
                 inputs.clear();
+                restart_round = true;
                 break;
             }
 
@@ -2354,6 +2258,12 @@ pub extern "C" fn wallet_send_with_filter(
             };
 
             inputs.push(with_decoys);
+        }
+
+        if restart_round {
+            selected.clear();
+            selected_sum = 0;
+            continue;
         }
 
         let mut ovk = [0u8; 32];
