@@ -1,36 +1,48 @@
-//! Shared key image derivation helpers.
+//! Shared key image derivation helpers (signer-aligned).
 //!
-//! Rationale
+//! Why this exists
+//! --------------
+//! We need a single, consistent key image derivation used across:
+//! - refresh-time output bookkeeping (`TrackedOutput.key_image`),
+//! - send-time spendability checks,
+//! - mapping daemon `/is_key_image_spent` results back to tracked outpoints.
+//!
+//! The authoritative behavior is what the transaction signer uses. In the monero-oxide
+//! wallet signer (`monero_wallet::send::SignableTransaction::sign`), the per-input secret key is:
+//!
+//!   x = a + key_offset
+//!
+//! and the key image is:
+//!
+//!   I = x * Hp(P)
+//!
+//! where `a` is the wallet's private spend scalar, `key_offset` comes from the owned output,
+//! and `P` is the one-time public key for the output.
+//!
+//! IMPORTANT
 //! ---------
-//! We need `TrackedOutput.key_image` (persisted during refresh) to match the key images used when
-//! constructing and signing transactions. If these differ, we cannot reliably:
-//! - correlate daemon `is_key_image_spent` results back to wallet outputs,
-//! - detect spends correctly,
-//! - avoid false `double_spend` / `invalid_input` send failures.
+//! This module intentionally mirrors the signer semantics using dalek scalar arithmetic for `x`,
+//! to avoid mismatches caused by differing scalar representations or operator support.
 //!
-//! This module provides a single, shared derivation used by both refresh and send paths.
-//!
-//! Notes
-//! -----
-//! - This helper is aligned with the `monero-oxide` signer semantics used by
-//!   `monero_wallet::send::SignableTransaction::sign`.
-//! - In the signer, the input secret key is derived as: `x = a + key_offset`
-//!   (no additional subaddress `m` term is added at this stage).
-//! - `subaddress_major`/`subaddress_minor` are accepted for API compatibility but are not used.
+//! API notes
+//! ---------
+//! Callers still pass `view_scalar_ed` and subaddress indices for compatibility with older call
+//! sites; they are intentionally unused because signer semantics do not include any `m` term at
+//! this stage.
 
 use monero_wallet::{ed25519, WalletOutput};
 
-/// Derive the key image bytes for a `WalletOutput`.
+/// Derive the key image bytes for a `WalletOutput` using signer-aligned semantics.
 ///
-/// This is aligned with the signer implementation in `monero-oxide`:
-/// the input secret key is `x = a + key_offset`, and the key image is:
-/// `I = x * Hp(P)` where `P` is the one-time public key.
+/// Authoritative formula (monero-oxide signer):
+/// - `x = a + key_offset`
+/// - `I = x * Hp(P)`
 ///
 /// Inputs:
-/// - `wallet_out`: The output being tracked/spent.
-/// - `spend_scalar_dalek`: The wallet's private spend scalar `a` as a dalek scalar.
-/// - `view_scalar_ed`: Kept for API compatibility; not used by this derivation.
-/// - `subaddress_major`/`subaddress_minor`: Kept for API compatibility; not used by this derivation.
+/// - `wallet_out`: The owned output being tracked/spent.
+/// - `spend_scalar_dalek`: The wallet's private spend scalar `a` as a dalek scalar (stored in core state).
+/// - `view_scalar_ed`: Unused (kept for API compatibility).
+/// - `subaddress_major`/`subaddress_minor`: Unused (kept for API compatibility).
 ///
 /// Returns:
 /// - `[u8; 32]` key image bytes.
@@ -41,17 +53,16 @@ pub(crate) fn derive_key_image_bytes(
     _subaddress_major: u32,
     _subaddress_minor: u32,
 ) -> [u8; 32] {
-    // key_offset: monero_wallet::ed25519::Scalar -> [u8;32] -> dalek scalar
+    // key_offset: monero_wallet::ed25519::Scalar -> [u8; 32] -> dalek scalar
     let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
     let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
         .into_option()
         .unwrap_or(curve25519_dalek::Scalar::ZERO);
 
-    // Signer semantics:
-    // x = a + key_offset
+    // Signer semantics: x = a + key_offset
     let x = spend_scalar_dalek + ko_dalek;
 
-    // Hp(P)
+    // Hp(P): biased_hash(compressed P) (monero-oxide ed25519 point hashing), then convert to dalek point.
     let p = wallet_out.key();
     let p_bytes = p.compress().to_bytes();
     let hp_p = ed25519::Point::biased_hash(p_bytes);
