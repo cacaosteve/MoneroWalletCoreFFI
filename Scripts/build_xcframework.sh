@@ -12,6 +12,11 @@ export IPHONESIMULATOR_DEPLOYMENT_TARGET="${IPHONESIMULATOR_DEPLOYMENT_TARGET:-1
 # -----------------------------
 # Configuration and environment
 # -----------------------------
+#
+# NOTE:
+# We no longer support "fork mode" via local path patches.
+# The walletcore crate is expected to pin monero-oxide dependencies by git URL + commit (rev),
+# making builds reproducible on CI and other machines without requiring a sibling checkout.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -94,6 +99,7 @@ ensure_targets() {
 build_target() {
   local triple="$1"
   echo "• Building monerowalletcore for ${triple} (${PROFILE})"
+  # Cargo requires the manifest to be named `Cargo.toml`, so we do not pass --manifest-path here.
   (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
 }
 
@@ -171,6 +177,7 @@ echo "  - Output dir: ${OUT_DIR}"
 echo "  - Profile: ${PROFILE}"
 
 check_tools
+
 ensure_targets
 
 # Build all Apple targets

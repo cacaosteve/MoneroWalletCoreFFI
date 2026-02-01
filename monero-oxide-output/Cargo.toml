@@ -10,22 +10,27 @@ crate-type = ["cdylib", "staticlib"]
 [features]
 # Enable scanner micro-profiler plumbing (compile-time + runtime).
 # Runtime toggle is controlled via env var: MONERO_WALLET_SCANNER_MICROPROF=1
-scanner-microprof = ["monero-wallet/scanner-microprof"]
+scanner-microprof = []
 
 # Forward monero-wallet's compile-time generators (precomputed tables) feature through walletcore
 # so the xcframework build can enable it via CARGO_FEATURES.
 compile-time-generators = ["monero-wallet/compile-time-generators"]
 
+# Fork-only dependency feature wiring lives directly in this fork-mode manifest.
+#
+# We intentionally do NOT use a forwarding feature (like `walletcore-fork-features`) here, because
+# the whole point of having `Cargo.fork.toml` is that it's only used in fork mode.
+
 [dependencies]
-monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-wallet", features = ["std"] }
+monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-wallet", features = ["std"] }
 monero-seed = { git = "https://github.com/monero-oxide/monero-wallet-util", package = "monero-seed", features = ["std"] }
-monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-address", features = ["std"] }
-monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-ed25519", features = ["std"] }
-monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-interface", features = ["std", "walletcore-lenient-prunable", "walletcore-lenient-tx-verify"] }
+monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-address", features = ["std"] }
+monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-ed25519", features = ["std"] }
+monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-interface", features = ["std"] }
 
 # Upstream daemon RPC implementation + recommended HTTP transport (simple-request)
-monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-daemon-rpc", features = ["std", "walletcore-telemetry", "walletcore-lenient-prunable"] }
-monero-simple-request-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-simple-request-rpc", features = ["webpki-roots"] }
+monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-daemon-rpc", features = ["std"] }
+monero-simple-request-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-simple-request-rpc", features = ["webpki-roots"] }
 
 # Required because we construct a lightweight runtime (Runtime::new + block_on) around upstream async daemon RPC.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
@@ -33,8 +38,8 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
-monero-io = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-io", features = ["std"] }
-monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "98191b4c20378022a4f5aa04fe7b359a2cdcfacd", package = "monero-epee" }
+monero-io = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-io", features = ["std"] }
+monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-epee" }
 
 # Locate Application Support / data directory for per-wallet log file writing
 dirs = "5"
@@ -65,16 +70,3 @@ overflow-checks = false
 
 [profile.dev]
 overflow-checks = true
-
-# Use your local monero-oxide checkout so we can enable local-only features (e.g. scanner-microprof)
-# without needing to push them to the upstream git revision.
-[patch."https://github.com/cacaosteve/monero-oxide"]
-monero-wallet = { path = "../../monero-oxide/monero-oxide/wallet" }
-monero-oxide = { path = "../../monero-oxide/monero-oxide" }
-monero-interface = { path = "../../monero-oxide/monero-oxide/interface" }
-monero-daemon-rpc = { path = "../../monero-oxide/monero-oxide/interface/daemon" }
-monero-simple-request-rpc = { path = "../../monero-oxide/monero-oxide/interface/daemon/simple-request" }
-monero-address = { path = "../../monero-oxide/monero-oxide/wallet/address" }
-monero-ed25519 = { path = "../../monero-oxide/monero-oxide/ed25519" }
-monero-io = { path = "../../monero-oxide/monero-oxide/io" }
-monero-epee = { path = "../../monero-oxide/monero-oxide/epee" }
