@@ -33,7 +33,8 @@ monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = 
 monero-simple-request-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "1315c67714b389bb42d94f3d5b908bc3bcae93f4", package = "monero-simple-request-rpc", features = ["webpki-roots"] }
 
 # Required because we construct a lightweight runtime (Runtime::new + block_on) around upstream async daemon RPC.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+# NOTE: `tokio::time::timeout` requires the time driver; without it, calling time APIs can panic/abort at runtime.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
 
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
