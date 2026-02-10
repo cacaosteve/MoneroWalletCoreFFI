@@ -20,9 +20,12 @@
 #   OUT_DIR                              : output root (default: MoneroWalletCoreFFI/Artifacts/android)
 #
 # Optional post-build install step:
-#   INSTALL_TO_NEXAWAL_ANDROID            : if "1", copy built .so into nexawal-android app jniLibs
+#   INSTALL_TO_NEXAWAL_ANDROID            : if "1", copy built .so into nexawal-android *walletcore module* jniLibs
+#                                          (this avoids duplicate packaging vs app/src/main/jniLibs)
 #   NEXAWAL_ANDROID_DIR                   : override path to nexawal-android (default: repo-root/../nexawal-android)
-#   NEXAWAL_ANDROID_JNILIBS_DIR           : override jniLibs dir (default: $NEXAWAL_ANDROID_DIR/app/src/main/jniLibs)
+#   NEXAWAL_ANDROID_JNILIBS_DIR           : override jniLibs dir
+#                                          default: $NEXAWAL_ANDROID_DIR/walletcore/src/main/jniLibs
+#                                          legacy app module: $NEXAWAL_ANDROID_DIR/app/src/main/jniLibs
 #
 # Examples:
 #   PROFILE=release CARGO_FEATURES="compile-time-generators" ./Scripts/build_android.sh
@@ -49,7 +52,8 @@ OUT_DIR="${OUT_DIR:-${ARTIFACTS_DIR}/android}"
 # Optional: install artifacts into nexawal-android after building
 INSTALL_TO_NEXAWAL_ANDROID="${INSTALL_TO_NEXAWAL_ANDROID:-0}"
 NEXAWAL_ANDROID_DIR="${NEXAWAL_ANDROID_DIR:-${REPO_ROOT}/../nexawal-android}"
-NEXAWAL_ANDROID_JNILIBS_DIR="${NEXAWAL_ANDROID_JNILIBS_DIR:-${NEXAWAL_ANDROID_DIR}/app/src/main/jniLibs}"
+# Default to the :walletcore module jniLibs to avoid duplicate packaging with the app module.
+NEXAWAL_ANDROID_JNILIBS_DIR="${NEXAWAL_ANDROID_JNILIBS_DIR:-${NEXAWAL_ANDROID_DIR}/walletcore/src/main/jniLibs}"
 
 # Tooling
 CARGO_BIN="$(command -v cargo || true)"
@@ -216,17 +220,19 @@ echo "Artifacts are in: ${OUT_DIR}"
 echo
 
 if [[ "${INSTALL_TO_NEXAWAL_ANDROID}" == "1" ]]; then
-  echo "Installed into nexawal-android jniLibs:"
+  echo "Installed into nexawal-android :walletcore jniLibs:"
   echo "  ${NEXAWAL_ANDROID_JNILIBS_DIR}/arm64-v8a/libmonerowalletcore.so"
   echo "  ${NEXAWAL_ANDROID_JNILIBS_DIR}/x86_64/libmonerowalletcore.so"
 else
-  echo "Next step: copy these into your Android module's jniLibs, e.g.:"
-  echo "  app/src/main/jniLibs/arm64-v8a/libmonerowalletcore.so"
-  echo "  app/src/main/jniLibs/x86_64/libmonerowalletcore.so"
+  echo "Next step: copy these into your Android :walletcore module's jniLibs, e.g.:"
+  echo "  walletcore/src/main/jniLibs/arm64-v8a/libmonerowalletcore.so"
+  echo "  walletcore/src/main/jniLibs/x86_64/libmonerowalletcore.so"
   echo
   echo "Or install automatically into nexawal-android by setting:"
   echo "  INSTALL_TO_NEXAWAL_ANDROID=1"
   echo "Optionally override paths:"
   echo "  NEXAWAL_ANDROID_DIR=/path/to/nexawal-android"
-  echo "  NEXAWAL_ANDROID_JNILIBS_DIR=/path/to/nexawal-android/app/src/main/jniLibs"
+  echo "  NEXAWAL_ANDROID_JNILIBS_DIR=/path/to/nexawal-android/walletcore/src/main/jniLibs"
+  echo
+  echo "Note: Avoid also copying into app/src/main/jniLibs, or you'll get duplicate .so packaging warnings."
 fi
