@@ -29,6 +29,28 @@ WALLETCORE_EXTERN_C_BEGIN
 
 /* ===== Version / Error utilities ===== */
 
+/* ===== Mnemonic generation ===== */
+
+/*
+ * Generate a new English Monero mnemonic (25 words) and write it into out_buf.
+ *
+ * ABI:
+ * - out_buf/out_buf_len: caller-provided buffer for UTF-8 mnemonic string (space-separated words)
+ * - out_written: bytes written (excluding NUL) if non-null
+ *
+ * Returns:
+ * - 0 on success
+ * - -11 invalid argument (null pointers / zero length)
+ * - -12 insufficient output buffer (output is zeroed)
+ * - -20 internal generation failure
+ */
+int32_t wallet_generate_mnemonic_english(
+    char* out_buf,
+    size_t out_buf_len,
+    size_t* out_written
+);
+
+
 /* Returns a newly-allocated NUL-terminated version string; free with walletcore_free_cstr. */
 char* walletcore_version(void);
 
