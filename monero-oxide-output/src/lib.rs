@@ -32,6 +32,11 @@ use crate::support::bulk_bin_debug_enabled;
 mod ffi;
 mod support;
 
+// Re-export new public ABI symbols implemented in FFI submodules.
+// Keeping these at crate root ensures they are visible to consumers linking against
+// the cdylib/staticlib, even as we continue extracting FFI into `src/ffi/*`.
+pub use crate::ffi::mnemonic::wallet_generate_mnemonic_english;
+
 // Bulk binary (EPEE / portable_storage) decoding helpers extracted from this file.
 // Kept reachable via `crate::support::*` for FFI submodules.
 

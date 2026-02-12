@@ -4,6 +4,7 @@
 //! re-exported from the crate root (`lib.rs`) to preserve the public ABI.
 
 pub(crate) mod cache;
+pub(crate) mod mnemonic;
 pub(crate) mod preview_fee;
 pub(crate) mod refresh;
 pub(crate) mod send;
