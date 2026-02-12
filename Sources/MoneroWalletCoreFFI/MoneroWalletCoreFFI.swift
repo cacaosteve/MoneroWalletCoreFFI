@@ -852,6 +852,26 @@ public enum WalletCoreFFIClient {
         return String(decoding: addrBytes, as: UTF8.self)
     }
 
+    /// Generate a new English Monero mnemonic (25 words).
+    ///
+    /// This calls the Rust core via FFI. The mnemonic is returned as a single
+    /// space-separated string.
+    public static func generateMnemonicEnglish() throws -> String {
+        // 25-word mnemonic is ~ (avg 8 chars + space) * 25 ~= 225 bytes.
+        // Use a generous buffer to be safe.
+        var buffer = Array<CChar>(repeating: 0, count: 512)
+        var written: Int = 0
+        let rc: Int32 = wallet_generate_mnemonic_english(
+            &buffer,
+            buffer.count,
+            &written
+        )
+        try checkRC(rc, context: "wallet_generate_mnemonic_english")
+        buffer[min(written, buffer.count - 1)] = 0
+        let bytes = buffer.prefix(min(written, buffer.count - 1)).map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Derive a subaddress (accountIndex, subaddressIndex) from a 25-word mnemonic.
     public static func deriveSubaddressFromMnemonic(
         _ phrase: String,
