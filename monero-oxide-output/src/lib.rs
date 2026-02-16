@@ -1878,23 +1878,33 @@ fn derive_address_string(
         let view_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.view_scalar_dalek);
         MoneroAddress::new(network, MoneroAddressType::Legacy, spend_pub, view_pub).to_string()
     } else {
-        let b_point = ED25519_BASEPOINT_POINT * keys.view_scalar_dalek;
+        // Monero wallet2 subaddress derivation:
+        //
+        // m = Hs("SubAddr\0" || a || major || minor)             where a = private view key (scalar bytes)
+        // D = B + m*G                                            where B = spend public key
+        // C = a*D                                                where a = private view key scalar
+        //
+        // Address = (D, C) encoded as a subaddress for the given network.
+        let spend_pub = ED25519_BASEPOINT_POINT * keys.spend_scalar;
+        let view_scalar = keys.view_scalar_dalek;
+
         let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
         data.extend_from_slice(b"SubAddr\0");
-        // Monero wallet2 subaddress derivation uses the *private view key* (not entropy/seed) in the hash preimage:
-        // m = Hs("SubAddr\0" || view_secret_key || major || minor)
-        //
+
         // Use the Monero ed25519 Scalar bytes directly to match wallet2 behavior.
-        // (`monero_ed25519::Scalar` stores the canonical 32-byte scalar representation.)
-        //
-        // Note: `monero_ed25519::Scalar` implements `From<Scalar> for [u8; 32]`, so we must call it explicitly.
         let view_key_bytes: [u8; 32] = <[u8; 32]>::from(keys.view_scalar_ed);
         data.extend_from_slice(&view_key_bytes);
+
         data.extend_from_slice(&account_index.to_le_bytes());
         data.extend_from_slice(&subaddress_index.to_le_bytes());
+
         let m_scalar: curve25519_dalek::Scalar = EdScalar::hash(&data).into();
-        let d_dalek = b_point + (ED25519_BASEPOINT_POINT * m_scalar);
-        let c_dalek = d_dalek * keys.spend_scalar;
+
+        // D = B + m*G
+        let d_dalek = spend_pub + (ED25519_BASEPOINT_POINT * m_scalar);
+
+        // C = a*D
+        let c_dalek = d_dalek * view_scalar;
 
         let d_point = EdPoint::from(d_dalek);
         let c_point = EdPoint::from(c_dalek);
