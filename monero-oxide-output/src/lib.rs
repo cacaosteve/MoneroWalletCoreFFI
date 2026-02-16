@@ -1881,7 +1881,11 @@ fn derive_address_string(
         let b_point = ED25519_BASEPOINT_POINT * keys.view_scalar_dalek;
         let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
         data.extend_from_slice(b"SubAddr\0");
-        data.extend_from_slice(keys.entropy.as_ref());
+        // Monero wallet2 subaddress derivation uses the *private view key* (not entropy/seed) in the hash preimage:
+        // m = Hs("SubAddr\0" || view_secret_key || major || minor)
+        //
+        // We use the dalek scalar byte representation (32 bytes) for the private view key.
+        data.extend_from_slice(&keys.view_scalar_dalek.to_bytes());
         data.extend_from_slice(&account_index.to_le_bytes());
         data.extend_from_slice(&subaddress_index.to_le_bytes());
         let m_scalar: curve25519_dalek::Scalar = EdScalar::hash(&data).into();
