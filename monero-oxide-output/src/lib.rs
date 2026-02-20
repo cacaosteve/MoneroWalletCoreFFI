@@ -2169,6 +2169,11 @@ pub(crate) struct ObservedOutput {
     is_coinbase: bool,
     spent: bool,
     confirmations: u64,
+
+    /// Canonical lowercase hex key image for this owned output.
+    /// Used for scanner idempotency / dedupe across rescans.
+    key_image_hex: String,
+
     timelock: ObservedTimelock,
     unlock_height: u64,
     unlocked: bool,
@@ -2284,6 +2289,7 @@ impl ObservedOutput {
         };
         let tx_hash = hex_lowercase(&output.tx_hash);
         let unlocked = output.is_unlocked(chain_height, chain_time);
+        let key_image_hex = hex_lowercase(&output.key_image);
         Self {
             tx_hash,
             index_in_tx: output.index_in_tx,
@@ -2294,6 +2300,7 @@ impl ObservedOutput {
             is_coinbase: output.is_coinbase,
             spent: output.spent,
             confirmations,
+            key_image_hex,
             timelock,
             unlock_height,
             unlocked,
