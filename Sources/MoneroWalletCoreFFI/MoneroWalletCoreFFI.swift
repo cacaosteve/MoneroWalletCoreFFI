@@ -958,6 +958,11 @@ public struct WalletObservedOutputsEnvelope: Decodable {
         public let isCoinbase: Bool
         public let spent: Bool
         public let confirmations: UInt64
+
+        /// Canonical lowercase hex key image for this owned output.
+        /// This is used for scanner idempotency / dedupe across rescans.
+        public let keyImageHex: String
+
         public let timelock: WalletObservedTimelock
         public let unlockHeight: UInt64
         public let unlocked: Bool
@@ -1023,6 +1028,7 @@ extension WalletObservedOutputsEnvelope.ObservedOutput {
         case isCoinbase = "is_coinbase"
         case spent
         case confirmations
+        case keyImageHex = "key_image_hex"
         case timelock
         case unlockHeight = "unlock_height"
         case unlocked
