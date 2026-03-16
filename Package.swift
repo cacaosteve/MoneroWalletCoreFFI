@@ -40,6 +40,9 @@ let package = Package(
             swiftSettings: [
                 .define("WALLETCORE_APPLE", .when(platforms: [.iOS, .macOS])),
                 .define("WALLETCORE_LINUX", .when(platforms: [.linux]))
+            ],
+            linkerSettings: [
+                .linkedLibrary("c++", .when(platforms: [.iOS, .macOS]))
             ]
         ),
         .executableTarget(
