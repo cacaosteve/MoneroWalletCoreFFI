@@ -38,7 +38,7 @@ public enum WalletCoreFFIClient {
     // MARK: - Private helpers
 
     /// Reads the last error message from the core, if any.
-    /// This does NOT attempt to free the returned pointer, since implementations may return a static string.
+    /// The returned pointer is owned by the core and must be freed with walletcore_free_cstr.
     public static func lastErrorMessage() -> String? {
         guard let cstr = walletcore_last_error_message() else { return nil }
         let s = String(cString: cstr)
@@ -75,6 +75,21 @@ public enum WalletCoreFFIClient {
     private static let jsonDecoder: JSONDecoder = {
         JSONDecoder()
     }()
+
+    private static func encodeOptionalJSONObject(
+        _ value: [String: Any]?,
+        context: String
+    ) throws -> String? {
+        guard let value else { return nil }
+        guard JSONSerialization.isValidJSONObject(value) else {
+            throw WalletCoreFFIError.invalidArgument("Invalid JSON object for \(context)")
+        }
+        let data = try JSONSerialization.data(withJSONObject: value, options: [])
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw WalletCoreFFIError.invalidArgument("Failed to encode \(context) as UTF-8 JSON")
+        }
+        return json
+    }
 
     /// Transfer destination schema for FFI JSON calls.
     public struct Destination: Encodable {
@@ -191,15 +206,10 @@ public enum WalletCoreFFIClient {
         walletId: String,
         gapLimit: UInt32
     ) throws {
-#if canImport(CLibMoneroWalletCore)
         let rc = walletId.withCString { cId in
             wallet_set_gap_limit(cId, gapLimit)
         }
         try checkRC(rc, context: "wallet_set_gap_limit")
-#else
-        _ = walletId
-        _ = gapLimit
-#endif
     }
 
     public static func forceRescanFromHeight(
@@ -224,32 +234,22 @@ public enum WalletCoreFFIClient {
     }
 
     public static func startZmqListener(endpoint: String) throws {
-#if canImport(CLibMoneroWalletCore)
         let rc = endpoint.withCString { cEndpoint in
             wallet_start_zmq_listener(cEndpoint)
         }
         try checkRC(rc, context: "wallet_start_zmq_listener")
-#else
-        _ = endpoint
-#endif
     }
 
     public static func stopZmqListener() throws {
-#if canImport(CLibMoneroWalletCore)
         let rc = wallet_stop_zmq_listener()
         try checkRC(rc, context: "wallet_stop_zmq_listener")
-#endif
     }
 
     public static func zmqSequence() throws -> UInt64 {
-#if canImport(CLibMoneroWalletCore)
         var value: UInt64 = 0
         let rc = wallet_zmq_sequence(&value)
         try checkRC(rc, context: "wallet_zmq_sequence")
         return value
-#else
-        return 0
-#endif
     }
 
     /// Refresh the wallet against the daemon (nodeURL). Returns the last scanned height.
@@ -290,12 +290,10 @@ public enum WalletCoreFFIClient {
 
     /// Request cancellation of the in-flight refresh for a specific wallet.
     public static func refreshCancel(walletId: String) throws {
-#if canImport(CLibMoneroWalletCore)
         let rc: Int32 = walletId.withCString { cId in
             wallet_refresh_cancel(cId)
         }
         try checkRC(rc, context: "wallet_refresh_cancel")
-#endif
     }
 
     /// Retrieve sync status values cached on the core for this wallet.
@@ -339,12 +337,7 @@ public enum WalletCoreFFIClient {
         walletId: String,
         filter: [String: Any]? = nil
     ) throws -> (total: UInt64, unlocked: UInt64) {
-        let filterJSON: String? = {
-            guard let filter else { return nil }
-            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
-            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
-            return data.flatMap { String(data: $0, encoding: .utf8) }
-        }()
+        let filterJSON = try encodeOptionalJSONObject(filter, context: "wallet_get_balance_with_filter filter")
 
         var total: UInt64 = 0
         var unlocked: UInt64 = 0
@@ -417,12 +410,7 @@ public enum WalletCoreFFIClient {
             throw WalletCoreFFIError.invalidArgument("Failed to encode destinations as UTF-8 JSON")
         }
 
-        let filterJSON: String? = {
-            guard let filter else { return nil }
-            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
-            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
-            return data.flatMap { String(data: $0, encoding: .utf8) }
-        }()
+        let filterJSON = try encodeOptionalJSONObject(filter, context: "wallet_preview_fee_with_filter filter")
 
         let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
             if let node = nodeURL {
@@ -502,12 +490,7 @@ public enum WalletCoreFFIClient {
         ringLen: UInt8 = 16,
         nodeURL: String? = nil
     ) throws -> (amount: UInt64, fee: UInt64) {
-        let filterJSON: String? = {
-            guard let filter else { return nil }
-            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
-            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
-            return data.flatMap { String(data: $0, encoding: .utf8) }
-        }()
+        let filterJSON = try encodeOptionalJSONObject(filter, context: "wallet_preview_sweep_with_filter filter")
 
         let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
             if let node = nodeURL {
@@ -580,12 +563,7 @@ public enum WalletCoreFFIClient {
         ringLen: UInt8 = 16,
         nodeURL: String? = nil
     ) throws -> (txid: String, amount: UInt64, fee: UInt64) {
-        let filterJSON: String? = {
-            guard let filter else { return nil }
-            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
-            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
-            return data.flatMap { String(data: $0, encoding: .utf8) }
-        }()
+        let filterJSON = try encodeOptionalJSONObject(filter, context: "wallet_sweep_with_filter filter")
 
         let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
             if let node = nodeURL {
@@ -664,12 +642,7 @@ public enum WalletCoreFFIClient {
             throw WalletCoreFFIError.invalidArgument("Failed to encode destinations as UTF-8 JSON")
         }
 
-        let filterJSON: String? = {
-            guard let filter else { return nil }
-            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
-            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
-            return data.flatMap { String(data: $0, encoding: .utf8) }
-        }()
+        let filterJSON = try encodeOptionalJSONObject(filter, context: "wallet_send_with_filter filter")
 
         let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
             if let node = nodeURL {
