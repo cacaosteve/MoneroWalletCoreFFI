@@ -1,11 +1,17 @@
 # MoneroWalletCoreFFI
 
-A cross‑platform Swift Package that exposes a safe Swift wrapper around a Rust Monero wallet core via a stable C ABI.
+`MoneroWalletCoreFFI` is the shared wallet-core repository used by NexaWal and related apps.
 
-- Apple (iOS + macOS): ships a prebuilt `MoneroWalletCore.xcframework` (binary target) so clients do not need Rust.
-- Linux (Vapor): links against a system‑installed `libmonerowalletcore.so` (via `pkg-config monerowalletcore`), so servers do not need Rust at build time either.
+- Swift package / product name: `MoneroWalletCoreFFI`
+- Repository: `https://github.com/cacaosteve/MoneroWalletCoreFFI`
+- Rust wallet core: built from `monero-oxide`
 
-This README explains how to add the package with SwiftPM on Apple platforms and how to set up Linux so Vapor apps “just work.”
+Platform outputs:
+- Apple (iOS + macOS): prebuilt `MoneroWalletCore.xcframework`
+- Android: native `libmonerowalletcore.so` built from the same crate via `Scripts/build_android.sh`
+- Linux (Vapor/server): system-installed `libmonerowalletcore.so` via `pkg-config`
+
+This README explains how to consume the package on Apple platforms, how Linux linking works, and how the native artifacts are built.
 
 
 ## Supported platforms
@@ -44,20 +50,17 @@ Notes:
 ```swift
 // Inside your app’s Package.swift
 dependencies: [
-    .package(url: "https://github.com/<you>/<repo>.git", branch: "main")
+    .package(url: "https://github.com/cacaosteve/MoneroWalletCoreFFI.git", branch: "main")
 ],
 targets: [
     .target(
         name: "YourApp",
         dependencies: [
-            .product(name: "MoneroWalletCoreFFI", package: "repo-name")
+            .product(name: "MoneroWalletCoreFFI", package: "MoneroWalletCoreFFI")
         ]
     )
 ]
 ```
-
-Replace `<you>/<repo>` and `repo-name` with your actual GitHub org/repo and package name.
-
 
 ## Linux (Vapor) setup
 
@@ -200,6 +203,8 @@ let address = try WalletCoreFFIClient.deriveAddressFromSeed(
 
 - `Scripts/build_xcframework.sh`
   - Builds Apple static libs across supported Apple triples and packages `Artifacts/MoneroWalletCore.xcframework`.
+- `Scripts/build_android.sh`
+  - Builds Android `.so` artifacts for `arm64-v8a` and `x86_64` by default and can install them into `nexawal-android`.
 - `Scripts/install_linux.sh`
   - Installs `libmonerowalletcore.so`, `monerowalletcore.h`, and `monerowalletcore.pc` to a prefix (default `/usr/local`), and can be used in Docker/CI.
 
