@@ -275,7 +275,7 @@ dependencies = [
  "digest",
  "hex",
  "md-5",
- "rand",
+ "rand 0.8.5",
  "sha2",
 ]
 
@@ -340,7 +340,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
- "rand_core",
+ "rand_core 0.6.4",
  "subtle",
 ]
 
@@ -510,7 +510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
 dependencies = [
  "ff",
- "rand_core",
+ "rand_core 0.6.4",
  "subtle",
 ]
 
@@ -905,7 +905,7 @@ dependencies = [
  "monero-ed25519",
  "monero-io",
  "monero-primitives",
- "rand_core",
+ "rand_core 0.6.4",
  "std-shims",
  "thiserror 2.0.18",
  "zeroize",
@@ -932,8 +932,8 @@ dependencies = [
  "group",
  "monero-ed25519",
  "monero-io",
- "rand_chacha",
- "rand_core",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
  "std-shims",
  "subtle",
  "thiserror 2.0.18",
@@ -963,7 +963,7 @@ dependencies = [
  "crypto-bigint",
  "curve25519-dalek",
  "monero-io",
- "rand_core",
+ "rand_core 0.6.4",
  "sha3",
  "std-shims",
  "subtle",
@@ -1040,7 +1040,7 @@ version = "0.1.0"
 source = "git+https://github.com/monero-oxide/monero-wallet-util#a9ed050f16d0148582e94af503a5317733c452d2"
 dependencies = [
  "curve25519-dalek",
- "rand_core",
+ "rand_core 0.6.4",
  "std-shims",
  "thiserror 1.0.69",
  "zeroize",
@@ -1070,9 +1070,9 @@ dependencies = [
  "monero-clsag",
  "monero-interface",
  "monero-oxide",
- "rand",
- "rand_chacha",
- "rand_core",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
  "rand_distr",
  "std-shims",
  "subtle",
@@ -1187,8 +1187,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
 dependencies = [
  "libc",
- "rand_chacha",
- "rand_core",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
+dependencies = [
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -1198,7 +1208,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -1211,13 +1231,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+dependencies = [
+ "getrandom 0.3.4",
+]
+
+[[package]]
 name = "rand_distr"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
 dependencies = [
  "num-traits",
- "rand",
+ "rand 0.8.5",
 ]
 
 [[package]]
@@ -1820,7 +1849,7 @@ dependencies = [
  "monero-simple-request-rpc",
  "monero-wallet",
  "once_cell",
- "rand",
+ "rand 0.9.3",
  "serde",
  "serde_json",
  "sha3",
@@ -1878,7 +1907,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
