@@ -51,74 +51,36 @@ pub(crate) fn hex_dump_prefix(bytes: &[u8], max_len: usize) -> String {
     hex
 }
 
-/// Non-destructive peek of Monero portable_storage varint (LEB128-style) from a byte slice.
+/// Non-destructive peek of Monero portable_storage varint from a byte slice.
 /// Returns `(value, bytes_used)` if the varint is well-formed and fits in `u64`.
 pub(crate) fn peek_epee_varint_u64(bytes: &[u8]) -> Option<(u64, usize)> {
-    let mut out: u64 = 0;
-    let mut shift: u32 = 0;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        let low = (b & 0x7f) as u64;
-
-        // Prevent overflow / nonsense shifts
-        if shift >= 64 {
-            return None;
-        }
-
-        out |= low.checked_shl(shift)? as u64;
-
-        if (b & 0x80) == 0 {
-            return Some((out, i + 1));
-        }
-
-        shift = shift.saturating_add(7);
-
-        // Cap to a sane maximum number of bytes for u64.
-        if i >= 9 {
-            return None;
-        }
+    let start = *bytes.first()?;
+    let len = 1usize.checked_shl((start & 0b11) as u32)?;
+    if bytes.len() < len {
+        return None;
     }
 
-    None
+    let mut tmp = &bytes[..len];
+    let value = cuprate_epee_encoding::read_varint::<_, u64>(&mut tmp).ok()?;
+    Some((value, len))
 }
 
 /// Consume a portable_storage varint from a `Buf`.
 pub(crate) fn skip_epee_varint_u64<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<u64> {
-    // Monero portable_storage uses a LEB128-style varint.
-    let mut out: u64 = 0;
-    let mut shift: u32 = 0;
-
-    loop {
-        if !r.has_remaining() {
-            return Err(cuprate_epee_encoding::error::Error::Format(
-                "skip_epee_varint_u64: EOF",
-            ));
-        }
-
-        let b = r.get_u8();
-        out |= u64::from(b & 0x7f) << shift;
-
-        if (b & 0x80) == 0 {
-            return Ok(out);
-        }
-
-        shift += 7;
-        if shift >= 64 {
-            return Err(cuprate_epee_encoding::error::Error::Format(
-                "skip_epee_varint_u64: varint overflow",
-            ));
-        }
-    }
+    cuprate_epee_encoding::read_varint::<_, u64>(r)
+        .map_err(|_| cuprate_epee_encoding::error::Error::Format("skip_epee_varint_u64: invalid varint"))
 }
 
-/// Read a portable_storage field name (length-prefixed UTF-8 string).
+/// Read an EPEE object field name (u8 length-prefixed UTF-8 string).
 pub(crate) fn read_epee_field_name<B: Buf>(
     r: &mut B,
 ) -> cuprate_epee_encoding::error::Result<String> {
-    let name_len = skip_epee_varint_u64(r)?;
-    let name_len_usize = usize::try_from(name_len).map_err(|_| {
-        cuprate_epee_encoding::error::Error::Format("read_epee_field_name: name length overflow")
-    })?;
+    if r.remaining() < 1 {
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "read_epee_field_name: EOF reading name length",
+        ));
+    }
+    let name_len_usize = r.get_u8() as usize;
 
     if r.remaining() < name_len_usize {
         return Err(cuprate_epee_encoding::error::Error::Format(
@@ -230,12 +192,12 @@ pub(crate) fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error
         0x0c => {
             let fields = skip_epee_varint_u64(r)?;
             for _ in 0..fields {
-                let name_len = skip_epee_varint_u64(r)?;
-                let name_len_usize = usize::try_from(name_len).map_err(|_| {
-                    cuprate_epee_encoding::error::Error::Format(
-                        "skip_epee_value: name length overflow",
-                    )
-                })?;
+                if r.remaining() < 1 {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value: EOF reading field name length",
+                    ));
+                }
+                let name_len_usize = r.get_u8() as usize;
                 if r.remaining() < name_len_usize {
                     return Err(cuprate_epee_encoding::error::Error::Format(
                         "skip_epee_value: EOF reading field name",
@@ -315,12 +277,12 @@ pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
         0x0c => {
             let fields = skip_epee_varint_u64(r)?;
             for _ in 0..fields {
-                let name_len = skip_epee_varint_u64(r)?;
-                let name_len_usize = usize::try_from(name_len).map_err(|_| {
-                    cuprate_epee_encoding::error::Error::Format(
-                        "skip_epee_value_with_known_marker: name length overflow",
-                    )
-                })?;
+                if r.remaining() < 1 {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value_with_known_marker: EOF reading field name length",
+                    ));
+                }
+                let name_len_usize = r.get_u8() as usize;
                 if r.remaining() < name_len_usize {
                     return Err(cuprate_epee_encoding::error::Error::Format(
                         "skip_epee_value_with_known_marker: EOF reading field name",

@@ -21,6 +21,8 @@ struct Smoke {
 
         let nodeURL = env["MONERO_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         let destinationAddress = env["SMOKE_DEST_ADDRESS"]?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let cachePath = env["WALLET_CACHE_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let outputsJSONPath = env["WALLET_OUTPUTS_JSON_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         let runRefresh = envFlag("SMOKE_REFRESH", defaultValue: false)
         let runCancel = envFlag("SMOKE_CANCEL_REFRESH", defaultValue: false)
 
@@ -41,6 +43,8 @@ struct Smoke {
         print("- Cancel refresh enabled: \(runCancel)")
         if let nodeURL { print("- Node URL: \(nodeURL)") }
         if let destinationAddress { print("- Destination address: \(destinationAddress)") }
+        if let cachePath { print("- Cache path: \(cachePath)") }
+        if let outputsJSONPath { print("- Outputs JSON path: \(outputsJSONPath)") }
 
         do {
             let generatedMnemonic = try WalletCoreFFIClient.generateMnemonicEnglish()
@@ -65,6 +69,26 @@ struct Smoke {
                 mainnet: mainnet
             )
             print("✔ openWalletFromMnemonic: OK")
+
+            if let cachePath {
+                let cacheURL = URL(fileURLWithPath: cachePath)
+                let cache = try Data(contentsOf: cacheURL)
+                try WalletCoreFFIClient.importCache(walletId: walletId, cacheBlob: cache)
+                print("✔ importCache from WALLET_CACHE_PATH: \(cache.count) bytes")
+
+                let outputs = try WalletCoreFFIClient.observedOutputs(walletId: walletId)
+                let spentCount = outputs.outputs.filter(\.spent).count
+                let unspent = outputs.outputs.filter { !$0.spent }
+                let unspentTotal = unspent.reduce(UInt64(0)) { $0 &+ $1.amount }
+                let unlockedUnspentTotal = unspent.filter(\.unlocked).reduce(UInt64(0)) { $0 &+ $1.amount }
+                print("✔ observedOutputs: rows=\(outputs.outputs.count) spent=\(spentCount) unspent=\(unspent.count) unspentTotal=\(unspentTotal) unlockedUnspentTotal=\(unlockedUnspentTotal)")
+
+                if let outputsJSONPath {
+                    let json = try WalletCoreFFIClient.exportOutputsJSON(walletId: walletId)
+                    try json.write(to: URL(fileURLWithPath: outputsJSONPath), atomically: true, encoding: .utf8)
+                    print("✔ wrote observed outputs JSON: \(outputsJSONPath)")
+                }
+            }
 
             let initialStatus = try WalletCoreFFIClient.syncStatus(walletId: walletId)
             print("✔ syncStatus: chainHeight=\(initialStatus.chainHeight) lastScanned=\(initialStatus.lastScanned) restoreHeight=\(initialStatus.restoreHeight)")
@@ -168,6 +192,8 @@ struct Smoke {
           WALLET_MNEMONIC         25-word mnemonic (required)
           WALLET_ID               Stable id for the wallet (default: "smoke_wallet")
           WALLET_RESTORE_HEIGHT   Starting scan height (default: 0)
+          WALLET_CACHE_PATH       Optional cache blob to import before checks
+          WALLET_OUTPUTS_JSON_PATH Optional path to write observed outputs JSON after cache import
           MONERO_URL              Daemon URL, e.g. http://127.0.0.1:18081 (optional)
           SMOKE_DEST_ADDRESS      Optional destination address for fee/sweep preview checks
           SMOKE_REFRESH           Set to 1/true/yes to perform refresh calls

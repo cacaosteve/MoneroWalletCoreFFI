@@ -11,6 +11,7 @@ use std::{
     },
     time::Duration,
 };
+use bytes::Buf;
 
 // Bulk EPEE models (request/response structs + builders) extracted to `support::bulk_models`.
 // Import into the crate root so existing `BlockingRpcTransport` methods can keep using the short names
@@ -1579,14 +1580,43 @@ impl BlockingRpcTransport {
         count: u64,
         prune: bool,
     ) -> Result<GetBlocksBinResponse, RpcError> {
-        let req = GetBlocksBinRequest {
-            start_height,
-            count,
-            prune,
-        };
-        let body = to_bytes(req)
-            .map(|b| b.to_vec())
-            .map_err(|e| RpcError::InvalidInterface(format!("epee encode: {e}")))?;
+        // Monero's `/get_blocks.bin` does not accept the generic portable-storage framing emitted
+        // by `cuprate_epee_encoding::to_bytes`. Walletcore's earlier telemetry and a standalone
+        // local probe both confirm the daemon expects this exact field layout:
+        //
+        //   prune=<bool>
+        //   start_height=<u64 little-endian>
+        //   max_block_count=<u64 little-endian>
+        //
+        // encoded with Monero's historical on-wire prefix bytes.
+        const GET_BLOCKS_BIN_PREFIX_BEFORE_PRUNE_VALUE: &[u8] = &[
+            0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01, 0x0c, 0x05, 0x70, 0x72,
+            0x75, 0x6e, 0x65, 0x0b,
+        ];
+        const GET_BLOCKS_BIN_PREFIX_AFTER_PRUNE_VALUE: &[u8] = &[
+            0x0c, 0x73, 0x74, 0x61, 0x72, 0x74, 0x5f, 0x68,
+            0x65, 0x69, 0x67, 0x68, 0x74, 0x05,
+        ];
+        const GET_BLOCKS_BIN_MID: &[u8] = &[
+            0x0f, 0x6d, 0x61, 0x78, 0x5f, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x5f, 0x63, 0x6f,
+            0x75, 0x6e, 0x74, 0x05,
+        ];
+
+        let mut body = Vec::with_capacity(
+            GET_BLOCKS_BIN_PREFIX_BEFORE_PRUNE_VALUE.len()
+                + 1
+                + GET_BLOCKS_BIN_PREFIX_AFTER_PRUNE_VALUE.len()
+                + 8
+                + GET_BLOCKS_BIN_MID.len()
+                + 8,
+        );
+        body.extend_from_slice(GET_BLOCKS_BIN_PREFIX_BEFORE_PRUNE_VALUE);
+        body.push(if prune { 1 } else { 0 });
+        body.extend_from_slice(GET_BLOCKS_BIN_PREFIX_AFTER_PRUNE_VALUE);
+        body.extend_from_slice(&start_height.to_le_bytes());
+        body.extend_from_slice(GET_BLOCKS_BIN_MID);
+        body.extend_from_slice(&count.to_le_bytes());
+
         let resp_bytes = self.post_bin("get_blocks.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksBinResponse = from_bytes(&mut reader)
@@ -2052,6 +2082,8 @@ struct TrackedOutput {
     spent: bool,
     /// If this output has been detected as spent, record the spending txid when known.
     spending_txid: Option<[u8; 32]>,
+    /// Height where the spending tx was observed, if known.
+    spending_height: Option<u64>,
 }
 
 /// Minimal pending-outgoing record for UI history.
@@ -2363,6 +2395,8 @@ pub(crate) struct PersistedOutput {
     subaddress_minor: u32,
     spent: bool,
     spending_txid: Option<[u8; 32]>,
+    #[serde(default)]
+    spending_height: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2444,6 +2478,7 @@ impl From<&TrackedOutput> for PersistedOutput {
             subaddress_minor: output.subaddress_minor,
             spent: output.spent,
             spending_txid: output.spending_txid,
+            spending_height: output.spending_height,
         }
     }
 }
@@ -2462,6 +2497,7 @@ impl From<PersistedOutput> for TrackedOutput {
             subaddress_minor: output.subaddress_minor,
             spent: output.spent,
             spending_txid: output.spending_txid,
+            spending_height: output.spending_height,
         }
     }
 }
@@ -2867,9 +2903,6 @@ pub extern "C" fn wallet_get_balance_with_filter(
     let mut unlocked: u64 = 0;
 
     for o in state.tracked_outputs.iter() {
-        // Total/unlocked balances should consider all outputs (including spent if core keeps them),
-        // but tracked_outputs is typically pruned of spent outputs during refresh. Either way, we
-        // preserve existing semantics and only sum what exists in tracked_outputs.
         if let Some(f) = &filter {
             if let Some(minor) = f.subaddress_minor {
                 // Account 0 only for now
@@ -2877,6 +2910,9 @@ pub extern "C" fn wallet_get_balance_with_filter(
                     continue;
                 }
             }
+        }
+        if o.spent {
+            continue;
         }
 
         total = total.saturating_add(o.amount);

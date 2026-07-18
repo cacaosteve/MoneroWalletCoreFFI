@@ -274,56 +274,6 @@ pub extern "C" fn wallet_send(
         }
     }
 
-    // Consistency checker: derive key image from reconstructed `WalletOutput` using the *same*
-    // derivation as refresh uses to populate `TrackedOutput.key_image`.
-    //
-    // If these diverge, spending will likely be rejected by the daemon with `invalid_input` even
-    // though the key image is not spent.
-    let derive_key_image_bytes = |wallet_out: &monero_wallet::WalletOutput,
-                                  spend_scalar_dalek: curve25519_dalek::Scalar,
-                                  view_scalar_ed: monero_wallet::ed25519::Scalar,
-                                  subaddress_major: u32,
-                                  subaddress_minor: u32|
-     -> [u8; 32] {
-        // key_offset: monero_wallet::ed25519::Scalar -> [u8;32] -> dalek scalar
-        let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
-        let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
-            .into_option()
-            .unwrap_or(curve25519_dalek::Scalar::ZERO);
-
-        // subaddress scalar m (dalek), matches refresh
-        let m_dalek = if subaddress_major == 0 && subaddress_minor == 0 {
-            curve25519_dalek::Scalar::ZERO
-        } else {
-            let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
-            data.extend_from_slice(b"SubAddr\0");
-            data.extend_from_slice(&<[u8; 32]>::from(view_scalar_ed));
-            data.extend_from_slice(&subaddress_major.to_le_bytes());
-            data.extend_from_slice(&subaddress_minor.to_le_bytes());
-            let m_ed: monero_wallet::ed25519::Scalar = monero_wallet::ed25519::Scalar::hash(&data);
-            let m_d: curve25519_dalek::Scalar = m_ed.into();
-            m_d
-        };
-
-        // x = a + key_offset + m
-        let x = spend_scalar_dalek + ko_dalek + m_dalek;
-
-        // Hp(P)
-        let p = wallet_out.key();
-        let p_bytes = p.compress().to_bytes();
-        let hp_p = monero_wallet::ed25519::Point::biased_hash(p_bytes);
-        let hp_p_bytes = hp_p.compress().to_bytes();
-
-        use curve25519_dalek::traits::Identity;
-        let hp_p_dalek = curve25519_dalek::edwards::CompressedEdwardsY(hp_p_bytes)
-            .decompress()
-            .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
-
-        // I = x * Hp(P)
-        let ki = hp_p_dalek * x;
-        ki.compress().to_bytes()
-    };
-
     // Fee rate (once)
     let max_per_weight = fee_rate_max_per_weight_cap();
     let fee_priority = walletcore_fee_priority();
