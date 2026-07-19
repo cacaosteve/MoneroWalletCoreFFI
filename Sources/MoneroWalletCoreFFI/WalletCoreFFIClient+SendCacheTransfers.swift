@@ -9,6 +9,71 @@ import CLibMoneroWalletCore
 #endif
 
 public extension WalletCoreFFIClient {
+    static func prepareSend(
+        walletId: String,
+        toAddress: String,
+        amountPiconero: UInt64,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> PreparedSend {
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddress in
+                        wallet_prepare_send(cId, cNode, cAddress, amountPiconero, ringLen)
+                    }
+                }
+            }
+            return toAddress.withCString { cAddress in
+                wallet_prepare_send(cId, nil, cAddress, amountPiconero, ringLen)
+            }
+        }
+
+        let string = try WalletCoreFFISupport.takeCString(raw, context: "wallet_prepare_send")
+        guard let data = string.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_prepare_send returned non-UTF8 data")
+        }
+        do {
+            return try WalletCoreFFISupport.jsonDecoder.decode(PreparedSend.self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Unexpected wallet_prepare_send payload: \(string)")
+        }
+    }
+
+    static func relayPrepared(
+        walletId: String,
+        prepared: PreparedSend,
+        nodeURL: String? = nil
+    ) throws -> RelayResult {
+        let payloadData = try WalletCoreFFISupport.jsonEncoder.encode(prepared)
+        guard let payload = String(data: payloadData, encoding: .utf8) else {
+            throw WalletCoreFFIError.invalidArgument("Failed to encode prepared transaction")
+        }
+
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    payload.withCString { cPayload in
+                        wallet_relay_prepared(cId, cNode, cPayload)
+                    }
+                }
+            }
+            return payload.withCString { cPayload in
+                wallet_relay_prepared(cId, nil, cPayload)
+            }
+        }
+
+        let string = try WalletCoreFFISupport.takeCString(raw, context: "wallet_relay_prepared")
+        guard let data = string.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_relay_prepared returned non-UTF8 data")
+        }
+        do {
+            return try WalletCoreFFISupport.jsonDecoder.decode(RelayResult.self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Unexpected wallet_relay_prepared payload: \(string)")
+        }
+    }
+
     static func previewFee(
         walletId: String,
         destinations: [Destination],

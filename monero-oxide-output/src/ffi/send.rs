@@ -23,7 +23,10 @@ use zeroize::Zeroizing;
 // External types used by the send path.
 use monero_address::MoneroAddress;
 use monero_interface::{FeeError, FeeRate};
-use monero_wallet::Scanner;
+use monero_wallet::{
+    transaction::{Input, NotPruned, Transaction},
+    Scanner,
+};
 
 // Treat any broadcast failure tagged as `double_spend` as requiring spent-evidence before we
 // quarantine a candidate output.
@@ -132,6 +135,255 @@ fn walletcore_send_retry_max() -> usize {
         .unwrap_or(2)
 }
 
+#[derive(Deserialize)]
+struct PreparedSendPayload {
+    txid: String,
+    amount: u64,
+    fee: u64,
+    signed_tx_hex: String,
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() % 2 != 0 {
+        return Err("signed transaction hex must be non-empty and even-length".to_string());
+    }
+    if value.len() > 4 * 1024 * 1024 {
+        return Err("signed transaction hex exceeds the 2 MiB binary limit".to_string());
+    }
+
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = nibble(pair[0])
+            .ok_or_else(|| "signed transaction contains non-hex data".to_string())?;
+        let low = nibble(pair[1])
+            .ok_or_else(|| "signed transaction contains non-hex data".to_string())?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn daemon_knows_tx(base_url: &str, txid: &str) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct TxInfo {
+        tx_hash: String,
+    }
+
+    #[derive(Deserialize)]
+    struct GetTransactionsResponse {
+        #[serde(default)]
+        txs: Vec<TxInfo>,
+    }
+
+    let rpc_client: RpcClient = TOKIO_RUNTIME
+        .block_on(monero_simple_request_rpc::SimpleRequestTransport::new(
+            base_url.to_string(),
+        ))
+        .map_err(|error| format!("failed to connect daemon '{base_url}': {error}"))?;
+    let params = serde_json::json!({
+        "txs_hashes": [txid],
+        "decode_as_json": false,
+        "prune": true
+    })
+    .to_string();
+    let raw = TOKIO_RUNTIME
+        .block_on(rpc_client.rpc_call("get_transactions", Some(params), 2 * 1024 * 1024))
+        .map_err(|error| format!("get_transactions failed: {error}"))?;
+    let response: GetTransactionsResponse = serde_json::from_str(&raw)
+        .map_err(|error| format!("get_transactions response was invalid: {error}"))?;
+    Ok(response
+        .txs
+        .iter()
+        .any(|transaction| transaction.tx_hash.eq_ignore_ascii_case(txid)))
+}
+
+fn relay_result_json(txid: &str, status: &str) -> *mut c_char {
+    let result = serde_json::json!({ "txid": txid, "status": status }).to_string();
+    match CString::new(result) {
+        Ok(value) => {
+            clear_last_error();
+            value.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_relay_prepared: result contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Relay a previously prepared transaction. Repeating this call is idempotent because the signed
+/// blob and therefore its transaction hash are immutable.
+#[no_mangle]
+pub extern "C" fn wallet_relay_prepared(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    prepared_json: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if wallet_id.is_null() || prepared_json.is_null() {
+        record_error(-11, "wallet_relay_prepared: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(value) if !value.trim().is_empty() => value.trim(),
+        _ => {
+            record_error(-10, "wallet_relay_prepared: invalid wallet id");
+            return ptr::null_mut();
+        }
+    };
+    let payload_text = match unsafe { CStr::from_ptr(prepared_json) }.to_str() {
+        Ok(value) => value,
+        Err(_) => {
+            record_error(-10, "wallet_relay_prepared: prepared payload was not UTF-8");
+            return ptr::null_mut();
+        }
+    };
+    let prepared: PreparedSendPayload = match serde_json::from_str(payload_text) {
+        Ok(value) => value,
+        Err(error) => {
+            record_error(
+                -10,
+                format!("wallet_relay_prepared: invalid payload ({error})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let tx_bytes = match decode_hex(&prepared.signed_tx_hex) {
+        Ok(value) => value,
+        Err(error) => {
+            record_error(-10, format!("wallet_relay_prepared: {error}"));
+            return ptr::null_mut();
+        }
+    };
+    let mut reader = tx_bytes.as_slice();
+    let transaction = match Transaction::<NotPruned>::read(&mut reader) {
+        Ok(value) if reader.is_empty() => value,
+        Ok(_) => {
+            record_error(
+                -10,
+                "wallet_relay_prepared: signed blob contained trailing bytes",
+            );
+            return ptr::null_mut();
+        }
+        Err(error) => {
+            record_error(
+                -10,
+                format!("wallet_relay_prepared: invalid transaction ({error})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let actual_txid = hex_lowercase(&transaction.hash());
+    if !actual_txid.eq_ignore_ascii_case(prepared.txid.trim()) {
+        record_error(
+            -10,
+            "wallet_relay_prepared: payload txid does not match signed blob",
+        );
+        return ptr::null_mut();
+    }
+
+    let base_url = if node_url.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+    .or_else(|| std::env::var("MONERO_URL").ok())
+    .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    if daemon_knows_tx(&base_url, &actual_txid).unwrap_or(false) {
+        return relay_result_json(&actual_txid, "already_known");
+    }
+
+    if let Err(error) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_bytes))
+    {
+        if daemon_knows_tx(&base_url, &actual_txid).unwrap_or(false) {
+            return relay_result_json(&actual_txid, "already_known");
+        }
+        record_error(
+            map_rpc_error(error.clone()),
+            format!("wallet_relay_prepared: send_raw_transaction failed ({error})"),
+        );
+        return ptr::null_mut();
+    }
+
+    {
+        let mut store = WALLET_STORE.lock().expect("wallet store poisoned");
+        let Some(state) = store.get_mut(id) else {
+            record_error(
+                -13,
+                format!("wallet_relay_prepared: wallet '{id}' not registered"),
+            );
+            return ptr::null_mut();
+        };
+
+        let mut spent_sum = 0u64;
+        for input in transaction.prefix().inputs.iter() {
+            let Input::ToKey { key_image, .. } = input else {
+                continue;
+            };
+            if let Some(output) = state
+                .tracked_outputs
+                .iter_mut()
+                .find(|output| output.key_image == key_image.to_bytes())
+            {
+                if !output.spent {
+                    output.spent = true;
+                    spent_sum = spent_sum.saturating_add(output.amount);
+                }
+            }
+        }
+        state.total = state.total.saturating_sub(spent_sum);
+        state.unlocked = state.unlocked.saturating_sub(spent_sum);
+
+        if !state
+            .pending_outgoing
+            .iter()
+            .any(|entry| entry.txid == actual_txid)
+        {
+            state.pending_outgoing.push(PendingOutgoingTx {
+                txid: actual_txid.clone(),
+                amount: prepared.amount,
+                fee: prepared.fee,
+                created_at: state.chain_time,
+            });
+        }
+        state
+            .tx_ledger
+            .entry(actual_txid.clone())
+            .or_insert_with(|| LedgerEntry {
+                txid: actual_txid.clone(),
+                direction: "out".to_string(),
+                amount: prepared.amount,
+                fee: Some(prepared.fee),
+                height: None,
+                timestamp: Some(state.chain_time),
+                is_pending: true,
+                is_coinbase: false,
+            });
+    }
+
+    relay_result_json(&actual_txid, "accepted")
+}
+
 /// Single-destination convenience send (legacy API).
 #[no_mangle]
 pub extern "C" fn wallet_send(
@@ -140,6 +392,43 @@ pub extern "C" fn wallet_send(
     to_address: *const c_char,
     amount_piconero: u64,
     ring_len: u8,
+) -> *mut c_char {
+    wallet_send_impl(
+        wallet_id,
+        node_url,
+        to_address,
+        amount_piconero,
+        ring_len,
+        false,
+    )
+}
+
+/// Build and sign a single-destination transaction without broadcasting it.
+#[no_mangle]
+pub extern "C" fn wallet_prepare_send(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    amount_piconero: u64,
+    ring_len: u8,
+) -> *mut c_char {
+    wallet_send_impl(
+        wallet_id,
+        node_url,
+        to_address,
+        amount_piconero,
+        ring_len,
+        true,
+    )
+}
+
+fn wallet_send_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    amount_piconero: u64,
+    ring_len: u8,
+    prepare_only: bool,
 ) -> *mut c_char {
     clear_last_error();
 
@@ -940,6 +1229,40 @@ pub extern "C" fn wallet_send(
                 return ptr::null_mut();
             }
         };
+
+        if prepare_only {
+            let tx_blob = tx.serialize();
+            let txid = hex_lowercase(&tx.hash());
+            let result_json = match serde_json::to_string(&serde_json::json!({
+                "txid": txid,
+                "amount": amount_piconero,
+                "fee": fee_piconero,
+                "signed_tx_hex": hex_lowercase(&tx_blob)
+            })) {
+                Ok(s) => s,
+                Err(err) => {
+                    record_error(
+                        -16,
+                        format!("wallet_prepare_send: result JSON serialization failed ({err})"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            return match CString::new(result_json) {
+                Ok(cstr) => {
+                    clear_last_error();
+                    cstr.into_raw()
+                }
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_prepare_send: result JSON contained interior null bytes",
+                    );
+                    ptr::null_mut()
+                }
+            };
+        }
 
         // Broadcast via /send_raw_transaction
         let tx_blob = tx.serialize();
@@ -2663,5 +2986,28 @@ pub extern "C" fn wallet_send_with_filter(
             );
             ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_hex;
+
+    #[test]
+    fn decode_hex_accepts_mixed_case() {
+        assert_eq!(decode_hex("00aBfF").unwrap(), vec![0, 0xab, 0xff]);
+    }
+
+    #[test]
+    fn decode_hex_rejects_empty_odd_and_non_hex_values() {
+        assert!(decode_hex("").is_err());
+        assert!(decode_hex("abc").is_err());
+        assert!(decode_hex("zz").is_err());
+    }
+
+    #[test]
+    fn decode_hex_enforces_binary_size_limit() {
+        let oversized = "00".repeat((2 * 1024 * 1024) + 1);
+        assert!(decode_hex(&oversized).is_err());
     }
 }

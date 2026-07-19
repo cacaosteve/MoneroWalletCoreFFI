@@ -343,6 +343,32 @@ char* wallet_send(
 );
 
 /*
+ * Build and sign a single-destination transaction without broadcasting it.
+ * Returns JSON:
+ *   { "txid": "<hex>", "amount": <uint64>, "fee": <uint64>, "signed_tx_hex": "<hex>" }
+ * Caller must persist the complete payload before calling wallet_relay_prepared and free the
+ * returned string with walletcore_free_cstr.
+ */
+char* wallet_prepare_send(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    uint64_t amount_piconero,
+    uint8_t ring_len
+);
+
+/*
+ * Relay a payload returned by wallet_prepare_send. Repeating this call relays the same immutable
+ * transaction and returns JSON { "txid": "<hex>", "status": "accepted" | "already_known" }.
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_relay_prepared(
+    const char* wallet_id,
+    const char* node_url,
+    const char* prepared_json
+);
+
+/*
  * Preview fee for multi-destination transfer. destinations_json is a JSON array:
  *   [ { "address": "<addr>", "amount": <uint64> }, ... ]
  * Returns a JSON string (e.g., { "fee": <uint64> }); caller must free it.

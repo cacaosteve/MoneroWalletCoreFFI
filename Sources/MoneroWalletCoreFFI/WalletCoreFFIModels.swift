@@ -16,6 +16,25 @@ public extension WalletCoreFFIClient {
         public let fee: UInt64
     }
 
+    struct PreparedSend: Codable, Equatable {
+        public let txid: String
+        public let amount: UInt64
+        public let fee: UInt64
+        public let signedTxHex: String
+
+        private enum CodingKeys: String, CodingKey {
+            case txid
+            case amount
+            case fee
+            case signedTxHex = "signed_tx_hex"
+        }
+    }
+
+    struct RelayResult: Decodable, Equatable {
+        public let txid: String
+        public let status: String
+    }
+
     struct FeeResult: Decodable {
         public let fee: UInt64
     }

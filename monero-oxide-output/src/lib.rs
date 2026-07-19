@@ -3000,6 +3000,8 @@ pub use crate::ffi::preview_fee::wallet_preview_fee_with_filter;
 pub use crate::ffi::refresh::wallet_refresh;
 pub use crate::ffi::refresh::wallet_refresh_async;
 pub use crate::ffi::refresh::wallet_sync_status;
+pub use crate::ffi::send::wallet_prepare_send;
+pub use crate::ffi::send::wallet_relay_prepared;
 pub use crate::ffi::send::wallet_send;
 pub use crate::ffi::send::wallet_send_with_filter;
 pub use crate::ffi::sweep::wallet_preview_sweep;
