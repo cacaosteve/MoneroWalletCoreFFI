@@ -4,14 +4,23 @@
 
 - Swift package / product name: `MoneroWalletCoreFFI`
 - Repository: `https://github.com/cacaosteve/MoneroWalletCoreFFI`
-- Rust wallet core: built from `monero-oxide`
+- **Active consumer branch:** `walletcore/aligned-2026-07-18` (prebuilt Apple + Android artifacts)
+- Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) (pinned rev in `monero-oxide-output/Cargo.toml`)
+- Consumers: [nexawal](https://github.com/cacaosteve/nexawal) (SPM), [nexawal-android](https://github.com/cacaosteve/nexawal-android) (git submodule)
 
 Platform outputs:
-- Apple (iOS + macOS): prebuilt `MoneroWalletCore.xcframework`
-- Android: native `libmonerowalletcore.so` built from the same crate via `Scripts/build_android.sh`
+- Apple (iOS device + simulator + macOS): prebuilt `Artifacts/MoneroWalletCore.xcframework`
+- Android: `Artifacts/android/{arm64-v8a,x86_64}/libmonerowalletcore.so` via `Scripts/build_android.sh`
 - Linux (Vapor/server): system-installed `libmonerowalletcore.so` via `pkg-config`
 
 This README explains how to consume the package on Apple platforms, how Linux linking works, and how the native artifacts are built.
+
+### Wallet-core behavior (high level)
+
+- Open from mnemonic; refresh/scan against a Monero daemon
+- Balance, transfers, subaddress derivation, fee preview
+- Send / sweep via **prepare → durable local persist → relay** (apps recover pending prepares across relaunch)
+- Secret hygiene: in-memory keys (not a long-lived mnemonic string); KI/amount diagnostic dumps are env-gated
 
 
 ## Supported platforms
@@ -36,13 +45,15 @@ You have two ways to consume this package:
 
 ### iOS/macOS (Xcode)
 
-- File > Add Packages… and paste the repository URL (branch “main/master” or a specific revision).
+- File > Add Packages… and paste `https://github.com/cacaosteve/MoneroWalletCoreFFI.git`
+- Prefer branch **`walletcore/aligned-2026-07-18`** (or pin a specific revision on that branch). This is what NexaWal uses.
 - Select the `MoneroWalletCoreFFI` library product.
 - That’s it — the xcframework is used automatically by SPM.
 
 Notes:
-- Apple artifacts are built as static libraries in the xcframework, so you don’t need to worry about runtime search paths on iOS/macOS.
+- Apple artifacts are built as static libraries in the xcframework (device + simulator + macOS), so you don’t need runtime search paths on iOS/macOS.
 - No Rust toolchain is needed on client machines.
+- Use **File → Packages → Update to Latest Package Versions** to float to the tip of the branch.
 
 
 ### iOS/macOS (Package.swift consumer)
@@ -50,7 +61,10 @@ Notes:
 ```swift
 // Inside your app’s Package.swift
 dependencies: [
-    .package(url: "https://github.com/cacaosteve/MoneroWalletCoreFFI.git", branch: "main")
+    .package(
+        url: "https://github.com/cacaosteve/MoneroWalletCoreFFI.git",
+        branch: "walletcore/aligned-2026-07-18"
+    )
 ],
 targets: [
     .target(
@@ -60,6 +74,16 @@ targets: [
         ]
     )
 ]
+```
+
+### Android (NexaWal pattern)
+
+- Add this repo as a git submodule tracking `walletcore/aligned-2026-07-18`.
+- Copy (or Gradle-sync) `Artifacts/android/<abi>/libmonerowalletcore.so` into your module `jniLibs`.
+- Rebuild artifacts after core changes:
+
+```bash
+PROFILE=release INSTALL_TO_NEXAWAL_ANDROID=1 ./Scripts/build_android.sh
 ```
 
 ## Linux (Vapor) setup
@@ -163,7 +187,7 @@ if let exported = try WalletCoreFFIClient.exportCache(walletId: "main_hot") {
 }
 ```
 
-Preview fee and send:
+Preview fee and send (apps typically prepare → persist → relay; `send` remains available as a convenience wrapper):
 ```swift
 let fee = try WalletCoreFFIClient.previewFee(
     walletId: "main_hot",
