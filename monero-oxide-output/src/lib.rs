@@ -1192,11 +1192,24 @@ pub extern "C" fn wallet_refresh_cancel(wallet_id: *const c_char) -> c_int {
     0
 }
 
+#[derive(Clone)]
 struct MasterKeys {
+    // `entropy` is wrapped in `Zeroizing`, so it is wiped automatically when dropped.
     entropy: Zeroizing<[u8; 32]>,
     spend_scalar: curve25519_dalek::Scalar,
     view_scalar_dalek: curve25519_dalek::Scalar,
     view_scalar_ed: EdScalar,
+}
+
+impl Drop for MasterKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        // `entropy` is already zeroized via `Zeroizing`; explicitly wipe the derived
+        // secret scalars so no plaintext key material lingers in freed memory.
+        self.spend_scalar.zeroize();
+        self.view_scalar_dalek.zeroize();
+        self.view_scalar_ed.zeroize();
+    }
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
@@ -2343,7 +2356,7 @@ impl ObservedOutput {
 
 #[derive(Clone)]
 struct StoredWallet {
-    mnemonic: String,
+    keys: MasterKeys,
     restore_height: u64,
     network: MoneroNetwork,
     last_scanned: u64,
@@ -2703,15 +2716,12 @@ pub extern "C" fn wallet_open_from_mnemonic(
         return -10;
     }
 
-    // Basic validation: attempt to parse mnemonic (English) so obviously bad inputs fail fast
-    if MoneroSeed::from_string(
-        MoneroSeedLanguage::English,
-        Zeroizing::new(mnemonic.to_string()),
-    )
-    .is_err()
-    {
-        return -10;
-    }
+    // Derive the master keys once. This also validates the mnemonic (English),
+    // so obviously bad inputs fail fast without a separate parse step.
+    let keys = match master_keys_from_mnemonic_str(mnemonic) {
+        Ok(keys) => keys,
+        Err(_) => return -10,
+    };
 
     let network = if is_mainnet != 0 {
         MoneroNetwork::Mainnet
@@ -2723,7 +2733,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
     match map.entry(id.to_string()) {
         Entry::Occupied(mut slot) => {
             let state = slot.get_mut();
-            state.mnemonic = mnemonic.to_string();
+            state.keys = keys;
             state.network = network;
             if restore_height < state.restore_height {
                 state.restore_height = restore_height;
@@ -2737,7 +2747,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
         }
         Entry::Vacant(slot) => {
             slot.insert(StoredWallet {
-                mnemonic: mnemonic.to_string(),
+                keys,
                 restore_height,
                 network,
                 last_scanned: restore_height,

@@ -534,13 +534,7 @@ fn wallet_send_impl(
     };
 
     // Construct master keys and view pair
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(code, "wallet_send: unable to parse mnemonic");
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
@@ -854,20 +848,23 @@ fn wallet_send_impl(
 
                 if signer_ki != t.key_image {
                     // Real invariant violation: the signer would produce a different key image than what we tracked.
-                    walletcore_log_line(
-                        id,
-                        snapshot.network,
-                        &format!(
-                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
+                    // Gated: dumps full key image hex.
+                    if walletcore_debug_input_dump_enabled() {
+                        walletcore_log_line(
                             id,
-                            hex_dump_prefix(&t.tx_hash, 32),
-                            t.index_in_tx,
-                            t.subaddress_major,
-                            t.subaddress_minor,
-                            hex_dump_prefix(&t.key_image, 32),
-                            hex_dump_prefix(&signer_ki, 32)
-                        ),
-                    );
+                            snapshot.network,
+                            &format!(
+                                "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
+                                id,
+                                hex_dump_prefix(&t.tx_hash, 32),
+                                t.index_in_tx,
+                                t.subaddress_major,
+                                t.subaddress_minor,
+                                hex_dump_prefix(&t.key_image, 32),
+                                hex_dump_prefix(&signer_ki, 32)
+                            ),
+                        );
+                    }
 
                     // Quarantine this outpoint and restart selection so we don't attempt to spend it.
                     {
@@ -1366,30 +1363,33 @@ fn wallet_send_impl(
                 );
             }
 
-            // Log selected inputs for correlation
-            walletcore_log_line(
-                id,
-                snapshot.network,
-                &format!(
-                    "🧾 send selected_inputs wallet_id={} selected_count={} selected_sum={} inputs={}",
+            // Log selected inputs for correlation.
+            // Gated: dumps per-output txids + amounts.
+            if walletcore_debug_input_dump_enabled() {
+                walletcore_log_line(
                     id,
-                    selected_tracked.len(),
-                    selected_sum,
-                    selected_tracked
-                        .iter()
-                        .map(|o| {
-                            format!(
-                                "{}:{}@{}:{}",
-                                hex_lowercase(&o.tx_hash),
-                                o.index_in_tx,
-                                o.block_height,
-                                o.amount
-                            )
-                        })
-                        .collect::<Vec<String>>()
-                        .join(",")
-                ),
-            );
+                    snapshot.network,
+                    &format!(
+                        "🧾 send selected_inputs wallet_id={} selected_count={} selected_sum={} inputs={}",
+                        id,
+                        selected_tracked.len(),
+                        selected_sum,
+                        selected_tracked
+                            .iter()
+                            .map(|o| {
+                                format!(
+                                    "{}:{}@{}:{}",
+                                    hex_lowercase(&o.tx_hash),
+                                    o.index_in_tx,
+                                    o.block_height,
+                                    o.amount
+                                )
+                            })
+                            .collect::<Vec<String>>()
+                            .join(",")
+                    ),
+                );
+            }
 
             // Signer-aligned KI diagnostics: for each selected input, show
             // - tracked KI (refresh)
@@ -2041,19 +2041,21 @@ fn wallet_send_impl(
                     created_at: state.chain_time,
                 });
 
-                walletcore_log_line(
-                    id,
-                    snapshot.network,
-                    &format!(
-                        "🧾 pending_outgoing recorded wallet_id={} txid={} amount_piconero={} fee_piconero={} created_at={} pending_outgoing_count={}",
+                if walletcore_debug_input_dump_enabled() {
+                    walletcore_log_line(
                         id,
-                        hex,
-                        amount_piconero,
-                        fee_piconero,
-                        state.chain_time,
-                        state.pending_outgoing.len()
-                    ),
-                );
+                        snapshot.network,
+                        &format!(
+                            "🧾 pending_outgoing recorded wallet_id={} txid={} amount_piconero={} fee_piconero={} created_at={} pending_outgoing_count={}",
+                            id,
+                            hex,
+                            amount_piconero,
+                            fee_piconero,
+                            state.chain_time,
+                            state.pending_outgoing.len()
+                        ),
+                    );
+                }
 
                 state.tx_ledger.insert(
                     hex.clone(),
@@ -2288,13 +2290,7 @@ fn wallet_send_with_filter_impl(
         top_block_timestamp: 0,
     };
 
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(code, "wallet_send_with_filter: unable to parse mnemonic");
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {

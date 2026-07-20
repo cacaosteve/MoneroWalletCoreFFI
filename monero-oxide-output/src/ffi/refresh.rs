@@ -960,15 +960,7 @@ fn wallet_refresh_impl(
     };
 
     // Keys + scanner
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            return record_error(
-                code,
-                format!("wallet_refresh: unable to parse mnemonic ({code})"),
-            )
-        }
-    };
+    let master = snapshot.keys.clone();
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
@@ -991,17 +983,19 @@ fn wallet_refresh_impl(
     // Fingerprints + derived address logs
     let spend_scalar_bytes = master.spend_scalar.to_bytes();
     let view_scalar_bytes = master.view_scalar_dalek.to_bytes();
-    walletcore_log_line(
-        id,
-        snapshot.network,
-        &format!(
-            "🔐 wallet_fingerprint wallet_id={} spend_scalar_fpr={} view_scalar_fpr={} entropy_fpr={}",
+    if walletcore_debug_input_dump_enabled() {
+        walletcore_log_line(
             id,
-            fingerprint32("spend_scalar", &spend_scalar_bytes),
-            fingerprint32("view_scalar", &view_scalar_bytes),
-            fingerprint32("entropy", master.entropy.as_ref()),
-        ),
-    );
+            snapshot.network,
+            &format!(
+                "🔐 wallet_fingerprint wallet_id={} spend_scalar_fpr={} view_scalar_fpr={} entropy_fpr={}",
+                id,
+                fingerprint32("spend_scalar", &spend_scalar_bytes),
+                fingerprint32("view_scalar", &view_scalar_bytes),
+                fingerprint32("entropy", master.entropy.as_ref()),
+            ),
+        );
+    }
 
     let derived_primary_address = derive_address_string(&master, 0, 0, snapshot.network);
     walletcore_log_line(
@@ -1753,19 +1747,21 @@ fn wallet_refresh_impl(
                                 let e = spent_inputs_by_txid.entry(spend_txid).or_insert(0);
                                 *e = e.saturating_add(spent_amount);
 
-                                walletcore_log_line(
-                                    id,
-                                    snapshot.network,
-                                    &format!(
-                                        "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                if walletcore_debug_spend_detect_enabled() {
+                                    walletcore_log_line(
                                         id,
-                                        hex_dump_prefix(&spend_txid, 32),
-                                        hex_dump_prefix(&ki_bytes, 32),
-                                        spent_amount,
-                                        hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
-                                        working_outputs[out_idx].index_in_tx
-                                    ),
-                                );
+                                        snapshot.network,
+                                        &format!(
+                                            "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                            id,
+                                            hex_dump_prefix(&spend_txid, 32),
+                                            hex_dump_prefix(&ki_bytes, 32),
+                                            spent_amount,
+                                            hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                            working_outputs[out_idx].index_in_tx
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1799,21 +1795,23 @@ fn wallet_refresh_impl(
                                 if watch == ki_bytes {
                                     let matched =
                                         key_image_to_output_index.get(&ki_bytes).copied().is_some();
-                                    walletcore_log_line(
-                                        id,
-                                        snapshot.network,
-                                        &format!(
-                                            "🕵️ watch_key_image_seen wallet_id={} height={} spending_txid={} key_image={} matched_owned_output={}",
+                                    if walletcore_debug_spend_detect_enabled() {
+                                        walletcore_log_line(
                                             id,
-                                            th,
-                                            match spend_txid_opt {
-                                                Some(txid) => hex_dump_prefix(&txid, 32),
-                                                None => "(unknown)".to_string(),
-                                            },
-                                            hex_dump_prefix(&ki_bytes, 32),
-                                            matched
-                                        ),
-                                    );
+                                            snapshot.network,
+                                            &format!(
+                                                "🕵️ watch_key_image_seen wallet_id={} height={} spending_txid={} key_image={} matched_owned_output={}",
+                                                id,
+                                                th,
+                                                match spend_txid_opt {
+                                                    Some(txid) => hex_dump_prefix(&txid, 32),
+                                                    None => "(unknown)".to_string(),
+                                                },
+                                                hex_dump_prefix(&ki_bytes, 32),
+                                                matched
+                                            ),
+                                        );
+                                    }
                                 }
                             }
 
@@ -1828,34 +1826,38 @@ fn wallet_refresh_impl(
                                     let e = spent_inputs_by_txid.entry(spend_txid).or_insert(0);
                                     *e = e.saturating_add(spent_amount);
 
-                                    walletcore_log_line(
-                                        id,
-                                        snapshot.network,
-                                        &format!(
-                                            "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                    if walletcore_debug_spend_detect_enabled() {
+                                        walletcore_log_line(
                                             id,
-                                            hex_dump_prefix(&spend_txid, 32),
-                                            hex_dump_prefix(&ki_bytes, 32),
-                                            spent_amount,
-                                            hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
-                                            working_outputs[out_idx].index_in_tx
-                                        ),
-                                    );
+                                            snapshot.network,
+                                            &format!(
+                                                "🧾 spend_detected wallet_id={} spending_txid={} key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                                id,
+                                                hex_dump_prefix(&spend_txid, 32),
+                                                hex_dump_prefix(&ki_bytes, 32),
+                                                spent_amount,
+                                                hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                                working_outputs[out_idx].index_in_tx
+                                            ),
+                                        );
+                                    }
                                 } else {
                                     working_outputs[out_idx].spending_txid = None;
                                     working_outputs[out_idx].spending_height = Some(th);
-                                    walletcore_log_line(
-                                        id,
-                                        snapshot.network,
-                                        &format!(
-                                            "🧾 spend_detected wallet_id={} spending_txid=(unknown) key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                    if walletcore_debug_spend_detect_enabled() {
+                                        walletcore_log_line(
                                             id,
-                                            hex_dump_prefix(&ki_bytes, 32),
-                                            spent_amount,
-                                            hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
-                                            working_outputs[out_idx].index_in_tx
-                                        ),
-                                    );
+                                            snapshot.network,
+                                            &format!(
+                                                "🧾 spend_detected wallet_id={} spending_txid=(unknown) key_image={} spent_amount_piconero={} source_out_txid={} source_out_index={}",
+                                                id,
+                                                hex_dump_prefix(&ki_bytes, 32),
+                                                spent_amount,
+                                                hex_dump_prefix(&working_outputs[out_idx].tx_hash, 32),
+                                                working_outputs[out_idx].index_in_tx
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         }

@@ -233,16 +233,7 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
         top_block_timestamp: 0,
     };
 
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(
-                code,
-                "wallet_preview_sweep_with_filter: unable to parse mnemonic",
-            );
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
 
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
@@ -495,20 +486,22 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
 
     let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
     for t in &selected {
-        walletcore_log_line(
-            id,
-            snapshot.network,
-            &format!(
-                "🔎 sweep_preview selecting_input wallet_id={} base_url={} real_out_height={} real_out_txid={} real_out_index_in_tx={} real_out_amount_piconero={} daemon_height={}",
+        if walletcore_debug_input_dump_enabled() {
+            walletcore_log_line(
                 id,
-                base_url,
-                t.block_height,
-                hex_dump_prefix(&t.tx_hash, 32),
-                t.index_in_tx,
-                t.amount,
-                daemon.height
-            ),
-        );
+                snapshot.network,
+                &format!(
+                    "🔎 sweep_preview selecting_input wallet_id={} base_url={} real_out_height={} real_out_txid={} real_out_index_in_tx={} real_out_amount_piconero={} daemon_height={}",
+                    id,
+                    base_url,
+                    t.block_height,
+                    hex_dump_prefix(&t.tx_hash, 32),
+                    t.index_in_tx,
+                    t.amount,
+                    daemon.height
+                ),
+            );
+        }
 
         let block_number = match usize::try_from(t.block_height) {
             Ok(value) => value,
@@ -923,13 +916,7 @@ fn wallet_sweep_with_filter_impl(
         top_block_timestamp: 0,
     };
 
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(code, "wallet_sweep_with_filter: unable to parse mnemonic");
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
 
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,

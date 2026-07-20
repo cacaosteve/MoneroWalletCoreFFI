@@ -134,13 +134,7 @@ pub extern "C" fn wallet_preview_fee(
         top_block_timestamp: 0,
     };
 
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(code, "wallet_preview_fee: unable to parse mnemonic");
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
@@ -744,16 +738,7 @@ pub extern "C" fn wallet_preview_fee_with_filter(
         top_block_timestamp: 0,
     };
 
-    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
-        Ok(keys) => keys,
-        Err(code) => {
-            record_error(
-                code,
-                "wallet_preview_fee_with_filter: unable to parse mnemonic",
-            );
-            return ptr::null_mut();
-        }
-    };
+    let master = snapshot.keys.clone();
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {

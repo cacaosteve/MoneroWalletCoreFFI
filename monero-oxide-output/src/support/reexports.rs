@@ -47,6 +47,7 @@ pub(crate) use crate::{
     // Debugging helpers.
     walletcore_debug_dump_tracked_outputs,
     walletcore_debug_input_dump_enabled,
+    walletcore_debug_spend_detect_enabled,
     walletcore_debug_target_height,
     walletcore_debug_target_txid,
     walletcore_debug_target_window,
