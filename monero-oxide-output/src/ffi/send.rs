@@ -310,12 +310,14 @@ pub extern "C" fn wallet_relay_prepared(
     .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
     if daemon_knows_tx(&base_url, &actual_txid).unwrap_or(false) {
+        apply_relayed_tx_local_state(id, &transaction, &prepared, &actual_txid);
         return relay_result_json(&actual_txid, "already_known");
     }
 
     if let Err(error) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_bytes))
     {
         if daemon_knows_tx(&base_url, &actual_txid).unwrap_or(false) {
+            apply_relayed_tx_local_state(id, &transaction, &prepared, &actual_txid);
             return relay_result_json(&actual_txid, "already_known");
         }
         record_error(
@@ -325,63 +327,72 @@ pub extern "C" fn wallet_relay_prepared(
         return ptr::null_mut();
     }
 
-    {
-        let mut store = WALLET_STORE.lock().expect("wallet store poisoned");
-        let Some(state) = store.get_mut(id) else {
-            record_error(
-                -13,
-                format!("wallet_relay_prepared: wallet '{id}' not registered"),
-            );
-            return ptr::null_mut();
-        };
+    if !apply_relayed_tx_local_state(id, &transaction, &prepared, &actual_txid) {
+        record_error(
+            -13,
+            format!("wallet_relay_prepared: wallet '{id}' not registered"),
+        );
+        return ptr::null_mut();
+    }
+    relay_result_json(&actual_txid, "accepted")
+}
 
-        let mut spent_sum = 0u64;
-        for input in transaction.prefix().inputs.iter() {
-            let Input::ToKey { key_image, .. } = input else {
-                continue;
-            };
-            if let Some(output) = state
-                .tracked_outputs
-                .iter_mut()
-                .find(|output| output.key_image == key_image.to_bytes())
-            {
-                if !output.spent {
-                    output.spent = true;
-                    spent_sum = spent_sum.saturating_add(output.amount);
-                }
+fn apply_relayed_tx_local_state(
+    id: &str,
+    transaction: &Transaction<NotPruned>,
+    prepared: &PreparedSendPayload,
+    actual_txid: &str,
+) -> bool {
+    let mut store = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(state) = store.get_mut(id) else {
+        return false;
+    };
+
+    let mut spent_sum = 0u64;
+    for input in transaction.prefix().inputs.iter() {
+        let Input::ToKey { key_image, .. } = input else {
+            continue;
+        };
+        if let Some(output) = state
+            .tracked_outputs
+            .iter_mut()
+            .find(|output| output.key_image == key_image.to_bytes())
+        {
+            if !output.spent {
+                output.spent = true;
+                spent_sum = spent_sum.saturating_add(output.amount);
             }
         }
-        state.total = state.total.saturating_sub(spent_sum);
-        state.unlocked = state.unlocked.saturating_sub(spent_sum);
-
-        if !state
-            .pending_outgoing
-            .iter()
-            .any(|entry| entry.txid == actual_txid)
-        {
-            state.pending_outgoing.push(PendingOutgoingTx {
-                txid: actual_txid.clone(),
-                amount: prepared.amount,
-                fee: prepared.fee,
-                created_at: state.chain_time,
-            });
-        }
-        state
-            .tx_ledger
-            .entry(actual_txid.clone())
-            .or_insert_with(|| LedgerEntry {
-                txid: actual_txid.clone(),
-                direction: "out".to_string(),
-                amount: prepared.amount,
-                fee: Some(prepared.fee),
-                height: None,
-                timestamp: Some(state.chain_time),
-                is_pending: true,
-                is_coinbase: false,
-            });
     }
+    state.total = state.total.saturating_sub(spent_sum);
+    state.unlocked = state.unlocked.saturating_sub(spent_sum);
 
-    relay_result_json(&actual_txid, "accepted")
+    if !state
+        .pending_outgoing
+        .iter()
+        .any(|entry| entry.txid == actual_txid)
+    {
+        state.pending_outgoing.push(PendingOutgoingTx {
+            txid: actual_txid.to_string(),
+            amount: prepared.amount,
+            fee: prepared.fee,
+            created_at: state.chain_time,
+        });
+    }
+    state
+        .tx_ledger
+        .entry(actual_txid.to_string())
+        .or_insert_with(|| LedgerEntry {
+            txid: actual_txid.to_string(),
+            direction: "out".to_string(),
+            amount: prepared.amount,
+            fee: Some(prepared.fee),
+            height: None,
+            timestamp: Some(state.chain_time),
+            is_pending: true,
+            is_coinbase: false,
+        });
+    true
 }
 
 /// Single-destination convenience send (legacy API).
@@ -2108,6 +2119,44 @@ pub extern "C" fn wallet_send_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    wallet_send_with_filter_impl(
+        wallet_id,
+        node_url,
+        destinations_json,
+        filter_json,
+        ring_len,
+        false,
+    )
+}
+
+/// Build and sign a filtered multi-destination transaction without broadcasting it.
+/// Returns the same prepare payload shape as `wallet_prepare_send`.
+#[no_mangle]
+pub extern "C" fn wallet_prepare_send_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    wallet_send_with_filter_impl(
+        wallet_id,
+        node_url,
+        destinations_json,
+        filter_json,
+        ring_len,
+        true,
+    )
+}
+
+fn wallet_send_with_filter_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+    prepare_only: bool,
+) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() || destinations_json.is_null() {
@@ -2784,6 +2833,42 @@ pub extern "C" fn wallet_send_with_filter(
             return ptr::null_mut();
         }
     };
+
+    if prepare_only {
+        let tx_blob = tx.serialize();
+        let txid = hex_lowercase(&tx.hash());
+        let result_json = match serde_json::to_string(&serde_json::json!({
+            "txid": txid,
+            "amount": total_needed,
+            "fee": fee_piconero,
+            "signed_tx_hex": hex_lowercase(&tx_blob)
+        })) {
+            Ok(s) => s,
+            Err(err) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_prepare_send_with_filter: result JSON serialization failed ({err})"
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        return match CString::new(result_json) {
+            Ok(cstr) => {
+                clear_last_error();
+                cstr.into_raw()
+            }
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_prepare_send_with_filter: result JSON contained interior null bytes",
+                );
+                ptr::null_mut()
+            }
+        };
+    }
 
     let tx_blob = tx.serialize();
     if let Err(err) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {

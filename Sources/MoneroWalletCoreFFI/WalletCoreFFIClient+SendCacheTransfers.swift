@@ -40,6 +40,132 @@ public extension WalletCoreFFIClient {
         }
     }
 
+    static func prepareSendWithFilter(
+        walletId: String,
+        destinations: [Destination],
+        filter: [String: Any]? = nil,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> PreparedSend {
+        let destData = try WalletCoreFFISupport.jsonEncoder.encode(destinations)
+        guard let destJSON = String(data: destData, encoding: .utf8) else {
+            throw WalletCoreFFIError.invalidArgument("Failed to encode destinations as UTF-8 JSON")
+        }
+        let filterJSON = try WalletCoreFFISupport.encodeOptionalJSONObject(
+            filter,
+            context: "wallet_prepare_send_with_filter filter"
+        )
+
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    destJSON.withCString { cDests in
+                        if let f = filterJSON {
+                            return f.withCString { cFilter in
+                                wallet_prepare_send_with_filter(cId, cNode, cDests, cFilter, ringLen)
+                            }
+                        }
+                        return wallet_prepare_send_with_filter(cId, cNode, cDests, nil, ringLen)
+                    }
+                }
+            }
+            return destJSON.withCString { cDests in
+                if let f = filterJSON {
+                    return f.withCString { cFilter in
+                        wallet_prepare_send_with_filter(cId, nil, cDests, cFilter, ringLen)
+                    }
+                }
+                return wallet_prepare_send_with_filter(cId, nil, cDests, nil, ringLen)
+            }
+        }
+
+        let string = try WalletCoreFFISupport.takeCString(raw, context: "wallet_prepare_send_with_filter")
+        guard let data = string.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_prepare_send_with_filter returned non-UTF8 data")
+        }
+        do {
+            return try WalletCoreFFISupport.jsonDecoder.decode(PreparedSend.self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Unexpected wallet_prepare_send_with_filter payload: \(string)")
+        }
+    }
+
+    static func prepareSweep(
+        walletId: String,
+        toAddress: String,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> PreparedSend {
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        wallet_prepare_sweep(cId, cNode, cAddr, ringLen)
+                    }
+                }
+            }
+            return toAddress.withCString { cAddr in
+                wallet_prepare_sweep(cId, nil, cAddr, ringLen)
+            }
+        }
+
+        let string = try WalletCoreFFISupport.takeCString(raw, context: "wallet_prepare_sweep")
+        guard let data = string.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_prepare_sweep returned non-UTF8 data")
+        }
+        do {
+            return try WalletCoreFFISupport.jsonDecoder.decode(PreparedSend.self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Unexpected wallet_prepare_sweep payload: \(string)")
+        }
+    }
+
+    static func prepareSweepWithFilter(
+        walletId: String,
+        toAddress: String,
+        filter: [String: Any]? = nil,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> PreparedSend {
+        let filterJSON = try WalletCoreFFISupport.encodeOptionalJSONObject(
+            filter,
+            context: "wallet_prepare_sweep_with_filter filter"
+        )
+
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        if let f = filterJSON {
+                            return f.withCString { cFilter in
+                                wallet_prepare_sweep_with_filter(cId, cNode, cAddr, cFilter, ringLen)
+                            }
+                        }
+                        return wallet_prepare_sweep_with_filter(cId, cNode, cAddr, nil, ringLen)
+                    }
+                }
+            }
+            return toAddress.withCString { cAddr in
+                if let f = filterJSON {
+                    return f.withCString { cFilter in
+                        wallet_prepare_sweep_with_filter(cId, nil, cAddr, cFilter, ringLen)
+                    }
+                }
+                return wallet_prepare_sweep_with_filter(cId, nil, cAddr, nil, ringLen)
+            }
+        }
+
+        let string = try WalletCoreFFISupport.takeCString(raw, context: "wallet_prepare_sweep_with_filter")
+        guard let data = string.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_prepare_sweep_with_filter returned non-UTF8 data")
+        }
+        do {
+            return try WalletCoreFFISupport.jsonDecoder.decode(PreparedSend.self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Unexpected wallet_prepare_sweep_with_filter payload: \(string)")
+        }
+    }
+
     static func relayPrepared(
         walletId: String,
         prepared: PreparedSend,

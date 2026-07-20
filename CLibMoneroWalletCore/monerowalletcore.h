@@ -301,6 +301,19 @@ char* wallet_sweep(
 );
 
 /*
+ * Build and sign a full-wallet sweep without broadcasting it.
+ * Returns JSON:
+ *   { "txid": "<hex>", "amount": <uint64>, "fee": <uint64>, "signed_tx_hex": "<hex>" }
+ * Caller must persist then call wallet_relay_prepared. Free with walletcore_free_cstr.
+ */
+char* wallet_prepare_sweep(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    uint8_t ring_len
+);
+
+/*
  * Preview fee and max-sendable amount for a sweep ("send all") with an optional input filter.
  * filter_json is a JSON object (or NULL). Useful for sweeping a specific subaddress.
  * Returns JSON:
@@ -322,6 +335,19 @@ char* wallet_preview_sweep_with_filter(
  * Caller must free the returned string with walletcore_free_cstr.
  */
 char* wallet_sweep_with_filter(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    const char* filter_json,
+    uint8_t ring_len
+);
+
+/*
+ * Build and sign a filtered sweep without broadcasting it.
+ * Returns the same prepare payload shape as wallet_prepare_sweep.
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_prepare_sweep_with_filter(
     const char* wallet_id,
     const char* node_url,
     const char* to_address,
@@ -358,8 +384,23 @@ char* wallet_prepare_send(
 );
 
 /*
- * Relay a payload returned by wallet_prepare_send. Repeating this call relays the same immutable
- * transaction and returns JSON { "txid": "<hex>", "status": "accepted" | "already_known" }.
+ * Build and sign a filtered multi-destination transaction without broadcasting it.
+ * Returns the same prepare payload shape as wallet_prepare_send.
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_prepare_send_with_filter(
+    const char* wallet_id,
+    const char* node_url,
+    const char* destinations_json,
+    const char* filter_json,
+    uint8_t ring_len
+);
+
+/*
+ * Relay a payload returned by wallet_prepare_send / wallet_prepare_send_with_filter /
+ * wallet_prepare_sweep / wallet_prepare_sweep_with_filter.
+ * Repeating this call relays the same immutable transaction and returns JSON
+ * { "txid": "<hex>", "status": "accepted" | "already_known" }.
  * Caller must free the returned string with walletcore_free_cstr.
  */
 char* wallet_relay_prepared(

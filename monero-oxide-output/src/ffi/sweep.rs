@@ -63,7 +63,25 @@ pub extern "C" fn wallet_sweep(
     }
 
     // No filter (whole wallet)
-    wallet_sweep_with_filter(wallet_id, node_url, to_address, ptr::null(), ring_len)
+    wallet_sweep_with_filter_impl(wallet_id, node_url, to_address, ptr::null(), ring_len, false)
+}
+
+/// Build and sign a full-wallet sweep without broadcasting it.
+#[no_mangle]
+pub extern "C" fn wallet_prepare_sweep(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_prepare_sweep: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    wallet_sweep_with_filter_impl(wallet_id, node_url, to_address, ptr::null(), ring_len, true)
 }
 
 #[no_mangle]
@@ -752,6 +770,43 @@ pub extern "C" fn wallet_sweep_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    wallet_sweep_with_filter_impl(
+        wallet_id,
+        node_url,
+        to_address,
+        filter_json,
+        ring_len,
+        false,
+    )
+}
+
+/// Build and sign a filtered sweep without broadcasting it.
+#[no_mangle]
+pub extern "C" fn wallet_prepare_sweep_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    wallet_sweep_with_filter_impl(
+        wallet_id,
+        node_url,
+        to_address,
+        filter_json,
+        ring_len,
+        true,
+    )
+}
+
+fn wallet_sweep_with_filter_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+    prepare_only: bool,
+) -> *mut c_char {
     clear_last_error();
     if wallet_id.is_null() || to_address.is_null() {
         record_error(-11, "wallet_sweep_with_filter: null argument(s)");
@@ -1225,6 +1280,42 @@ pub extern "C" fn wallet_sweep_with_filter(
             return ptr::null_mut();
         }
     };
+
+    if prepare_only {
+        let tx_blob = tx.serialize();
+        let txid = hex_lowercase(&tx.hash());
+        let result_json = match serde_json::to_string(&serde_json::json!({
+            "txid": txid,
+            "amount": final_amount,
+            "fee": final_fee,
+            "signed_tx_hex": hex_lowercase(&tx_blob)
+        })) {
+            Ok(s) => s,
+            Err(err) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_prepare_sweep_with_filter: result JSON serialization failed ({err})"
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        return match CString::new(result_json) {
+            Ok(cstr) => {
+                clear_last_error();
+                cstr.into_raw()
+            }
+            Err(_) => {
+                record_error(
+                    -16,
+                    "wallet_prepare_sweep_with_filter: result JSON contained interior null bytes",
+                );
+                ptr::null_mut()
+            }
+        };
+    }
 
     let tx_blob = tx.serialize();
     if let Err(err) = TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
