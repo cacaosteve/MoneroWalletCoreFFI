@@ -2475,21 +2475,24 @@ fn wallet_send_with_filter_impl(
                 t.subaddress_minor,
             );
             if signer_ki != t.key_image {
-                // Always emit a diagnostic line for this invariant violation.
-                walletcore_log_line(
-                    id,
-                    snapshot.network,
-                    &format!(
-                        "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
+                // Diagnostic line for this invariant violation.
+                // Gated: dumps full key image hex.
+                if walletcore_debug_input_dump_enabled() {
+                    walletcore_log_line(
                         id,
-                        hex_dump_prefix(&t.tx_hash, 32),
-                        t.index_in_tx,
-                        t.subaddress_major,
-                        t.subaddress_minor,
-                        hex_dump_prefix(&t.key_image, 32),
-                        hex_dump_prefix(&signer_ki, 32)
-                    ),
-                );
+                        snapshot.network,
+                        &format!(
+                            "🧪 key_image_mismatch: quarantining wallet_id={} out={}:{} subaddr={}:{} tracked_key_image={} signer_key_image={}",
+                            id,
+                            hex_dump_prefix(&t.tx_hash, 32),
+                            t.index_in_tx,
+                            t.subaddress_major,
+                            t.subaddress_minor,
+                            hex_dump_prefix(&t.key_image, 32),
+                            hex_dump_prefix(&signer_ki, 32)
+                        ),
+                    );
+                }
 
                 // Quarantine this outpoint and restart selection so we don't attempt to spend it.
                 {
