@@ -4,8 +4,8 @@
 
 - Swift package / product name: `MoneroWalletCoreFFI`
 - Repository: `https://github.com/cacaosteve/MoneroWalletCoreFFI`
-- **Active consumer branch:** `walletcore/aligned-2026-07-18` (prebuilt Apple + Android artifacts)
-- Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) (pinned rev in `monero-oxide-output/Cargo.toml`)
+- **Active consumer branch:** `main` (prebuilt Apple + Android artifacts)
+- Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) `perf/scanner-hotpath-only` (pinned rev in `monero-oxide-output/Cargo.toml`)
 - Consumers: [nexawal](https://github.com/cacaosteve/nexawal) (SPM), [nexawal-android](https://github.com/cacaosteve/nexawal-android) (git submodule)
 
 Platform outputs:
@@ -46,7 +46,7 @@ You have two ways to consume this package:
 ### iOS/macOS (Xcode)
 
 - File > Add Packages… and paste `https://github.com/cacaosteve/MoneroWalletCoreFFI.git`
-- Prefer branch **`walletcore/aligned-2026-07-18`** (or pin a specific revision on that branch). This is what NexaWal uses.
+- Prefer branch **`main`** (or pin a specific revision). This is what NexaWal uses.
 - Select the `MoneroWalletCoreFFI` library product.
 - That’s it — the xcframework is used automatically by SPM.
 
@@ -63,7 +63,7 @@ Notes:
 dependencies: [
     .package(
         url: "https://github.com/cacaosteve/MoneroWalletCoreFFI.git",
-        branch: "walletcore/aligned-2026-07-18"
+        branch: "main"
     )
 ],
 targets: [
@@ -78,7 +78,7 @@ targets: [
 
 ### Android (NexaWal pattern)
 
-- Add this repo as a git submodule tracking `walletcore/aligned-2026-07-18`.
+- Add this repo as a git submodule tracking `main`.
 - Copy (or Gradle-sync) `Artifacts/android/<abi>/libmonerowalletcore.so` into your module `jniLibs`.
 - Rebuild artifacts after core changes:
 
