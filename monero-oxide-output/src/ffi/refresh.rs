@@ -715,12 +715,7 @@ fn wallet_refresh_impl(
     // IMPORTANT: on Android, stdout/stderr is often not captured, so emit directly to logcat.
     wc_log_line_android_or_stdout(&format!("🧭 wallet_refresh stage=init wallet_id={}", id));
 
-    // Debug/perf logging: force-enable on Android when unset so we get timing breakdowns in logcat.
-    // You can override by explicitly setting WALLETCORE_SCAN_LOG=0 in the environment.
-    #[cfg(target_os = "android")]
-    {
-        wc_android_force_env_default("WALLETCORE_SCAN_LOG", "1");
-    }
+    // Debug/perf logging is opt-in via WALLETCORE_SCAN_LOG=1. Do not force it on Android.
 
     // Build/runtime sanity logs (once per process).
     static BUILD_INFO_LOGGED: std::sync::Once = std::sync::Once::new();

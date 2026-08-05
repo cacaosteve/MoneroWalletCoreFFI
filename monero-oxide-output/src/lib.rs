@@ -1429,6 +1429,13 @@ fn master_keys_from_mnemonic_str(mnemonic: &str) -> Result<MasterKeys, c_int> {
         return Err(-10);
     }
 
+    // English Monero seeds are 13 or 25 words (entropy + checksum). Reject truncations
+    // such as a 24-word drop of the checksum word even if a parser would accept them.
+    let word_count = phrase.split_whitespace().count();
+    if word_count != 13 && word_count != 25 {
+        return Err(-10);
+    }
+
     let seed = MoneroSeed::from_string(
         MoneroSeedLanguage::English,
         Zeroizing::new(phrase.to_string()),
@@ -3077,3 +3084,6 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
 // (moved to src/ffi/sweep.rs)
 
 // (moved to src/ffi/preview_fee.rs)
+
+#[cfg(test)]
+mod vector_tests;
