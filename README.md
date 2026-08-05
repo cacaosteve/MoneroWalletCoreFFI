@@ -7,6 +7,7 @@
 - **Active consumer branch:** `main` (prebuilt Apple + Android artifacts)
 - Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) `perf/scanner-hotpath-only` (pinned rev in `monero-oxide-output/Cargo.toml`)
 - Consumers: [nexawal](https://github.com/cacaosteve/nexawal) (SPM), [nexawal-android](https://github.com/cacaosteve/nexawal-android) (git submodule)
+- License: [MIT](LICENSE)
 
 Platform outputs:
 - Apple (iOS device + simulator + macOS): prebuilt `Artifacts/MoneroWalletCore.xcframework`
@@ -268,3 +269,7 @@ Q: Can I keep using a “lib/release” folder inside the app repo?
 
 Q: Do Apple clients need Rust?
 - No. The xcframework is prebuilt and shipped in this package, so iOS/mac apps just add the package and go.
+
+## License
+
+[MIT](LICENSE). Vendored / downstream crates (including `monero-oxide`) keep their own licenses; retain those notices when redistributing binaries.
