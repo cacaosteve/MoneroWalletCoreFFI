@@ -497,6 +497,8 @@ struct AndroidFetchReq {
 #[cfg(target_os = "android")]
 struct AndroidPendingFetch {
     resp_rx: std::sync::mpsc::Receiver<Result<Vec<ScannableBlock>, RpcError>>,
+    /// When the request was queued on the worker (for RPC wall time vs main-thread wait).
+    started_at: Instant,
 }
 
 #[cfg(target_os = "android")]
@@ -605,7 +607,10 @@ impl AndroidContiguousFetchWorker {
         if self.tx.send(req).is_err() {
             return Err("disconnected");
         }
-        Ok(AndroidPendingFetch { resp_rx })
+        Ok(AndroidPendingFetch {
+            resp_rx,
+            started_at: Instant::now(),
+        })
     }
 
     fn wait_pending(
@@ -823,6 +828,10 @@ fn wallet_refresh_impl(
 
     let mut refresh_scan_ms_total: u128 = 0;
     let mut refresh_persist_ms_total: u128 = 0;
+    // Main-thread time blocked waiting for the current batch's blocks.
+    let mut refresh_fetch_wait_ms_total: u128 = 0;
+    // Worker/RPC wall time for those fetches (includes overlap with prior scan on prefetch hit).
+    let mut refresh_fetch_rpc_ms_total: u128 = 0;
     let mut refresh_blocks_total: usize = 0;
     let mut refresh_outputs_added_total: usize = 0;
     let mut refresh_batches_total: usize = 0;
@@ -1125,7 +1134,7 @@ fn wallet_refresh_impl(
             .clamp(1, 2);
 
         #[cfg(not(target_os = "android"))]
-        let mut next_scannables_q: VecDeque<(u64, u64, Vec<ScannableBlock>)> = VecDeque::new();
+        let mut next_scannables_q: VecDeque<(u64, u64, u128, Vec<ScannableBlock>)> = VecDeque::new();
 
         #[cfg(not(target_os = "android"))]
         let mut prefetch_in_flight: VecDeque<
@@ -1179,24 +1188,28 @@ fn wallet_refresh_impl(
                     id,
                     snapshot.network,
                     &format!(
-                        "📈 wallet_refresh summary wallet_id={} status=cancelled total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} persist_ms_total={}",
+                        "📈 wallet_refresh summary wallet_id={} status=cancelled total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} fetch_wait_ms_total={} fetch_rpc_ms_total={} persist_ms_total={}",
                         id,
                         total_ms,
                         refresh_batches_total,
                         refresh_blocks_total,
                         refresh_outputs_added_total,
                         refresh_scan_ms_total,
+                        refresh_fetch_wait_ms_total,
+                        refresh_fetch_rpc_ms_total,
                         refresh_persist_ms_total
                     ),
                 );
                 wc_log_line_android_or_stdout(&format!(
-                    "📈 wallet_refresh summary wallet_id={} status=cancelled total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} persist_ms_total={}",
+                    "📈 wallet_refresh summary wallet_id={} status=cancelled total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} fetch_wait_ms_total={} fetch_rpc_ms_total={} persist_ms_total={}",
                     id,
                     total_ms,
                     refresh_batches_total,
                     refresh_blocks_total,
                     refresh_outputs_added_total,
                     refresh_scan_ms_total,
+                    refresh_fetch_wait_ms_total,
+                    refresh_fetch_rpc_ms_total,
                     refresh_persist_ms_total
                 ));
                 return record_error(-30, "wallet_refresh: cancelled");
@@ -1246,17 +1259,25 @@ fn wallet_refresh_impl(
                 ));
             }
 
+            let mut batch_fetch_wait_ms: u128 = 0;
+            let mut batch_fetch_rpc_ms: u128 = 0;
+            let mut batch_prefetch: &'static str = "n/a";
+
             let scannables: Vec<ScannableBlock> = {
                 #[cfg(not(target_os = "android"))]
                 {
-                    if let Some((pf_start, pf_end, pf_vec)) = next_scannables_q.pop_front() {
+                    if let Some((pf_start, pf_end, pf_rpc_ms, pf_vec)) = next_scannables_q.pop_front() {
                         if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 {
+                            batch_prefetch = "hit";
+                            batch_fetch_wait_ms = 0;
+                            batch_fetch_rpc_ms = pf_rpc_ms;
                             pf_vec
                         } else {
                             // Prefetch mismatch; fetch synchronously (with hard timeout).
                             let fetch_t0 = Instant::now();
                             let start_bn_local = start_bn;
                             let end_bn_inclusive_local = end_bn_inclusive;
+                            batch_prefetch = "miss";
 
                             let fetch_res = {
                                 // Clone outside the timeout closure so we don't move `rpc_client` into the closure
@@ -1291,6 +1312,8 @@ fn wallet_refresh_impl(
                             match fetch_res {
                                 Ok(Ok(v)) => {
                                     let fetch_ms = fetch_t0.elapsed().as_millis();
+                                    batch_fetch_wait_ms = fetch_ms;
+                                    batch_fetch_rpc_ms = fetch_ms;
                                     if log_batch_events {
                                         walletcore_log_line(
                                             id,
@@ -1372,6 +1395,7 @@ fn wallet_refresh_impl(
                         let fetch_t0 = Instant::now();
                         let start_bn_local = start_bn;
                         let end_bn_inclusive_local = end_bn_inclusive;
+                        batch_prefetch = "sync";
 
                         let fetch_res = {
                             // Clone outside the timeout closure so we don't move `rpc_client` into the closure
@@ -1404,6 +1428,8 @@ fn wallet_refresh_impl(
                         match fetch_res {
                             Ok(Ok(v)) => {
                                 let fetch_ms = fetch_t0.elapsed().as_millis();
+                                batch_fetch_wait_ms = fetch_ms;
+                                batch_fetch_rpc_ms = fetch_ms;
                                 if log_batch_events {
                                     walletcore_log_line(
                                         id,
@@ -1487,14 +1513,17 @@ fn wallet_refresh_impl(
                 {
                     // Prefer one-ahead prefetch when the pending range matches; otherwise drain and
                     // fetch synchronously. Hyper stays on the dedicated worker thread either way.
-                    let fetch_t0 = Instant::now();
+                    let fetch_wait_t0 = Instant::now();
                     let start_bn_local = start_bn;
                     let end_bn_inclusive_local = end_bn_inclusive;
+                    let mut fetch_started_at = fetch_wait_t0;
 
                     let fetch_res = match android_next_prefetch.take() {
                         Some((pf_start, pf_end, pending))
                             if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 =>
                         {
+                            batch_prefetch = "hit";
+                            fetch_started_at = pending.started_at;
                             if log_batch_events {
                                 wc_log_line_android_or_stdout(&format!(
                                     "🧭 wallet_refresh stage=android_prefetch_hit wallet_id={} range={}..={}",
@@ -1507,6 +1536,7 @@ fn wallet_refresh_impl(
                             )
                         }
                         Some((pf_start, pf_end, pending)) => {
+                            batch_prefetch = "miss";
                             if log_batch_events {
                                 wc_log_line_android_or_stdout(&format!(
                                     "🧭 wallet_refresh stage=android_prefetch_miss wallet_id={} wanted={}..={} pending={}..={}",
@@ -1521,45 +1551,57 @@ fn wallet_refresh_impl(
                                 pending,
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                             );
+                            fetch_started_at = Instant::now();
                             android_fetch_worker.fetch_with_timeout(
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                                 start_bn_local,
                                 end_bn_inclusive_local,
                             )
                         }
-                        None => android_fetch_worker.fetch_with_timeout(
-                            CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
-                            start_bn_local,
-                            end_bn_inclusive_local,
-                        ),
+                        None => {
+                            batch_prefetch = "sync";
+                            fetch_started_at = Instant::now();
+                            android_fetch_worker.fetch_with_timeout(
+                                CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                                start_bn_local,
+                                end_bn_inclusive_local,
+                            )
+                        }
                     };
 
                     match fetch_res {
                         Ok(Ok(v)) => {
-                            let fetch_ms = fetch_t0.elapsed().as_millis();
+                            let fetch_wait_ms = fetch_wait_t0.elapsed().as_millis();
+                            let fetch_rpc_ms = fetch_started_at.elapsed().as_millis();
+                            batch_fetch_wait_ms = fetch_wait_ms;
+                            batch_fetch_rpc_ms = fetch_rpc_ms;
                             if log_batch_events {
                                 walletcore_log_line(
                                     id,
                                     snapshot.network,
                                     &format!(
-                                        "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
+                                        "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_wait_ms={} fetch_rpc_ms={} prefetch={} blocks_per_s={:.2}",
                                         id,
                                         v.len(),
-                                        fetch_ms,
-                                        if fetch_ms > 0 {
-                                            (v.len() as f64) / (fetch_ms as f64 / 1000.0)
+                                        fetch_wait_ms,
+                                        fetch_rpc_ms,
+                                        batch_prefetch,
+                                        if fetch_wait_ms > 0 {
+                                            (v.len() as f64) / (fetch_wait_ms as f64 / 1000.0)
                                         } else {
                                             0.0
                                         }
                                     ),
                                 );
                                 wc_log_line_android_or_stdout(&format!(
-                                    "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_ms={} blocks_per_s={:.2}",
+                                    "🧭 wallet_refresh stage=contiguous_scannable_blocks_ok wallet_id={} blocks={} fetch_wait_ms={} fetch_rpc_ms={} prefetch={} blocks_per_s={:.2}",
                                     id,
                                     v.len(),
-                                    fetch_ms,
-                                    if fetch_ms > 0 {
-                                        (v.len() as f64) / (fetch_ms as f64 / 1000.0)
+                                    fetch_wait_ms,
+                                    fetch_rpc_ms,
+                                    batch_prefetch,
+                                    if fetch_wait_ms > 0 {
+                                        (v.len() as f64) / (fetch_wait_ms as f64 / 1000.0)
                                     } else {
                                         0.0
                                     }
@@ -1568,7 +1610,7 @@ fn wallet_refresh_impl(
                             v
                         }
                         Ok(Err(err)) => {
-                            let fetch_ms = fetch_t0.elapsed().as_millis();
+                            let fetch_ms = fetch_wait_t0.elapsed().as_millis();
                             walletcore_log_line(
                                 id,
                                 snapshot.network,
@@ -1590,7 +1632,7 @@ fn wallet_refresh_impl(
                             );
                         }
                         Err(msg) => {
-                            let fetch_ms = fetch_t0.elapsed().as_millis();
+                            let fetch_ms = fetch_wait_t0.elapsed().as_millis();
                             let msg = format!(
                                 "wallet_refresh: contiguous_scannable_blocks timeout/disconnect ({}) after {}s for heights {}..{}",
                                 msg,
@@ -2172,10 +2214,38 @@ fn wallet_refresh_impl(
 
             let scan_ms = scan_t0.elapsed().as_millis();
             refresh_scan_ms_total = refresh_scan_ms_total.saturating_add(scan_ms);
+            refresh_fetch_wait_ms_total =
+                refresh_fetch_wait_ms_total.saturating_add(batch_fetch_wait_ms);
+            refresh_fetch_rpc_ms_total =
+                refresh_fetch_rpc_ms_total.saturating_add(batch_fetch_rpc_ms);
             refresh_blocks_total = refresh_blocks_total.saturating_add(blocks_in_batch);
             refresh_outputs_added_total =
                 refresh_outputs_added_total.saturating_add(outputs_added_in_batch);
             refresh_batches_total = refresh_batches_total.saturating_add(1);
+
+            let overlapped_ms = batch_fetch_rpc_ms.saturating_sub(batch_fetch_wait_ms);
+            let likely_bound = if batch_fetch_wait_ms >= scan_ms {
+                "fetch"
+            } else if scan_ms > batch_fetch_wait_ms.saturating_mul(2) {
+                "scan"
+            } else {
+                "balanced"
+            };
+            let timing_line = format!(
+                "⏱️ wallet_refresh stage=batch_timing wallet_id={} range={}..={} blocks={} prefetch={} fetch_wait_ms={} fetch_rpc_ms={} overlapped_ms={} scan_ms={} likely_bound={}",
+                id,
+                start_bn,
+                actual_end_bn_inclusive,
+                blocks_in_batch,
+                batch_prefetch,
+                batch_fetch_wait_ms,
+                batch_fetch_rpc_ms,
+                overlapped_ms,
+                scan_ms,
+                likely_bound
+            );
+            walletcore_log_line(id, snapshot.network, &timing_line);
+            wc_log_line_android_or_stdout(&timing_line);
 
             if log_batch_events {
                 walletcore_log_line(
@@ -2275,9 +2345,9 @@ fn wallet_refresh_impl(
 
                 let join_wait_t0 = Instant::now();
                 match TOKIO_RUNTIME.block_on(handle) {
-                    Ok((pf_start, pf_end, _pf_ms, Ok(v))) => {
+                    Ok((pf_start, pf_end, pf_ms, Ok(v))) => {
                         let _ = join_wait_t0.elapsed().as_millis();
-                        next_scannables_q.push_back((pf_start, pf_end, v));
+                        next_scannables_q.push_back((pf_start, pf_end, pf_ms, v));
                     }
                     Ok((_pf_start, _pf_end, _pf_ms, Err(err))) => {
                         let _ = join_wait_t0.elapsed().as_millis();
@@ -2370,33 +2440,48 @@ fn wallet_refresh_impl(
 
         let other_ms = total_ms_u128
             .saturating_sub(refresh_scan_ms_total)
-            .saturating_sub(refresh_persist_ms_total);
+            .saturating_sub(refresh_persist_ms_total)
+            .saturating_sub(refresh_fetch_wait_ms_total);
+
+        let likely_bound = if refresh_fetch_wait_ms_total >= refresh_scan_ms_total {
+            "fetch"
+        } else if refresh_scan_ms_total > refresh_fetch_wait_ms_total.saturating_mul(2) {
+            "scan"
+        } else {
+            "balanced"
+        };
 
         walletcore_log_line(
             id,
             snapshot.network,
             &format!(
-                "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} persist_ms_total={} other_ms={}",
+                "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} fetch_wait_ms_total={} fetch_rpc_ms_total={} persist_ms_total={} other_ms={} likely_bound={}",
                 id,
                 total_ms,
                 refresh_batches_total,
                 refresh_blocks_total,
                 refresh_outputs_added_total,
                 refresh_scan_ms_total,
+                refresh_fetch_wait_ms_total,
+                refresh_fetch_rpc_ms_total,
                 refresh_persist_ms_total,
-                other_ms
+                other_ms,
+                likely_bound
             ),
         );
         wc_log_line_android_or_stdout(&format!(
-            "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} persist_ms_total={} other_ms={}",
+            "📈 wallet_refresh summary wallet_id={} status=ok total_ms={} batches={} blocks={} outputs_added={} scan_ms_total={} fetch_wait_ms_total={} fetch_rpc_ms_total={} persist_ms_total={} other_ms={} likely_bound={}",
             id,
             total_ms,
             refresh_batches_total,
             refresh_blocks_total,
             refresh_outputs_added_total,
             refresh_scan_ms_total,
+            refresh_fetch_wait_ms_total,
+            refresh_fetch_rpc_ms_total,
             refresh_persist_ms_total,
-            other_ms
+            other_ms,
+            likely_bound
         ));
 
         #[cfg(feature = "scanner-microprof")]
