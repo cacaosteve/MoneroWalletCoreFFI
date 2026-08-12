@@ -477,14 +477,10 @@ fn fetch_scannable_blocks_range_bin(
 // - Tokio timeouts are not available here (no timer driver/reactor), so we implement bounded waiting
 //   via std::sync::mpsc + recv_timeout.
 // - The worker executes requests sequentially on a single long-lived OS thread.
-// Android Hyper note:
 // - IMPORTANT: build and own the RPC client *inside* the worker thread. Sharing a transport/client
 //   across OS threads can lead to Hyper ChannelClosed on Android.
 // - Also: Hyper can still surface ChannelClosed sporadically; on Android we rebuild the client and
 //   retry once when we detect ChannelClosed.
-// - For throughput: a pool of 2 workers fetches the two halves of a requested range concurrently.
-//   Speculative multi-batch prefetch at +batch is unsafe with get_blocks.bin because responses are
-//   often partial (ask 500, get ~250), so the next start height is only known after the prior RPC.
 #[cfg(target_os = "android")]
 struct AndroidContiguousFetchWorker {
     tx: std::sync::mpsc::Sender<AndroidFetchReq>,
@@ -499,39 +495,10 @@ struct AndroidFetchReq {
 }
 
 #[cfg(target_os = "android")]
-struct AndroidPendingFetchSingle {
+struct AndroidPendingFetch {
     resp_rx: std::sync::mpsc::Receiver<Result<Vec<ScannableBlock>, RpcError>>,
+    /// When the request was queued on the worker (for RPC wall time vs main-thread wait).
     started_at: Instant,
-}
-
-#[cfg(target_os = "android")]
-enum AndroidPendingFetch {
-    /// One worker fetching the full requested range.
-    Single(AndroidPendingFetchSingle),
-    /// Two workers fetching [start, mid) and [mid, end] in parallel.
-    Split {
-        first: AndroidPendingFetchSingle,
-        second: AndroidPendingFetchSingle,
-        start_bn: usize,
-        mid_bn: usize,
-        end_bn_inclusive: usize,
-        started_at: Instant,
-    },
-}
-
-#[cfg(target_os = "android")]
-impl AndroidPendingFetch {
-    fn started_at(&self) -> Instant {
-        match self {
-            Self::Single(s) => s.started_at,
-            Self::Split { started_at, .. } => *started_at,
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-struct AndroidFetchPool {
-    workers: Vec<AndroidContiguousFetchWorker>,
 }
 
 #[cfg(target_os = "android")]
@@ -557,11 +524,11 @@ impl AndroidContiguousFetchWorker {
                 s.contains("ChannelClosed")
             }
 
-            // Build the transport/client on this worker thread so hyper state is not shared across
-            // threads.
-            let mut client = match build_client(&base_url) {
-                Ok(c) => c,
-                Err(e) => {
+                // Build the transport/client on this worker thread so hyper state is not shared across
+                // threads.
+                let mut client = match build_client(&base_url) {
+                    Ok(c) => c,
+                    Err(e) => {
                     while let Ok(req) = rx.recv() {
                         let _ = req.resp_tx.send(Err(e.clone()));
                     }
@@ -575,20 +542,21 @@ impl AndroidContiguousFetchWorker {
                 let resp_tx = req.resp_tx;
 
                 // First attempt with current client
-                let mut res: Result<Vec<ScannableBlock>, RpcError> = match bulk_fetch_mode {
-                    BulkFetchMode::RangeBlocks => fetch_scannable_blocks_range_bin(
-                        &client,
-                        &base_url,
-                        start_bn,
-                        end_bn_inclusive,
-                    ),
-                    _ => TOKIO_RUNTIME.block_on(async {
-                        client
-                            .contiguous_scannable_blocks(start_bn..=end_bn_inclusive)
-                            .await
-                            .map_err(Into::into)
-                    }),
-                };
+                let mut res: Result<Vec<ScannableBlock>, RpcError> =
+                    match bulk_fetch_mode {
+                        BulkFetchMode::RangeBlocks => fetch_scannable_blocks_range_bin(
+                            &client,
+                            &base_url,
+                            start_bn,
+                            end_bn_inclusive,
+                        ),
+                        _ => TOKIO_RUNTIME.block_on(async {
+                            client
+                                .contiguous_scannable_blocks(start_bn..=end_bn_inclusive)
+                                .await
+                                .map_err(Into::into)
+                        }),
+                    };
 
                 // If Hyper channel got closed, rebuild client and retry once.
                 if res.as_ref().is_err_and(is_channel_closed) {
@@ -622,11 +590,12 @@ impl AndroidContiguousFetchWorker {
         }
     }
 
+    /// Queue a contiguous fetch on the worker without waiting (one-ahead prefetch).
     fn begin_fetch(
         &self,
         start_bn: usize,
         end_bn_inclusive: usize,
-    ) -> Result<AndroidPendingFetchSingle, &'static str> {
+    ) -> Result<AndroidPendingFetch, &'static str> {
         use std::sync::mpsc;
 
         let (resp_tx, resp_rx) = mpsc::channel::<Result<Vec<ScannableBlock>, RpcError>>();
@@ -638,66 +607,10 @@ impl AndroidContiguousFetchWorker {
         if self.tx.send(req).is_err() {
             return Err("disconnected");
         }
-        Ok(AndroidPendingFetchSingle {
+        Ok(AndroidPendingFetch {
             resp_rx,
             started_at: Instant::now(),
         })
-    }
-
-    fn shutdown(mut self) {
-        // Dropping tx closes the channel; worker exits its recv() loop.
-        drop(self.tx);
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-impl AndroidFetchPool {
-    fn start(worker_count: usize, base_url: String, bulk_fetch_mode: BulkFetchMode) -> Self {
-        let n = worker_count.max(1);
-        let workers = (0..n)
-            .map(|_| AndroidContiguousFetchWorker::start(base_url.clone(), bulk_fetch_mode))
-            .collect();
-        Self { workers }
-    }
-
-    /// Queue a range fetch. With 2+ workers and a large enough range, split into two concurrent
-    /// half-range RPCs (safe fixed height windows — not speculative +batch prefetch).
-    fn begin_fetch(
-        &self,
-        start_bn: usize,
-        end_bn_inclusive: usize,
-    ) -> Result<AndroidPendingFetch, &'static str> {
-        let count = end_bn_inclusive.saturating_sub(start_bn).saturating_add(1);
-        if self.workers.len() >= 2 && count >= 64 {
-            let first_count = count / 2;
-            let mid_bn = start_bn.saturating_add(first_count);
-            if mid_bn > start_bn && mid_bn <= end_bn_inclusive {
-                let first = self.workers[0].begin_fetch(start_bn, mid_bn.saturating_sub(1))?;
-                let second = self.workers[1].begin_fetch(mid_bn, end_bn_inclusive)?;
-                wc_log_line_android_or_stdout(&format!(
-                    "🧭 android_fetch_split start={} mid={} end={} first_count={} second_count={}",
-                    start_bn,
-                    mid_bn,
-                    end_bn_inclusive,
-                    first_count,
-                    end_bn_inclusive.saturating_sub(mid_bn).saturating_add(1)
-                ));
-                return Ok(AndroidPendingFetch::Split {
-                    first,
-                    second,
-                    start_bn,
-                    mid_bn,
-                    end_bn_inclusive,
-                    started_at: Instant::now(),
-                });
-            }
-        }
-
-        let single = self.workers[0].begin_fetch(start_bn, end_bn_inclusive)?;
-        Ok(AndroidPendingFetch::Single(single))
     }
 
     fn wait_pending(
@@ -707,80 +620,10 @@ impl AndroidFetchPool {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let timeout = Duration::from_secs(timeout_secs);
-
-        fn recv_one(
-            pending: AndroidPendingFetchSingle,
-            timeout: Duration,
-        ) -> Result<Result<Vec<ScannableBlock>, RpcError>, &'static str> {
-            match pending.resp_rx.recv_timeout(timeout) {
-                Ok(v) => Ok(v),
-                Err(mpsc::RecvTimeoutError::Timeout) => Err("timeout"),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err("disconnected"),
-            }
-        }
-
-        match pending {
-            AndroidPendingFetch::Single(single) => recv_one(single, timeout),
-            AndroidPendingFetch::Split {
-                first,
-                second,
-                start_bn,
-                mid_bn,
-                end_bn_inclusive,
-                ..
-            } => {
-                // Both halves are already in flight; wait for each.
-                let first_res = recv_one(first, timeout)?;
-                let second_res = recv_one(second, timeout)?;
-
-                let first_blocks = match first_res {
-                    Ok(v) => v,
-                    Err(e) => return Ok(Err(e)),
-                };
-                let second_blocks = match second_res {
-                    Ok(v) => v,
-                    Err(e) => return Ok(Err(e)),
-                };
-
-                let expected_first = mid_bn.saturating_sub(start_bn);
-                if first_blocks.len() < expected_first {
-                    // First half hit the daemon payload cap. Second half started at mid and would
-                    // leave a gap — drop it and return the contiguous prefix (same as a partial
-                    // single-range response).
-                    wc_log_line_android_or_stdout(&format!(
-                        "🧭 android_fetch_split_partial_first start={} mid={} end={} got_first={} expected_first={} dropping_second={}",
-                        start_bn,
-                        mid_bn,
-                        end_bn_inclusive,
-                        first_blocks.len(),
-                        expected_first,
-                        second_blocks.len()
-                    ));
-                    return Ok(Ok(first_blocks));
-                }
-                if first_blocks.len() > expected_first {
-                    return Ok(Err(RpcError::InvalidInterface(format!(
-                        "android split fetch first half returned {} blocks, expected {}",
-                        first_blocks.len(),
-                        expected_first
-                    ))));
-                }
-
-                wc_log_line_android_or_stdout(&format!(
-                    "🧭 android_fetch_split_ok start={} mid={} end={} first={} second={} total={}",
-                    start_bn,
-                    mid_bn,
-                    end_bn_inclusive,
-                    first_blocks.len(),
-                    second_blocks.len(),
-                    first_blocks.len().saturating_add(second_blocks.len())
-                ));
-
-                let mut merged = first_blocks;
-                merged.extend(second_blocks);
-                Ok(Ok(merged))
-            }
+        match pending.resp_rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(v) => Ok(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("timeout"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("disconnected"),
         }
     }
 
@@ -794,9 +637,11 @@ impl AndroidFetchPool {
         Self::wait_pending(pending, timeout_secs)
     }
 
-    fn shutdown(self) {
-        for w in self.workers {
-            w.shutdown();
+    fn shutdown(mut self) {
+        // Dropping tx closes the channel; worker exits its recv() loop.
+        drop(self.tx);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
         }
     }
 }
@@ -1299,34 +1144,35 @@ fn wallet_refresh_impl(
         #[cfg(not(target_os = "android"))]
         let prefetch_rpc_client = std::sync::Arc::new(prefetch_rpc_client);
 
-        // Android-only: dual dedicated fetch workers so each range can be split into two
-        // concurrent get_blocks.bin halves (Hyper client owned per worker thread).
+        // Android-only: single dedicated fetch worker for contiguous_scannable_blocks.
+        // Build and own the RPC client inside the worker thread to avoid Hyper ChannelClosed.
         #[cfg(target_os = "android")]
-        let android_fetch_pool = AndroidFetchPool::start(2, base_url.clone(), bulk_fetch_mode);
+        let android_fetch_worker =
+            AndroidContiguousFetchWorker::start(base_url.clone(), bulk_fetch_mode);
 
-        // Ensure the Android worker threads are always shut down, even on early returns.
-        // Keep the pool inside an Option so Drop can move it out and join the threads.
+        // Ensure the Android worker thread is always shut down, even on early returns.
+        // Keep the worker inside an Option so Drop can move it out and join the thread.
         #[cfg(target_os = "android")]
-        struct AndroidFetchPoolGuard(Option<AndroidFetchPool>);
+        struct AndroidFetchWorkerGuard(Option<AndroidContiguousFetchWorker>);
         #[cfg(target_os = "android")]
-        impl Drop for AndroidFetchPoolGuard {
+        impl Drop for AndroidFetchWorkerGuard {
             fn drop(&mut self) {
-                if let Some(p) = self.0.take() {
-                    p.shutdown();
+                if let Some(w) = self.0.take() {
+                    w.shutdown();
                 }
             }
         }
 
         #[cfg(target_os = "android")]
-        let mut _android_fetch_pool_guard = AndroidFetchPoolGuard(Some(android_fetch_pool));
+        let mut _android_fetch_worker_guard = AndroidFetchWorkerGuard(Some(android_fetch_worker));
         #[cfg(target_os = "android")]
-        let android_fetch_pool = _android_fetch_pool_guard.0.as_ref().unwrap();
+        let android_fetch_worker = _android_fetch_worker_guard.0.as_ref().unwrap();
 
-        // One-ahead prefetch of the *next* logical range (that fetch itself may be split C=2).
+        // One-ahead prefetch: (start_bn_u64, end_bn_inclusive_u64, pending response).
         #[cfg(target_os = "android")]
         let mut android_next_prefetch: Option<(u64, u64, AndroidPendingFetch)> = None;
 
-        // Prefetch depth>1 across batches is reserved; within-batch split provides concurrency.
+        // Silence unused on Android (prefetch_depth reserved for future depth>1).
         #[cfg(target_os = "android")]
         let _ = prefetch_depth;
 
@@ -1666,7 +1512,7 @@ fn wallet_refresh_impl(
                 #[cfg(target_os = "android")]
                 {
                     // Prefer one-ahead prefetch when the pending range matches; otherwise drain and
-                    // fetch synchronously. Each fetch may itself be a C=2 split across the pool.
+                    // fetch synchronously. Hyper stays on the dedicated worker thread either way.
                     let fetch_wait_t0 = Instant::now();
                     let start_bn_local = start_bn;
                     let end_bn_inclusive_local = end_bn_inclusive;
@@ -1677,14 +1523,14 @@ fn wallet_refresh_impl(
                             if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 =>
                         {
                             batch_prefetch = "hit";
-                            fetch_started_at = pending.started_at();
+                            fetch_started_at = pending.started_at;
                             if log_batch_events {
                                 wc_log_line_android_or_stdout(&format!(
                                     "🧭 wallet_refresh stage=android_prefetch_hit wallet_id={} range={}..={}",
                                     id, start_bn_local, end_bn_inclusive_local
                                 ));
                             }
-                            AndroidFetchPool::wait_pending(
+                            AndroidContiguousFetchWorker::wait_pending(
                                 pending,
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                             )
@@ -1701,12 +1547,12 @@ fn wallet_refresh_impl(
                                     pf_end
                                 ));
                             }
-                            let _ = AndroidFetchPool::wait_pending(
+                            let _ = AndroidContiguousFetchWorker::wait_pending(
                                 pending,
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                             );
                             fetch_started_at = Instant::now();
-                            android_fetch_pool.fetch_with_timeout(
+                            android_fetch_worker.fetch_with_timeout(
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                                 start_bn_local,
                                 end_bn_inclusive_local,
@@ -1715,7 +1561,7 @@ fn wallet_refresh_impl(
                         None => {
                             batch_prefetch = "sync";
                             fetch_started_at = Instant::now();
-                            android_fetch_pool.fetch_with_timeout(
+                            android_fetch_worker.fetch_with_timeout(
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                                 start_bn_local,
                                 end_bn_inclusive_local,
@@ -1892,12 +1738,11 @@ fn wallet_refresh_impl(
                 }
             }
 
-            // Android one-ahead: start next fetch on the pool before scanning this batch.
-            // The next fetch may itself be split across both workers (C=2).
+            // Android one-ahead: start next fetch on the worker before scanning this batch.
             #[cfg(target_os = "android")]
             {
                 if let Some((_, _, pending)) = android_next_prefetch.take() {
-                    let _ = AndroidFetchPool::wait_pending(
+                    let _ = AndroidContiguousFetchWorker::wait_pending(
                         pending,
                         CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                     );
@@ -1913,7 +1758,7 @@ fn wallet_refresh_impl(
                         usize::try_from(next_start),
                         usize::try_from(next_end_inclusive),
                     ) {
-                        match android_fetch_pool.begin_fetch(next_start_bn, next_end_bn) {
+                        match android_fetch_worker.begin_fetch(next_start_bn, next_end_bn) {
                             Ok(pending) => {
                                 if log_batch_events {
                                     wc_log_line_android_or_stdout(&format!(
