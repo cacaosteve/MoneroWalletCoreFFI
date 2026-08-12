@@ -167,14 +167,34 @@ build_one() {
   # Tell cargo which linker to use for this target. This is the most reliable approach for NDK builds.
   export "CARGO_TARGET_$(echo "${rust_target}" | tr '[:lower:]-' '[:upper:]_')_LINKER"="${cc}"
 
+  # Android 15+ 16 KB page-size compatibility (ELF PT_LOAD align >= 16384).
+  # https://developer.android.com/guide/practices/page-sizes
+  # Keep any caller-provided RUSTFLAGS; always append the page-size link args.
+  local page_flags="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+  if [[ -n "${RUSTFLAGS:-}" ]]; then
+    export RUSTFLAGS="${RUSTFLAGS} ${page_flags}"
+  else
+    export RUSTFLAGS="${page_flags}"
+  fi
+
   # Some crates/build scripts respect CC/CXX as well.
   export CC="${cc}"
   export CXX="${cxx}"
 
+  # Keep artifacts in-tree (avoid sandbox/redirected target dirs copying stale .so files).
+  export CARGO_TARGET_DIR="${CRATE_DIR}/target"
+
   (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${rust_target}")
 
-  local built_so="${CRATE_DIR}/target/${rust_target}/${PROFILE}/libmonerowalletcore.so"
+  local built_so="${CARGO_TARGET_DIR}/${rust_target}/${PROFILE}/libmonerowalletcore.so"
   [[ -f "${built_so}" ]] || die "expected .so not found: ${built_so}"
+
+  # Verify 16 KB ELF LOAD alignment before packaging.
+  if [[ -x "${LLVM_PREBUILT}/bin/llvm-readelf" ]]; then
+    if ! "${LLVM_PREBUILT}/bin/llvm-readelf" -l "${built_so}" | awk '/LOAD/ {print $NF}' | grep -q '0x4000'; then
+      die "libmonerowalletcore.so for ${abi} is not 16KB-aligned (expected PT_LOAD Align 0x4000). RUSTFLAGS='${RUSTFLAGS}'"
+    fi
+  fi
 
   local out_abi_dir="${OUT_DIR}/${abi}"
   mkdir -p "${out_abi_dir}"
@@ -185,7 +205,14 @@ build_one() {
     "${STRIP}" --strip-unneeded "${out_abi_dir}/libmonerowalletcore.so" 2>/dev/null || true
   fi
 
-  echo "• Wrote: ${out_abi_dir}/libmonerowalletcore.so"
+  # Re-check after strip (should still be 0x4000).
+  if [[ -x "${LLVM_PREBUILT}/bin/llvm-readelf" ]]; then
+    if ! "${LLVM_PREBUILT}/bin/llvm-readelf" -l "${out_abi_dir}/libmonerowalletcore.so" | awk '/LOAD/ {print $NF}' | grep -q '0x4000'; then
+      die "stripped libmonerowalletcore.so for ${abi} lost 16KB alignment"
+    fi
+  fi
+
+  echo "• Wrote: ${out_abi_dir}/libmonerowalletcore.so (16KB-aligned)"
 
   # Optional install into nexawal-android's jniLibs
   if [[ "${INSTALL_TO_NEXAWAL_ANDROID}" == "1" ]]; then
