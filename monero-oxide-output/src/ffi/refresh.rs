@@ -495,6 +495,11 @@ struct AndroidFetchReq {
 }
 
 #[cfg(target_os = "android")]
+struct AndroidPendingFetch {
+    resp_rx: std::sync::mpsc::Receiver<Result<Vec<ScannableBlock>, RpcError>>,
+}
+
+#[cfg(target_os = "android")]
 impl AndroidContiguousFetchWorker {
     fn start(base_url: String, bulk_fetch_mode: BulkFetchMode) -> Self {
         use std::sync::mpsc;
@@ -583,32 +588,48 @@ impl AndroidContiguousFetchWorker {
         }
     }
 
+    /// Queue a contiguous fetch on the worker without waiting (one-ahead prefetch).
+    fn begin_fetch(
+        &self,
+        start_bn: usize,
+        end_bn_inclusive: usize,
+    ) -> Result<AndroidPendingFetch, &'static str> {
+        use std::sync::mpsc;
+
+        let (resp_tx, resp_rx) = mpsc::channel::<Result<Vec<ScannableBlock>, RpcError>>();
+        let req = AndroidFetchReq {
+            start_bn,
+            end_bn_inclusive,
+            resp_tx,
+        };
+        if self.tx.send(req).is_err() {
+            return Err("disconnected");
+        }
+        Ok(AndroidPendingFetch { resp_rx })
+    }
+
+    fn wait_pending(
+        pending: AndroidPendingFetch,
+        timeout_secs: u64,
+    ) -> Result<Result<Vec<ScannableBlock>, RpcError>, &'static str> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        match pending.resp_rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(v) => Ok(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("timeout"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("disconnected"),
+        }
+    }
+
     fn fetch_with_timeout(
         &self,
         timeout_secs: u64,
         start_bn: usize,
         end_bn_inclusive: usize,
     ) -> Result<Result<Vec<ScannableBlock>, RpcError>, &'static str> {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (resp_tx, resp_rx) = mpsc::channel::<Result<Vec<ScannableBlock>, RpcError>>();
-
-        let req = AndroidFetchReq {
-            start_bn,
-            end_bn_inclusive,
-            resp_tx,
-        };
-
-        if self.tx.send(req).is_err() {
-            return Err("disconnected");
-        }
-
-        match resp_rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-            Ok(v) => Ok(v),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err("timeout"),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err("disconnected"),
-        }
+        let pending = self.begin_fetch(start_bn, end_bn_inclusive)?;
+        Self::wait_pending(pending, timeout_secs)
     }
 
     fn shutdown(mut self) {
@@ -1094,10 +1115,9 @@ fn wallet_refresh_impl(
     ));
 
     if scan_cursor < daemon.height {
-        // Sequential scan: upstream daemon RPC + pipelined fetch (non-Android).
-        //
-        // Android: disable the prefetch pipeline entirely. We always fetch sequentially via the
-        // dedicated contiguous-block fetch worker with a hard timeout.
+        // Android: keep Hyper on one dedicated worker thread (avoids ChannelClosed from
+        // sharing transports across OS threads). Still overlap the *next* batch fetch with
+        // the current batch scan via one-ahead prefetch on that same worker.
         let prefetch_depth: usize = std::env::var("WALLETCORE_PREFETCH_DEPTH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -1138,6 +1158,14 @@ fn wallet_refresh_impl(
         let mut _android_fetch_worker_guard = AndroidFetchWorkerGuard(Some(android_fetch_worker));
         #[cfg(target_os = "android")]
         let android_fetch_worker = _android_fetch_worker_guard.0.as_ref().unwrap();
+
+        // One-ahead prefetch: (start_bn_u64, end_bn_inclusive_u64, pending response).
+        #[cfg(target_os = "android")]
+        let mut android_next_prefetch: Option<(u64, u64, AndroidPendingFetch)> = None;
+
+        // Silence unused on Android (prefetch_depth reserved for future depth>1).
+        #[cfg(target_os = "android")]
+        let _ = prefetch_depth;
 
         while scan_cursor < daemon.height {
             if refresh_cancelled_for_wallet(id) {
@@ -1457,17 +1485,54 @@ fn wallet_refresh_impl(
 
                 #[cfg(target_os = "android")]
                 {
-                    // Android: prefetch pipeline disabled; always fetch sequentially via the
-                    // dedicated worker (hard timeout).
+                    // Prefer one-ahead prefetch when the pending range matches; otherwise drain and
+                    // fetch synchronously. Hyper stays on the dedicated worker thread either way.
                     let fetch_t0 = Instant::now();
                     let start_bn_local = start_bn;
                     let end_bn_inclusive_local = end_bn_inclusive;
 
-                    let fetch_res = android_fetch_worker.fetch_with_timeout(
-                        CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
-                        start_bn_local,
-                        end_bn_inclusive_local,
-                    );
+                    let fetch_res = match android_next_prefetch.take() {
+                        Some((pf_start, pf_end, pending))
+                            if pf_start == start_bn_u64 && pf_end == end_bn_inclusive_u64 =>
+                        {
+                            if log_batch_events {
+                                wc_log_line_android_or_stdout(&format!(
+                                    "🧭 wallet_refresh stage=android_prefetch_hit wallet_id={} range={}..={}",
+                                    id, start_bn_local, end_bn_inclusive_local
+                                ));
+                            }
+                            AndroidContiguousFetchWorker::wait_pending(
+                                pending,
+                                CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                            )
+                        }
+                        Some((pf_start, pf_end, pending)) => {
+                            if log_batch_events {
+                                wc_log_line_android_or_stdout(&format!(
+                                    "🧭 wallet_refresh stage=android_prefetch_miss wallet_id={} wanted={}..={} pending={}..={}",
+                                    id,
+                                    start_bn_u64,
+                                    end_bn_inclusive_u64,
+                                    pf_start,
+                                    pf_end
+                                ));
+                            }
+                            let _ = AndroidContiguousFetchWorker::wait_pending(
+                                pending,
+                                CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                            );
+                            android_fetch_worker.fetch_with_timeout(
+                                CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                                start_bn_local,
+                                end_bn_inclusive_local,
+                            )
+                        }
+                        None => android_fetch_worker.fetch_with_timeout(
+                            CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                            start_bn_local,
+                            end_bn_inclusive_local,
+                        ),
+                    };
 
                     match fetch_res {
                         Ok(Ok(v)) => {
@@ -1628,6 +1693,48 @@ fn wallet_refresh_impl(
                     prefetch_in_flight.push_back(handle);
 
                     cursor_for_prefetch = next_end_exclusive;
+                }
+            }
+
+            // Android one-ahead: start next fetch on the worker before scanning this batch.
+            #[cfg(target_os = "android")]
+            {
+                if let Some((_, _, pending)) = android_next_prefetch.take() {
+                    let _ = AndroidContiguousFetchWorker::wait_pending(
+                        pending,
+                        CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
+                    );
+                }
+                let next_start = (actual_end_bn_inclusive as u64).saturating_add(1);
+                let next_end_exclusive = core::cmp::min(
+                    daemon.height,
+                    next_start.saturating_add(upstream_block_batch),
+                );
+                if next_end_exclusive > next_start {
+                    let next_end_inclusive = next_end_exclusive.saturating_sub(1);
+                    if let (Ok(next_start_bn), Ok(next_end_bn)) = (
+                        usize::try_from(next_start),
+                        usize::try_from(next_end_inclusive),
+                    ) {
+                        match android_fetch_worker.begin_fetch(next_start_bn, next_end_bn) {
+                            Ok(pending) => {
+                                if log_batch_events {
+                                    wc_log_line_android_or_stdout(&format!(
+                                        "🧭 wallet_refresh stage=android_prefetch_start wallet_id={} range={}..={}",
+                                        id, next_start_bn, next_end_bn
+                                    ));
+                                }
+                                android_next_prefetch =
+                                    Some((next_start, next_end_inclusive, pending));
+                            }
+                            Err(msg) => {
+                                wc_log_line_android_or_stdout(&format!(
+                                    "🧭 wallet_refresh stage=android_prefetch_begin_failed wallet_id={} err={}",
+                                    id, msg
+                                ));
+                            }
+                        }
+                    }
                 }
             }
 
