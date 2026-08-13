@@ -25,6 +25,9 @@ OUT_DIR="${REPO_ROOT}/Artifacts"
 FRAMEWORK_NAME="MoneroWalletCore"
 XCFRAMEWORK_PATH="${OUT_DIR}/${FRAMEWORK_NAME}.xcframework"
 
+# Keep artifacts in-tree (sandbox CARGO_TARGET_DIR otherwise packages stale libs).
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${CRATE_DIR}/target}"
+
 # Build profile: release (default) or debug
 PROFILE="${PROFILE:-release}" # set PROFILE=debug to build debug libs
 
@@ -64,6 +67,13 @@ APPLE_TARGETS=(
   "aarch64-apple-darwin"     # macOS (arm64)
   "x86_64-apple-darwin"      # macOS (x86_64)
 )
+# Mac Catalyst (ios-macabi). Required for Xcode "My Mac (Mac Catalyst)".
+if [[ "${INCLUDE_MACCATALYST:-1}" == "1" ]]; then
+  APPLE_TARGETS+=(
+    "aarch64-apple-ios-macabi"
+    "x86_64-apple-ios-macabi"
+  )
+fi
 # Optionally include Intel simulator (x86_64) slice
 if [[ "${INCLUDE_INTEL_SIM:-0}" == "1" ]]; then
   APPLE_TARGETS+=( "x86_64-apple-ios" )  # iOS simulator (x86_64)
@@ -100,7 +110,17 @@ build_target() {
   local triple="$1"
   echo "• Building monerowalletcore for ${triple} (${PROFILE})"
   # Cargo requires the manifest to be named `Cargo.toml`, so we do not pass --manifest-path here.
-  (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+  local extra_env=()
+  case "${triple}" in
+    *-apple-ios-macabi)
+      # Catalyst links against the macOS SDK with an ios-macabi target triple.
+      extra_env+=(
+        "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)"
+        "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+      )
+      ;;
+  esac
+  (cd "${CRATE_DIR}" && env "${extra_env[@]}" "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
 }
 
 lib_path_for() {
@@ -191,6 +211,8 @@ LIB_IOS_SIM_ARM64="$(lib_path_for aarch64-apple-ios-sim)"
 LIB_IOS_SIM_X86_64="$(lib_path_for x86_64-apple-ios)"
 LIB_MAC_ARM64="$(lib_path_for aarch64-apple-darwin)"
 LIB_MAC_X86_64="$(lib_path_for x86_64-apple-darwin)"
+LIB_CATALYST_ARM64="$(lib_path_for aarch64-apple-ios-macabi)"
+LIB_CATALYST_X86_64="$(lib_path_for x86_64-apple-ios-macabi)"
 
 # Prepare a temporary headers folder
 TMPDIR="$(mktemp -d /tmp/monerowalletcore.xc.XXXXXX)"
@@ -230,6 +252,18 @@ elif [[ -f "${LIB_MAC_ARM64}" ]]; then
   UNIVERSAL_LIBS+=( "${LIB_MAC_ARM64}" )
 elif [[ -f "${LIB_MAC_X86_64}" ]]; then
   UNIVERSAL_LIBS+=( "${LIB_MAC_X86_64}" )
+fi
+
+# Mac Catalyst: lipo arm64 + x86_64 macabi into one slice
+CATALYST_UNIV="${TMPDIR}/libmonerowalletcore_maccatalyst_universal.a"
+if [[ -f "${LIB_CATALYST_ARM64}" && -f "${LIB_CATALYST_X86_64}" ]]; then
+  echo "• Creating Mac Catalyst universal lib via lipo"
+  lipo -create -output "${CATALYST_UNIV}" "${LIB_CATALYST_ARM64}" "${LIB_CATALYST_X86_64}"
+  UNIVERSAL_LIBS+=( "${CATALYST_UNIV}" )
+elif [[ -f "${LIB_CATALYST_ARM64}" ]]; then
+  UNIVERSAL_LIBS+=( "${LIB_CATALYST_ARM64}" )
+elif [[ -f "${LIB_CATALYST_X86_64}" ]]; then
+  UNIVERSAL_LIBS+=( "${LIB_CATALYST_X86_64}" )
 fi
 
 # Create the xcframework with one library per platform/variant

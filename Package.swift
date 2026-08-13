@@ -19,7 +19,8 @@ let package = Package(
     defaultLocalization: "en",
     platforms: [
         .iOS(.v16),
-        .macOS(.v13)
+        .macOS(.v13),
+        .macCatalyst(.v16)
     ],
     products: [
         .library(name: "MoneroWalletCoreFFI", targets: ["MoneroWalletCoreFFI"])
@@ -33,16 +34,16 @@ let package = Package(
         .target(
             name: "MoneroWalletCoreFFI",
             dependencies: [
-                .target(name: "MoneroWalletCore", condition: .when(platforms: [.iOS, .macOS])),
+                .target(name: "MoneroWalletCore", condition: .when(platforms: [.iOS, .macOS, .macCatalyst])),
                 .target(name: "CLibMoneroWalletCore", condition: .when(platforms: [.linux]))
             ],
             path: "Sources/MoneroWalletCoreFFI",
             swiftSettings: [
-                .define("WALLETCORE_APPLE", .when(platforms: [.iOS, .macOS])),
+                .define("WALLETCORE_APPLE", .when(platforms: [.iOS, .macOS, .macCatalyst])),
                 .define("WALLETCORE_LINUX", .when(platforms: [.linux]))
             ],
             linkerSettings: [
-                .linkedLibrary("c++", .when(platforms: [.iOS, .macOS]))
+                .linkedLibrary("c++", .when(platforms: [.iOS, .macOS, .macCatalyst]))
             ]
         ),
         .executableTarget(
