@@ -28,6 +28,7 @@ pub(crate) use crate::{
     hex_lowercase,
     // Send/sweep error classification helpers.
     is_failed_send_raw_tx_error,
+    is_http_client_failed_error,
     is_invalid_input_send_raw_tx_error,
     // Binary-decoy provider constructor.
     make_bin_decoy_daemon,

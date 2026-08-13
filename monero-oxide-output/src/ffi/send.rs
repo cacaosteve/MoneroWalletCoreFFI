@@ -1583,6 +1583,7 @@ fn wallet_send_impl(
                     .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                 && quarantined_this_call == 0
+                && !crate::is_http_client_failed_error(&err_text)
                 && (is_invalid_input_send_raw_tx_error(&err_text)
                     || crate::is_double_spend_send_raw_tx_error(&err_text));
 

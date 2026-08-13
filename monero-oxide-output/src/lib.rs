@@ -263,7 +263,18 @@ async fn broadcast_send_raw_transaction(
             Some(String::from_utf8_lossy(&body).to_string()),
             64 * 1024,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            let s = err.to_string();
+            println!("🧭 send_raw_transaction rpc error: {s}");
+            if is_http_client_failed_error(&s) {
+                monero_interface::InterfaceError::InterfaceError(format!(
+                    "send_raw_transaction status=Failed {s}"
+                ))
+            } else {
+                err
+            }
+        })?;
 
     let res: SendRawTxResponse = serde_json::from_str(&raw).map_err(|_| {
         monero_interface::InterfaceError::InvalidInterface(
@@ -272,6 +283,11 @@ async fn broadcast_send_raw_transaction(
     })?;
 
     let status = res.status.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+    println!(
+        "🧭 send_raw_transaction daemon status={} reason={}",
+        status,
+        res.reason.clone().unwrap_or_else(|| "(none)".to_string())
+    );
     if status.eq_ignore_ascii_case("OK") {
         return Ok(());
     }
@@ -852,6 +868,59 @@ pub(crate) fn is_failed_send_raw_tx_error(_msg: &str) -> bool {
     false
 }
 
+pub(crate) fn parse_http_status_code(msg: &str) -> Option<u16> {
+    let m = msg;
+    for needle in ["HTTP ", "http ", "status code "] {
+        if let Some(idx) = m.find(needle) {
+            let rest = &m[idx + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(code) = digits.parse::<u16>() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// Cuprate/monerod HTTP 4xx (except 408/429) is a hard failure, not a transient fetch stall.
+pub(crate) fn is_http_client_failed_error(msg: &str) -> bool {
+    match parse_http_status_code(msg) {
+        Some(code) if (400..500).contains(&code) && code != 408 && code != 429 => true,
+        _ => false,
+    }
+}
+
+fn is_non_retryable_http_client_status(code: u16) -> bool {
+    (400..500).contains(&code) && code != 408 && code != 429
+}
+
+fn map_ureq_error(route: &str, err: ureq::Error) -> RpcError {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let text = resp.status_text().to_string();
+            let body_preview = resp
+                .into_string()
+                .ok()
+                .map(|s| s.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            println!(
+                "🧭 rpc HTTP status={} {} route={} body_preview={}",
+                code, text, route, body_preview
+            );
+            let msg = format!("HTTP {code} {text} route={route} body={body_preview}");
+            if is_non_retryable_http_client_status(code) {
+                RpcError::InvalidInterface(format!("status=Failed {msg}"))
+            } else {
+                RpcError::InterfaceError(msg)
+            }
+        }
+        ureq::Error::Transport(transport) => {
+            println!("🧭 rpc transport error route={} err={}", route, transport);
+            RpcError::InterfaceError(format!("route={route} {transport}"))
+        }
+    }
+}
+
 pub(crate) fn walletcore_send_bisect_on_failed_enabled() -> bool {
     // Deprecated/ignored: bisecting on generic failed broadcasts is unsafe and can quarantine
     // valid inputs. Keep the env var for backward compatibility but disable behavior.
@@ -961,8 +1030,14 @@ pub(crate) fn update_scan_progress(
 ) {
     if let Ok(mut map) = WALLET_STORE.lock() {
         if let Some(state) = map.get_mut(id) {
-            let normalized_scanned = scanned_height.max(restore_height).min(chain_height);
-            state.last_scanned = normalized_scanned;
+            // Never report last_scanned past the height we actually walked.
+            // Clamping up to chain_height is what made interrupted scans look complete.
+            let normalized_scanned = scanned_height.max(restore_height);
+            state.last_scanned = if chain_height > 0 {
+                normalized_scanned.min(chain_height)
+            } else {
+                normalized_scanned
+            };
             state.chain_height = chain_height;
             state.chain_time = chain_time;
         }
@@ -1553,7 +1628,8 @@ impl BlockingRpcTransport {
         let response = self
             .request_for(route)
             .send_bytes(&body)
-            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
+            .map_err(|err| map_ureq_error(route, err))?;
+        println!("🧭 rpc HTTP status={} route={}", response.status(), route);
         let mut reader = response.into_reader();
         let mut buf = Vec::new();
         reader
@@ -1569,7 +1645,12 @@ impl BlockingRpcTransport {
         let response = self
             .request_for_bin(route)
             .send_bytes(&body)
-            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
+            .map_err(|err| map_ureq_error(route, err))?;
+        println!(
+            "🧭 rpc(bin) HTTP status={} route={}",
+            response.status(),
+            route
+        );
         let mut reader = response.into_reader();
         let mut buf = Vec::new();
         reader
@@ -1723,11 +1804,9 @@ impl BlockingRpcTransport {
             .request_for("json_rpc")
             .send_json(payload)
             .map_err(|err| {
-                let detail = match &err {
-                    ureq::Error::Status(code, resp) => {
-                        format!("HTTP {code} {}", resp.status_text())
-                    }
-                    ureq::Error::Transport(transport) => transport.to_string(),
+                let detail = match map_ureq_error("json_rpc", err) {
+                    RpcError::InterfaceError(msg) | RpcError::InvalidInterface(msg) => msg,
+                    RpcError::InternalError(msg) => msg,
                 };
                 (-15, format!("json_rpc {method}: {detail}"))
             })?;

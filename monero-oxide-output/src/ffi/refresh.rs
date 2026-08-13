@@ -2424,7 +2424,20 @@ fn wallet_refresh_impl(
             );
         }
 
-        scan_cursor = daemon.height;
+        if scan_cursor < daemon.height {
+            walletcore_log_line(
+                id,
+                snapshot.network,
+                &format!(
+                    "⚠️ wallet_refresh stopped before tip wallet_id={} last_scanned={} tip={}",
+                    id, scan_cursor, daemon.height
+                ),
+            );
+            wc_log_line_android_or_stdout(&format!(
+                "⚠️ wallet_refresh stopped before tip wallet_id={} last_scanned={} tip={}",
+                id, scan_cursor, daemon.height
+            ));
+        }
     }
 
     // Close trailing persist span.
