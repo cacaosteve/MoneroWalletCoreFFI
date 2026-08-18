@@ -88,7 +88,7 @@ fn wc_android_force_env_default(key: &str, value: &str) {
 
 // External types used by refresh.
 use crate::BlockingRpcTransport;
-use monero_interface::ScannableBlock;
+use monero_interface::{PrunedTransactionWithPrunableHash, ScannableBlock};
 use monero_wallet::{
     block::Block as MoneroBlock,
     transaction::{NotPruned, Pruned, Transaction},
@@ -100,8 +100,8 @@ use monero_wallet::{
 use monero_wallet::scanner_microprof_snapshot;
 
 // Bring crate-local alias into scope for prefetch JoinHandle result typing.
-use crate::RpcError;
 use crate::BulkFetchMode;
+use crate::RpcError;
 
 // Hard timeout to prevent indefinite hangs when fetching scannable blocks.
 // This is intentionally enforced at the walletcore layer so we can always surface a diagnostic.
@@ -231,12 +231,103 @@ fn get_output_indexes_from_block_response(
     Ok(None)
 }
 
-fn fetch_scannable_blocks_range_bin(
+#[derive(Debug)]
+enum RangeFetchError {
+    Rpc(RpcError),
+    RetryUnpruned(RpcError),
+}
+
+impl From<RpcError> for RangeFetchError {
+    fn from(error: RpcError) -> Self {
+        Self::Rpc(error)
+    }
+}
+
+fn decode_range_transaction(
+    blob: &[u8],
+    prunable_hash: Option<[u8; 32]>,
+    expected_hash: [u8; 32],
+    block_idx: usize,
+    tx_idx: usize,
+) -> Result<Transaction<Pruned>, RangeFetchError> {
+    let mut pruned_reader = blob;
+    let pruned_decode_detail = match Transaction::<Pruned>::read(&mut pruned_reader) {
+        Ok(tx_pruned) if pruned_reader.is_empty() => {
+            let usable_prunable_hash = match &tx_pruned {
+                Transaction::V1 { .. } => None,
+                Transaction::V2 { proofs, .. } => {
+                    if proofs.is_some() && prunable_hash == Some([0; 32]) {
+                        return Err(RangeFetchError::RetryUnpruned(
+                            RpcError::InvalidInterface(format!(
+                                "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] pruned response had an uninitialized prunable_hash"
+                            )),
+                        ));
+                    }
+                    prunable_hash
+                }
+            };
+
+            let Some(tx_with_hash) =
+                PrunedTransactionWithPrunableHash::new(tx_pruned, usable_prunable_hash)
+            else {
+                return Err(RangeFetchError::RetryUnpruned(
+                    RpcError::InvalidInterface(format!(
+                        "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] pruned response was missing a usable prunable_hash"
+                    )),
+                ));
+            };
+
+            return tx_with_hash.verify_as_possible(expected_hash).map_err(|_| {
+                RangeFetchError::Rpc(RpcError::InvalidInterface(format!(
+                    "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] pruned transaction hash mismatch"
+                )))
+            });
+        }
+        Ok(_) => format!("pruned decode left {} trailing bytes", pruned_reader.len()),
+        Err(error) => format!("pruned decode failed: {error}"),
+    };
+
+    // A daemon is allowed to ignore the requested pruning mode. Preserve compatibility by
+    // accepting and validating a complete transaction blob when one is returned.
+    let mut full_reader = blob;
+    let tx_full = Transaction::<NotPruned>::read(&mut full_reader).map_err(|error| {
+        RangeFetchError::Rpc(RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] decode failed ({pruned_decode_detail}; full decode failed: {error})"
+        )))
+    })?;
+    if !full_reader.is_empty() {
+        return Err(RangeFetchError::Rpc(RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] full transaction had {} trailing bytes",
+            full_reader.len()
+        ))));
+    }
+
+    if tx_full.hash() != expected_hash {
+        return Err(RangeFetchError::Rpc(RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] full transaction hash mismatch"
+        ))));
+    }
+
+    if let (Some(expected_prunable_hash), Some(actual_prunable_hash)) =
+        (prunable_hash, tx_full.prunable_hash())
+    {
+        if actual_prunable_hash != expected_prunable_hash {
+            return Err(RangeFetchError::Rpc(RpcError::InvalidInterface(format!(
+                "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] prunable_hash mismatch"
+            ))));
+        }
+    }
+
+    Ok(Transaction::from(tx_full))
+}
+
+fn fetch_scannable_blocks_range_bin_with_prune(
     rpc_client: &RpcClient,
     base_url: &str,
     start_bn: usize,
     end_bn_inclusive: usize,
-) -> Result<Vec<ScannableBlock>, RpcError> {
+    prune: bool,
+) -> Result<Vec<ScannableBlock>, RangeFetchError> {
     let requested_blocks = end_bn_inclusive
         .checked_sub(start_bn)
         .and_then(|n| n.checked_add(1))
@@ -253,12 +344,13 @@ fn fetch_scannable_blocks_range_bin(
         ))
     })?;
 
-    let resp = transport.get_blocks_bin(start_height, count, false)?;
+    let resp = transport.get_blocks_bin(start_height, count, prune)?;
 
     wc_log_line_android_or_stdout(&format!(
-        "🧭 range_get_blocks_bin rpc_ok start_height={} count={} returned_blocks={}",
+        "🧭 range_get_blocks_bin rpc_ok start_height={} count={} prune={} returned_blocks={}",
         start_height,
         count,
+        prune,
         resp.blocks.len()
     ));
 
@@ -266,17 +358,17 @@ fn fetch_scannable_blocks_range_bin(
         if !status.eq_ignore_ascii_case("OK") {
             return Err(RpcError::InvalidInterface(format!(
                 "range get_blocks.bin returned status={status}"
-            )));
+            ))
+            .into());
         }
     }
 
     if resp.blocks.is_empty() {
         return Err(RpcError::InvalidInterface(format!(
             "range get_blocks.bin returned 0 blocks, expected up to {} for heights {}..={}",
-            requested_blocks,
-            start_bn,
-            end_bn_inclusive
-        )));
+            requested_blocks, start_bn, end_bn_inclusive
+        ))
+        .into());
     }
     if resp.blocks.len() > requested_blocks {
         return Err(RpcError::InvalidInterface(format!(
@@ -285,7 +377,8 @@ fn fetch_scannable_blocks_range_bin(
             requested_blocks,
             start_bn,
             end_bn_inclusive
-        )));
+        ))
+        .into());
     }
     if resp.blocks.len() < requested_blocks {
         let actual_end = start_bn.saturating_add(resp.blocks.len()).saturating_sub(1);
@@ -313,7 +406,8 @@ fn fetch_scannable_blocks_range_bin(
             return Err(RpcError::InvalidInterface(format!(
                 "range get_blocks.bin block[{block_idx}] had {} trailing bytes",
                 block_reader.len()
-            )));
+            ))
+            .into());
         }
 
         if block.transactions.len() != entry.txs.len() {
@@ -321,7 +415,8 @@ fn fetch_scannable_blocks_range_bin(
                 "range get_blocks.bin block[{block_idx}] had {} tx hashes but {} tx blobs",
                 block.transactions.len(),
                 entry.txs.len()
-            )));
+            ))
+            .into());
         }
 
         if block_idx == 0 {
@@ -333,41 +428,19 @@ fn fetch_scannable_blocks_range_bin(
         }
 
         let mut transactions: Vec<Transaction<Pruned>> = Vec::with_capacity(entry.txs.len());
-        for (tx_idx, (expected_hash, tx_entry)) in
-            block.transactions.iter().zip(entry.txs.into_iter()).enumerate()
+        for (tx_idx, (expected_hash, tx_entry)) in block
+            .transactions
+            .iter()
+            .zip(entry.txs.into_iter())
+            .enumerate()
         {
-            let mut tx_reader: &[u8] = tx_entry.blob.as_slice();
-            let tx_full = Transaction::<NotPruned>::read(&mut tx_reader).map_err(|e| {
-                RpcError::InvalidInterface(format!(
-                    "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] decode failed: {e}"
-                ))
-            })?;
-            if !tx_reader.is_empty() {
-                return Err(RpcError::InvalidInterface(format!(
-                    "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] had {} trailing bytes",
-                    tx_reader.len()
-                )));
-            }
-
-            let actual_hash = tx_full.hash();
-            if actual_hash != *expected_hash {
-                return Err(RpcError::InvalidInterface(format!(
-                    "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] hash mismatch",
-                )));
-            }
-
-            // Sanity-check optional daemon-provided prunable hashes when present.
-            if let Some(expected_prunable_hash) = tx_entry.prunable_hash {
-                if let Some(actual_prunable_hash) = tx_full.prunable_hash() {
-                    if actual_prunable_hash != expected_prunable_hash {
-                        return Err(RpcError::InvalidInterface(format!(
-                            "range get_blocks.bin block[{block_idx}] tx[{tx_idx}] prunable_hash mismatch"
-                        )));
-                    }
-                }
-            }
-
-            transactions.push(Transaction::from(tx_full));
+            transactions.push(decode_range_transaction(
+                &tx_entry.blob,
+                tx_entry.prunable_hash,
+                *expected_hash,
+                block_idx,
+                tx_idx,
+            )?);
         }
 
         if block_idx == 0 {
@@ -445,7 +518,8 @@ fn fetch_scannable_blocks_range_bin(
                         "range get_blocks.bin returned {} output indexes for {} outputs",
                         output_indexes.len(),
                         tx.prefix().outputs.len()
-                    )));
+                    ))
+                    .into());
                 }
 
                 output_index_for_first_ringct_output = output_indexes.first().copied();
@@ -467,6 +541,42 @@ fn fetch_scannable_blocks_range_bin(
     }
 
     Ok(out)
+}
+
+fn fetch_scannable_blocks_range_bin(
+    rpc_client: &RpcClient,
+    base_url: &str,
+    start_bn: usize,
+    end_bn_inclusive: usize,
+) -> Result<Vec<ScannableBlock>, RpcError> {
+    match fetch_scannable_blocks_range_bin_with_prune(
+        rpc_client,
+        base_url,
+        start_bn,
+        end_bn_inclusive,
+        true,
+    ) {
+        Ok(blocks) => Ok(blocks),
+        Err(RangeFetchError::RetryUnpruned(pruned_error)) => {
+            wc_log_line_android_or_stdout(&format!(
+                "🧭 range_get_blocks_bin retry_unpruned start_height={} end_height={} reason={}",
+                start_bn, end_bn_inclusive, pruned_error
+            ));
+            match fetch_scannable_blocks_range_bin_with_prune(
+                rpc_client,
+                base_url,
+                start_bn,
+                end_bn_inclusive,
+                false,
+            ) {
+                Ok(blocks) => Ok(blocks),
+                Err(RangeFetchError::Rpc(error) | RangeFetchError::RetryUnpruned(error)) => {
+                    Err(error)
+                }
+            }
+        }
+        Err(RangeFetchError::Rpc(error)) => Err(error),
+    }
 }
 
 // ===== Android-only: dedicated contiguous block fetch worker (no per-batch thread spawning) =====
@@ -2736,21 +2846,67 @@ fn wallet_refresh_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::fetch_scannable_blocks_range_bin;
-    use crate::BlockingRpcTransport;
+    use super::{decode_range_transaction, fetch_scannable_blocks_range_bin, RangeFetchError};
     use crate::support::RpcClient;
+    use crate::BlockingRpcTransport;
     use monero_wallet::block::Block as MoneroBlock;
+    use monero_wallet::transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix};
+
+    fn synthetic_pruned_v2() -> (Vec<u8>, [u8; 32], [u8; 32]) {
+        let transaction = Transaction::<Pruned>::V2 {
+            prefix: TransactionPrefix {
+                additional_timelock: Timelock::None,
+                inputs: vec![Input::Gen(1)],
+                outputs: vec![],
+                extra: vec![],
+            },
+            proofs: None,
+        };
+        let prunable_hash = [0; 32];
+        let transaction_hash = transaction
+            .hash_with_prunable_hash(prunable_hash)
+            .expect("v2 transaction should hash with a prunable hash");
+        (transaction.serialize(), prunable_hash, transaction_hash)
+    }
 
     #[test]
+    fn decodes_and_verifies_pruned_range_transaction() {
+        let (blob, prunable_hash, transaction_hash) = synthetic_pruned_v2();
+        let decoded = decode_range_transaction(&blob, Some(prunable_hash), transaction_hash, 0, 0)
+            .expect("valid pruned transaction should decode");
+
+        assert_eq!(decoded.serialize(), blob);
+    }
+
+    #[test]
+    fn requests_unpruned_retry_when_prunable_hash_is_missing() {
+        let (blob, _, transaction_hash) = synthetic_pruned_v2();
+        let result = decode_range_transaction(&blob, None, transaction_hash, 0, 0);
+
+        assert!(matches!(result, Err(RangeFetchError::RetryUnpruned(_))));
+    }
+
+    #[test]
+    fn rejects_pruned_transaction_hash_mismatch() {
+        let (blob, prunable_hash, mut transaction_hash) = synthetic_pruned_v2();
+        transaction_hash[0] ^= 1;
+        let result = decode_range_transaction(&blob, Some(prunable_hash), transaction_hash, 0, 0);
+
+        assert!(matches!(result, Err(RangeFetchError::Rpc(_))));
+    }
+
+    #[test]
+    #[ignore = "requires a live wallet RPC node"]
     fn debug_live_range_fetch_against_local_daemon() {
-        let base_url = "http://127.0.0.1:18092";
+        let base_url = std::env::var("WALLETCORE_TEST_NODE")
+            .unwrap_or_else(|_| "http://127.0.0.1:18092".to_string());
         let client: RpcClient = crate::TOKIO_RUNTIME
             .block_on(async {
-                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.to_string()).await
+                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()).await
             })
             .expect("failed to build rpc client");
 
-        let blocks = fetch_scannable_blocks_range_bin(&client, base_url, 3_630_413, 3_630_437)
+        let blocks = fetch_scannable_blocks_range_bin(&client, &base_url, 3_630_413, 3_630_437)
             .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
 
         eprintln!("fetched scannable blocks={}", blocks.len());
@@ -2758,6 +2914,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a live wallet RPC node"]
     fn debug_live_range_fetch_ios_window_against_local_daemon() {
         let base_url = "http://127.0.0.1:18092";
         let client: RpcClient = crate::TOKIO_RUNTIME
@@ -2774,6 +2931,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a live wallet RPC node"]
     fn debug_live_get_o_indexes_response_shape() {
         let base_url = "http://127.0.0.1:18092";
         let transport = BlockingRpcTransport::new(base_url).expect("transport init failed");

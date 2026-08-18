@@ -1475,6 +1475,7 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "requires /tmp/get_blocks_3630413_25.bin debug fixture"]
     fn debug_decode_saved_get_blocks_bin_sample() {
         let sample_path = "/tmp/get_blocks_3630413_25.bin";
         let sample = std::fs::read(sample_path)

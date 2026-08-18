@@ -149,131 +149,62 @@ pub(crate) fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error
     }
 
     let marker = r.get_u8();
-
-    match marker {
-        // Bool (1 byte)
-        0x01 => {
-            if r.remaining() < 1 {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value: EOF reading bool",
-                ));
-            }
-            let _ = r.get_u8();
-            Ok(())
-        }
-
-        // Fixed-width ints (best-effort; monerod frequently uses 8 byte ints)
-        0x02 | 0x03 => {
-            if r.remaining() < 8 {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value: EOF reading int64",
-                ));
-            }
-            r.advance(8);
-            Ok(())
-        }
-
-        // Strings/blobs: varint length + bytes
-        0x0a | 0x0b | 0xba | 0xcf => {
-            let len = skip_epee_varint_u64(r)?;
-            let len_usize = usize::try_from(len).map_err(|_| {
-                cuprate_epee_encoding::error::Error::Format("skip_epee_value: length overflow")
-            })?;
-            if r.remaining() < len_usize {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value: EOF reading bytes",
-                ));
-            }
-            r.advance(len_usize);
-            Ok(())
-        }
-
-        // Object: varint field count + repeated (name,value) pairs
-        0x0c => {
-            let fields = skip_epee_varint_u64(r)?;
-            for _ in 0..fields {
-                if r.remaining() < 1 {
-                    return Err(cuprate_epee_encoding::error::Error::Format(
-                        "skip_epee_value: EOF reading field name length",
-                    ));
-                }
-                let name_len_usize = r.get_u8() as usize;
-                if r.remaining() < name_len_usize {
-                    return Err(cuprate_epee_encoding::error::Error::Format(
-                        "skip_epee_value: EOF reading field name",
-                    ));
-                }
-                r.advance(name_len_usize);
-
-                skip_epee_value(r)?;
-            }
-            Ok(())
-        }
-
-        // Array: element marker + varint length + elements.
-        // Observed: `txs` can start with marker 0x8c; treat it array-like.
-        0x0d | 0x8c => {
-            if !r.has_remaining() {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value: EOF reading array element marker",
-                ));
-            }
-            let elem_marker = r.get_u8();
-            let n = skip_epee_varint_u64(r)?;
-            for _ in 0..n {
-                skip_epee_value_with_known_marker(r, elem_marker)?;
-            }
-            Ok(())
-        }
-
-        _ => Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("skip_epee_value: unsupported marker=0x{marker:02x} (extend decoder)")
-                .into_boxed_str(),
-        ))),
-    }
+    skip_epee_value_with_known_marker(r, marker)
 }
 
 pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
     r: &mut B,
     marker: u8,
 ) -> cuprate_epee_encoding::error::Result<()> {
+    if marker & 0x80 != 0 {
+        let element_marker = marker & 0x7f;
+        let elements = skip_epee_varint_u64(r)?;
+        for _ in 0..elements {
+            skip_epee_value_with_known_marker(r, element_marker)?;
+        }
+        return Ok(());
+    }
+
+    let fixed_width = match marker {
+        // i64, u64, f64
+        0x01 | 0x05 | 0x09 => Some(8),
+        // i32, u32
+        0x02 | 0x06 => Some(4),
+        // i16, u16
+        0x03 | 0x07 => Some(2),
+        // i8, u8, bool
+        0x04 | 0x08 | 0x0b => Some(1),
+        _ => None,
+    };
+    if let Some(width) = fixed_width {
+        if r.remaining() < width {
+            return Err(cuprate_epee_encoding::error::Error::Format(
+                "skip_epee_value_with_known_marker: EOF reading fixed-width value",
+            ));
+        }
+        r.advance(width);
+        return Ok(());
+    }
+
     match marker {
-        0x01 => {
-            if r.remaining() < 1 {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: EOF reading bool",
-                ));
-            }
-            let _ = r.get_u8();
-            Ok(())
-        }
-
-        0x02 | 0x03 => {
-            if r.remaining() < 8 {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: EOF reading int64",
-                ));
-            }
-            r.advance(8);
-            Ok(())
-        }
-
-        0x0a | 0x0b | 0xba | 0xcf => {
+        // String/blob: varint length + bytes.
+        0x0a => {
             let len = skip_epee_varint_u64(r)?;
             let len_usize = usize::try_from(len).map_err(|_| {
                 cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: length overflow",
+                    "skip_epee_value_with_known_marker: string length overflow",
                 )
             })?;
             if r.remaining() < len_usize {
                 return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: EOF reading bytes",
+                    "skip_epee_value_with_known_marker: EOF reading string",
                 ));
             }
             r.advance(len_usize);
             Ok(())
         }
 
+        // Object: varint field count + repeated (name, marker, value) tuples.
         0x0c => {
             let fields = skip_epee_varint_u64(r)?;
             for _ in 0..fields {
@@ -295,36 +226,10 @@ pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
             Ok(())
         }
 
-        0x0d | 0x8c => {
-            if !r.has_remaining() {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: EOF reading nested array elem marker",
-                ));
-            }
-            let elem_marker = r.get_u8();
-            let n = skip_epee_varint_u64(r)?;
-            for _ in 0..n {
-                skip_epee_value_with_known_marker(r, elem_marker)?;
-            }
-            Ok(())
-        }
-
-        _ => {
-            // Tolerant fallback: treat unknown markers as blob-like with a varint length.
-            let len = skip_epee_varint_u64(r)?;
-            let len_usize = usize::try_from(len).map_err(|_| {
-                cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: length overflow (unknown marker)",
-                )
-            })?;
-            if r.remaining() < len_usize {
-                return Err(cuprate_epee_encoding::error::Error::Format(
-                    "skip_epee_value_with_known_marker: EOF reading bytes (unknown marker)",
-                ));
-            }
-            r.advance(len_usize);
-            Ok(())
-        }
+        _ => Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+            format!("skip_epee_value_with_known_marker: unsupported marker=0x{marker:02x}")
+                .into_boxed_str(),
+        ))),
     }
 }
 
@@ -595,5 +500,42 @@ pub(crate) fn try_decode_block_complete_entry_from_blob_payload(
     {
         Ok(entry) => Ok(Some(entry)),
         Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_epee_value;
+
+    #[test]
+    fn skips_fixed_width_scalars_using_portable_storage_markers() {
+        let mut u64_value: &[u8] = &[0x05, 0, 0, 0, 0, 0, 0, 0, 0];
+        skip_epee_value(&mut u64_value).expect("u64 value should be skipped");
+        assert!(u64_value.is_empty());
+
+        let mut bool_value: &[u8] = &[0x0b, 1];
+        skip_epee_value(&mut bool_value).expect("bool value should be skipped");
+        assert!(bool_value.is_empty());
+    }
+
+    #[test]
+    fn skips_objects_and_typed_object_sequences() {
+        // A one-field object containing `block_weight` as a u64. Portable-storage
+        // small varints are stored as value << 2, so one field/element is 0x04.
+        let object = [
+            0x0c, 0x04, 0x0c, b'b', b'l', b'o', b'c', b'k', b'_', b'w', b'e', b'i', b'g', b'h',
+            b't', 0x05, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut object_value: &[u8] = &object;
+        skip_epee_value(&mut object_value).expect("object should be skipped");
+        assert!(object_value.is_empty());
+
+        let mut sequence = Vec::with_capacity(object.len() + 1);
+        sequence.push(0x8c); // typed sequence of objects
+        sequence.push(0x04); // one element
+        sequence.extend_from_slice(&object[1..]); // object payload omits its marker
+        let mut sequence_value: &[u8] = &sequence;
+        skip_epee_value(&mut sequence_value).expect("object sequence should be skipped");
+        assert!(sequence_value.is_empty());
     }
 }
