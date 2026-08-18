@@ -1,3 +1,4 @@
+use bytes::Buf;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     convert::TryInto,
@@ -11,7 +12,6 @@ use std::{
     },
     time::Duration,
 };
-use bytes::Buf;
 
 // Bulk EPEE models (request/response structs + builders) extracted to `support::bulk_models`.
 // Import into the crate root so existing `BlockingRpcTransport` methods can keep using the short names
@@ -30,6 +30,7 @@ use crate::support::bulk_bin_debug_enabled;
 
 // (moved into the main std::sync import above)
 
+pub mod api;
 mod ffi;
 mod support;
 
@@ -1021,6 +1022,10 @@ fn record_error(code: c_int, message: impl Into<String>) -> c_int {
     code
 }
 
+pub(crate) fn last_error_clone() -> Option<String> {
+    LAST_ERROR_MESSAGE.lock().ok().and_then(|slot| slot.clone())
+}
+
 pub(crate) fn update_scan_progress(
     id: &str,
     scanned_height: u64,
@@ -1691,16 +1696,15 @@ impl BlockingRpcTransport {
         //
         // encoded with Monero's historical on-wire prefix bytes.
         const GET_BLOCKS_BIN_PREFIX_BEFORE_PRUNE_VALUE: &[u8] = &[
-            0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01, 0x0c, 0x05, 0x70, 0x72,
-            0x75, 0x6e, 0x65, 0x0b,
+            0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01, 0x0c, 0x05, 0x70, 0x72, 0x75,
+            0x6e, 0x65, 0x0b,
         ];
         const GET_BLOCKS_BIN_PREFIX_AFTER_PRUNE_VALUE: &[u8] = &[
-            0x0c, 0x73, 0x74, 0x61, 0x72, 0x74, 0x5f, 0x68,
-            0x65, 0x69, 0x67, 0x68, 0x74, 0x05,
+            0x0c, 0x73, 0x74, 0x61, 0x72, 0x74, 0x5f, 0x68, 0x65, 0x69, 0x67, 0x68, 0x74, 0x05,
         ];
         const GET_BLOCKS_BIN_MID: &[u8] = &[
-            0x0f, 0x6d, 0x61, 0x78, 0x5f, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x5f, 0x63, 0x6f,
-            0x75, 0x6e, 0x74, 0x05,
+            0x0f, 0x6d, 0x61, 0x78, 0x5f, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x5f, 0x63, 0x6f, 0x75,
+            0x6e, 0x74, 0x05,
         ];
 
         let mut body = Vec::with_capacity(
@@ -2185,6 +2189,13 @@ struct TrackedOutput {
     spending_height: Option<u64>,
 }
 
+fn mark_tracked_output_spent(output: &mut TrackedOutput, spending_txid: Option<[u8; 32]>) {
+    output.spent = true;
+    if output.spending_txid.is_none() {
+        output.spending_txid = spending_txid;
+    }
+}
+
 /// Minimal pending-outgoing record for UI history.
 /// We add this when a send/sweep successfully broadcasts, and clear it once it is confirmed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2343,11 +2354,13 @@ pub(crate) struct ObservedTransfer {
 /// Persisted ledger entry used to build stable transfer history.
 ///
 /// - Incoming ("in"): `amount` is the total received in that tx to this wallet (sum of outputs).
-/// - Outgoing ("out"): `amount` is the recipient amount (what the user intended to send), fee stored separately.
+/// - Outgoing ("out"): `amount` is the wallet's net spend (`spent inputs − change`), i.e.
+///   payment + fee, matching Feather `balanceDelta` magnitude. Fee is stored separately when known.
 /// - Coinbase receives are included (as "in") with `is_coinbase = true`.
 ///
 /// We keep this separate from `TrackedOutput` so history remains stable even after outputs are spent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Rebuild it from tracked outputs each refresh — never clone-and-add, which double-counts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct LedgerEntry {
     txid: String,
     direction: String, // "in" | "out" | "self"
@@ -2357,6 +2370,196 @@ struct LedgerEntry {
     timestamp: Option<u64>,
     is_pending: bool,
     is_coinbase: bool,
+}
+
+#[derive(Default)]
+struct TxLedgerAgg {
+    incoming: u64,
+    incoming_height: Option<u64>,
+    is_coinbase: bool,
+    spent: u64,
+    spend_height: Option<u64>,
+}
+
+fn bump_height(slot: &mut Option<u64>, height: u64) {
+    if height == 0 {
+        return;
+    }
+    *slot = Some(slot.unwrap_or(0).max(height));
+}
+
+/// Rebuild transfer history from currently tracked outputs + pending local sends.
+///
+/// For each txid:
+/// - incoming = sum of owned outputs created in that tx (receives and change)
+/// - spent = sum of our inputs consumed by that tx (when `spending_txid` is known)
+/// - if spent > 0 → `out` with amount = spent − incoming (payment + fee, not gross inputs)
+/// - else → `in` with amount = incoming
+///
+/// Change-bearing spends therefore stay outgoing instead of being overwritten as a receive.
+/// Spent outputs missing `spending_txid` still attach to same-height change when that
+/// mapping is unambiguous (the interrupted-scan / bulk-index hole).
+pub(crate) fn rebuild_transfer_ledger(
+    outputs: &[TrackedOutput],
+    pending_outgoing: &[PendingOutgoingTx],
+    chain_time: u64,
+) -> HashMap<String, LedgerEntry> {
+    let mut by_txid: HashMap<String, TxLedgerAgg> = HashMap::new();
+    let mut unattributed: Vec<(u64, Option<u64>, String)> = Vec::new();
+
+    for output in outputs {
+        let recv_txid = hex_lowercase(&output.tx_hash);
+        let recv = by_txid.entry(recv_txid.clone()).or_default();
+        recv.incoming = recv.incoming.saturating_add(output.amount);
+        recv.is_coinbase = recv.is_coinbase || output.is_coinbase;
+        bump_height(&mut recv.incoming_height, output.block_height);
+
+        if output.spent {
+            if let Some(spend_bytes) = output.spending_txid {
+                let spend_txid = hex_lowercase(&spend_bytes);
+                let spend = by_txid.entry(spend_txid).or_default();
+                spend.spent = spend.spent.saturating_add(output.amount);
+                bump_height(&mut spend.spend_height, output.spending_height.unwrap_or(0));
+            } else {
+                unattributed.push((output.amount, output.spending_height, recv_txid));
+            }
+        }
+    }
+
+    if !unattributed.is_empty() {
+        let mut spent_by_height: HashMap<u64, u64> = HashMap::new();
+        let mut source_txids: HashSet<String> = HashSet::new();
+        for (amount, height, source_txid) in &unattributed {
+            source_txids.insert(source_txid.clone());
+            if let Some(height) = height.filter(|h| *h > 0) {
+                let slot = spent_by_height.entry(height).or_insert(0);
+                *slot = slot.saturating_add(*amount);
+            }
+        }
+
+        let mut incoming_at_height: HashMap<u64, Vec<String>> = HashMap::new();
+        for (txid, agg) in &by_txid {
+            if agg.incoming == 0 {
+                continue;
+            }
+            if let Some(height) = agg.incoming_height.filter(|h| *h > 0) {
+                incoming_at_height
+                    .entry(height)
+                    .or_default()
+                    .push(txid.clone());
+            }
+        }
+
+        for (height, spent_sum) in spent_by_height {
+            let Some(txids) = incoming_at_height.get(&height) else {
+                continue;
+            };
+            let candidates: Vec<&String> = txids
+                .iter()
+                .filter(|txid| !source_txids.contains(*txid))
+                .filter(|txid| {
+                    by_txid
+                        .get(*txid)
+                        .map(|agg| agg.incoming > 0 && agg.incoming < spent_sum && agg.spent == 0)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if candidates.len() != 1 {
+                continue;
+            }
+            let spend_txid = candidates[0].clone();
+            if let Some(spend) = by_txid.get_mut(&spend_txid) {
+                spend.spent = spend.spent.saturating_add(spent_sum);
+                bump_height(&mut spend.spend_height, height);
+            }
+        }
+    }
+
+    let timestamp = if chain_time > 0 {
+        Some(chain_time)
+    } else {
+        None
+    };
+    let mut ledger: HashMap<String, LedgerEntry> = HashMap::new();
+
+    for (txid, agg) in by_txid {
+        if agg.spent > 0 {
+            ledger.insert(
+                txid.clone(),
+                LedgerEntry {
+                    txid,
+                    direction: "out".to_string(),
+                    amount: agg.spent.saturating_sub(agg.incoming),
+                    fee: None,
+                    height: agg.spend_height.or(agg.incoming_height),
+                    timestamp,
+                    is_pending: false,
+                    is_coinbase: false,
+                },
+            );
+        } else if agg.incoming > 0 {
+            ledger.insert(
+                txid.clone(),
+                LedgerEntry {
+                    txid,
+                    direction: "in".to_string(),
+                    amount: agg.incoming,
+                    fee: None,
+                    height: agg.incoming_height,
+                    timestamp,
+                    is_pending: false,
+                    is_coinbase: agg.is_coinbase,
+                },
+            );
+        }
+    }
+
+    for pending in pending_outgoing {
+        match ledger.get_mut(&pending.txid) {
+            Some(entry) if entry.direction == "out" => {
+                if entry.fee.is_none() && pending.fee > 0 {
+                    entry.fee = Some(pending.fee);
+                }
+            }
+            Some(entry) => {
+                // Cache/interrupt path: change was recorded as a receive of our own send.
+                entry.direction = "out".to_string();
+                entry.amount = pending.amount.saturating_add(pending.fee);
+                entry.fee = if pending.fee > 0 {
+                    Some(pending.fee)
+                } else {
+                    None
+                };
+                entry.is_pending = entry.height.is_none();
+                entry.is_coinbase = false;
+            }
+            None => {
+                ledger.insert(
+                    pending.txid.clone(),
+                    LedgerEntry {
+                        txid: pending.txid.clone(),
+                        direction: "out".to_string(),
+                        amount: pending.amount.saturating_add(pending.fee),
+                        fee: if pending.fee > 0 {
+                            Some(pending.fee)
+                        } else {
+                            None
+                        },
+                        height: None,
+                        timestamp: if pending.created_at > 0 {
+                            Some(pending.created_at)
+                        } else {
+                            timestamp
+                        },
+                        is_pending: true,
+                        is_coinbase: false,
+                    },
+                );
+            }
+        }
+    }
+
+    ledger
 }
 
 pub(crate) fn confirmations_for_height(chain_height: u64, tx_height: u64) -> u64 {
@@ -3072,6 +3275,7 @@ pub extern "C" fn wallet_force_rescan_from_height(
             // or may cause us to exclude/consider outputs incorrectly). Clear them so sweep/input
             // selection doesn't accidentally treat unconfirmed change as safely spendable.
             state.pending_outgoing.clear();
+            state.tx_ledger.clear();
 
             clear_last_error();
             0
@@ -3101,10 +3305,10 @@ pub use crate::ffi::send::wallet_prepare_send_with_filter;
 pub use crate::ffi::send::wallet_relay_prepared;
 pub use crate::ffi::send::wallet_send;
 pub use crate::ffi::send::wallet_send_with_filter;
-pub use crate::ffi::sweep::wallet_preview_sweep;
-pub use crate::ffi::sweep::wallet_preview_sweep_with_filter;
 pub use crate::ffi::sweep::wallet_prepare_sweep;
 pub use crate::ffi::sweep::wallet_prepare_sweep_with_filter;
+pub use crate::ffi::sweep::wallet_preview_sweep;
+pub use crate::ffi::sweep::wallet_preview_sweep_with_filter;
 pub use crate::ffi::sweep::wallet_sweep;
 pub use crate::ffi::sweep::wallet_sweep_with_filter;
 pub use crate::ffi::transfers::wallet_export_outputs_json;
@@ -3143,6 +3347,8 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
 
             // Pending outgoing may refer to now-untracked outputs/change; clear for safety.
             state.pending_outgoing.clear();
+            // Stale ledger rows would otherwise survive the next refresh as ghost history.
+            state.tx_ledger.clear();
 
             // Balances will be recomputed on next refresh.
             state.total = 0;
@@ -3163,6 +3369,113 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
 // (moved to src/ffi/sweep.rs)
 
 // (moved to src/ffi/preview_fee.rs)
+
+#[cfg(test)]
+mod ledger_rebuild_tests {
+    use super::*;
+    use monero_wallet::transaction::Timelock;
+
+    fn out(
+        tx_hash: [u8; 32],
+        amount: u64,
+        spent: bool,
+        spending_txid: Option<[u8; 32]>,
+        spending_height: Option<u64>,
+    ) -> TrackedOutput {
+        TrackedOutput {
+            tx_hash,
+            index_in_tx: 0,
+            key_image: [0u8; 32],
+            amount,
+            block_height: 10,
+            additional_timelock: Timelock::None,
+            is_coinbase: false,
+            subaddress_major: 0,
+            subaddress_minor: 0,
+            spent,
+            spending_txid,
+            spending_height,
+        }
+    }
+
+    #[test]
+    fn receive_is_not_double_counted() {
+        let tx = [1u8; 32];
+        let outputs = vec![out(tx, 1_427_934_399, false, None, None)];
+        let first = rebuild_transfer_ledger(&outputs, &[], 0);
+        let second = rebuild_transfer_ledger(&outputs, &[], 0);
+        let txid = hex_lowercase(&tx);
+        assert_eq!(first.get(&txid).map(|e| e.amount), Some(1_427_934_399));
+        assert_eq!(second.get(&txid).map(|e| e.amount), Some(1_427_934_399));
+        assert_eq!(first.get(&txid).map(|e| e.direction.as_str()), Some("in"));
+    }
+
+    #[test]
+    fn spend_with_change_is_outgoing_net_not_gross_or_change() {
+        let incoming_tx = [2u8; 32];
+        let spend_tx = [3u8; 32];
+        // Spent a 0.008042 input, got 0.006998 change, paid ~0.001044 (payment+fee).
+        let outputs = vec![
+            out(incoming_tx, 8_042_082_635, true, Some(spend_tx), Some(20)),
+            out(spend_tx, 6_997_642_635, false, None, None),
+        ];
+        let ledger = rebuild_transfer_ledger(&outputs, &[], 0);
+        let in_id = hex_lowercase(&incoming_tx);
+        let out_id = hex_lowercase(&spend_tx);
+        assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
+        assert_eq!(ledger.get(&in_id).map(|e| e.amount), Some(8_042_082_635));
+        assert_eq!(
+            ledger.get(&out_id).map(|e| e.direction.as_str()),
+            Some("out")
+        );
+        assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
+    }
+
+    #[test]
+    fn spend_without_txid_same_height_change_is_outgoing_not_receive() {
+        let incoming_tx = [2u8; 32];
+        let spend_tx = [3u8; 32];
+        let outputs = vec![
+            out(incoming_tx, 8_042_082_635, true, None, Some(20)),
+            out(spend_tx, 6_997_642_635, false, None, None),
+        ];
+        // Change output is created in the spend block.
+        let mut outputs = outputs;
+        outputs[1].block_height = 20;
+        let ledger = rebuild_transfer_ledger(&outputs, &[], 0);
+        let in_id = hex_lowercase(&incoming_tx);
+        let out_id = hex_lowercase(&spend_tx);
+        assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
+        assert_eq!(
+            ledger.get(&out_id).map(|e| e.direction.as_str()),
+            Some("out")
+        );
+        assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
+    }
+
+    #[test]
+    fn pending_send_converts_change_receive_into_outgoing() {
+        let incoming_tx = [4u8; 32];
+        let spend_tx = [5u8; 32];
+        let outputs = vec![
+            out(incoming_tx, 8_042_082_635, true, None, None),
+            out(spend_tx, 6_997_642_635, false, None, None),
+        ];
+        let pending = [PendingOutgoingTx {
+            txid: hex_lowercase(&spend_tx),
+            amount: 1_000_000_000,
+            fee: 44_440_000,
+            created_at: 0,
+        }];
+        let ledger = rebuild_transfer_ledger(&outputs, &pending, 0);
+        let out_id = hex_lowercase(&spend_tx);
+        assert_eq!(
+            ledger.get(&out_id).map(|e| e.direction.as_str()),
+            Some("out")
+        );
+        assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
+    }
+}
 
 #[cfg(test)]
 mod vector_tests;

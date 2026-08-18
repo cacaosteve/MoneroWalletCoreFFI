@@ -30,12 +30,16 @@ pub(crate) use crate::{
     is_failed_send_raw_tx_error,
     is_http_client_failed_error,
     is_invalid_input_send_raw_tx_error,
+    last_error_clone,
     // Binary-decoy provider constructor.
     make_bin_decoy_daemon,
     map_rpc_error,
+    mark_tracked_output_spent,
     master_keys_from_mnemonic_str,
+    parse_hex_32,
     // Recent hash tracking (wallet2-style).
     push_recent_block_hash,
+    rebuild_transfer_ledger,
     record_error,
     refresh_cancelled_for_wallet,
     set_refresh_cancel_for_wallet,

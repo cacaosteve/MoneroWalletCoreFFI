@@ -67,8 +67,9 @@ pub(crate) fn peek_epee_varint_u64(bytes: &[u8]) -> Option<(u64, usize)> {
 
 /// Consume a portable_storage varint from a `Buf`.
 pub(crate) fn skip_epee_varint_u64<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<u64> {
-    cuprate_epee_encoding::read_varint::<_, u64>(r)
-        .map_err(|_| cuprate_epee_encoding::error::Error::Format("skip_epee_varint_u64: invalid varint"))
+    cuprate_epee_encoding::read_varint::<_, u64>(r).map_err(|_| {
+        cuprate_epee_encoding::error::Error::Format("skip_epee_varint_u64: invalid varint")
+    })
 }
 
 /// Read an EPEE object field name (u8 length-prefixed UTF-8 string).

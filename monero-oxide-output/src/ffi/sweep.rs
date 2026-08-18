@@ -63,7 +63,14 @@ pub extern "C" fn wallet_sweep(
     }
 
     // No filter (whole wallet)
-    wallet_sweep_with_filter_impl(wallet_id, node_url, to_address, ptr::null(), ring_len, false)
+    wallet_sweep_with_filter_impl(
+        wallet_id,
+        node_url,
+        to_address,
+        ptr::null(),
+        ring_len,
+        false,
+    )
 }
 
 /// Build and sign a full-wallet sweep without broadcasting it.
@@ -782,14 +789,7 @@ pub extern "C" fn wallet_prepare_sweep_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
-    wallet_sweep_with_filter_impl(
-        wallet_id,
-        node_url,
-        to_address,
-        filter_json,
-        ring_len,
-        true,
-    )
+    wallet_sweep_with_filter_impl(wallet_id, node_url, to_address, filter_json, ring_len, true)
 }
 
 fn wallet_sweep_with_filter_impl(
@@ -1484,6 +1484,8 @@ fn wallet_sweep_with_filter_impl(
     }
 
     // Mark spent outputs in memory, adjust totals (best-effort).
+    let tx_hash = tx.hash();
+    let hex = hex_lowercase(&tx_hash);
     {
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
         if let Some(state) = map.get_mut(id) {
@@ -1493,7 +1495,7 @@ fn wallet_sweep_with_filter_impl(
                     .iter_mut()
                     .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
                 {
-                    o.spent = true;
+                    mark_tracked_output_spent(o, Some(tx_hash));
                 }
             }
             state.total = state.total.saturating_sub(inputs_sum);
@@ -1502,8 +1504,6 @@ fn wallet_sweep_with_filter_impl(
     }
 
     // Record pending outgoing tx + ledger.
-    let tx_hash = tx.hash();
-    let hex = hex_lowercase(&tx_hash);
 
     {
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");

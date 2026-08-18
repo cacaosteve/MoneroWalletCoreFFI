@@ -73,72 +73,13 @@ pub extern "C" fn wallet_import_cache(
             // Apply persisted snapshot onto in-memory state.
             persisted.apply_to_state(state);
 
-            // Defensive: older caches or older runtime state may not have initialized the ledger.
-            // Ensure it exists so transfer history can be built deterministically.
-            if state.tx_ledger.is_empty() {
-                state.tx_ledger = std::collections::HashMap::new();
-            }
-
-            // Rebuild transfer ledger from tracked outputs so history is consistent even when
-            // refresh scans 0 blocks (cache-only fast path).
-            //
-            // We intentionally derive a minimal, deterministic "incoming" ledger here:
-            // - one entry per txid present in tracked outputs
-            // - amount is the sum of owned outputs in that tx
-            // - height is the max observed output height for that tx
-            //
-            // Outgoing/pending entries (if present) are preserved from the imported snapshot;
-            // they are further refined during refresh scanning.
-            {
-                use std::collections::HashMap;
-
-                let mut rebuilt_incoming: HashMap<String, LedgerEntry> = HashMap::new();
-
-                for o in state.tracked_outputs.iter() {
-                    let txid = hex_lowercase(&o.tx_hash);
-
-                    let entry =
-                        rebuilt_incoming
-                            .entry(txid.clone())
-                            .or_insert_with(|| LedgerEntry {
-                                txid,
-                                direction: "in".to_string(),
-                                amount: 0,
-                                fee: None,
-                                height: if o.block_height == 0 {
-                                    None
-                                } else {
-                                    Some(o.block_height)
-                                },
-                                timestamp: None,
-                                is_pending: false,
-                                is_coinbase: o.is_coinbase,
-                            });
-
-                    entry.amount = entry.amount.saturating_add(o.amount);
-                    entry.is_coinbase = entry.is_coinbase || o.is_coinbase;
-
-                    // Use max observed height for the tx.
-                    if o.block_height != 0 {
-                        let h = o.block_height;
-                        entry.height = Some(entry.height.unwrap_or(0).max(h));
-                    }
-                }
-
-                // Merge: keep any non-incoming entries from the imported ledger, but replace incoming
-                // entries with rebuilt ones (canonical from tracked outputs).
-                let mut merged: HashMap<String, LedgerEntry> = HashMap::new();
-                for (k, v) in state.tx_ledger.iter() {
-                    if v.direction != "in" {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                }
-                for (k, v) in rebuilt_incoming.into_iter() {
-                    merged.insert(k, v);
-                }
-
-                state.tx_ledger = merged;
-            }
+            // Rebuild from tracked outputs on every import. Previous incoming-only rebuild
+            // overwrote spend rows with change-as-receive and ignored outgoing net amounts.
+            state.tx_ledger = rebuild_transfer_ledger(
+                &state.tracked_outputs,
+                &state.pending_outgoing,
+                state.chain_time,
+            );
 
             // Invariant enforcement:
             // Cache blobs may have been exported mid-refresh (or from older versions), which can result in

@@ -202,7 +202,7 @@ dependencies = [
 [[package]]
 name = "cuprate-epee-encoding"
 version = "0.5.0"
-source = "git+https://github.com/Cuprate/cuprate#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
+source = "git+https://github.com/Cuprate/cuprate?rev=c170b77ce4b0e490ba3309ebe79230b117dc3beb#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
 dependencies = [
  "bytes",
  "cuprate-fixed-bytes",
@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "cuprate-fixed-bytes"
 version = "0.1.0"
-source = "git+https://github.com/Cuprate/cuprate#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
+source = "git+https://github.com/Cuprate/cuprate?rev=c170b77ce4b0e490ba3309ebe79230b117dc3beb#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
 dependencies = [
  "bytes",
  "thiserror 2.0.19",
@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "cuprate-hex"
 version = "0.0.0"
-source = "git+https://github.com/Cuprate/cuprate#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
+source = "git+https://github.com/Cuprate/cuprate?rev=c170b77ce4b0e490ba3309ebe79230b117dc3beb#c170b77ce4b0e490ba3309ebe79230b117dc3beb"
 dependencies = [
  "hex",
  "serde",

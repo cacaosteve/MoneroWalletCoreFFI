@@ -359,7 +359,7 @@ fn apply_relayed_tx_local_state(
             .find(|output| output.key_image == key_image.to_bytes())
         {
             if !output.spent {
-                output.spent = true;
+                mark_tracked_output_spent(output, parse_hex_32(actual_txid));
                 spent_sum = spent_sum.saturating_add(output.amount);
             }
         }
@@ -2011,6 +2011,8 @@ fn wallet_send_impl(
         }
 
         // Broadcast succeeded -> update store and return success.
+        let tx_hash = tx.hash();
+        let hex = hex_lowercase(&tx_hash);
         {
             let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
             if let Some(state) = map.get_mut(id) {
@@ -2021,16 +2023,13 @@ fn wallet_send_impl(
                         .iter_mut()
                         .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
                     {
-                        o.spent = true;
+                        mark_tracked_output_spent(o, Some(tx_hash));
                     }
                 }
                 state.total = state.total.saturating_sub(spent_sum);
                 state.unlocked = state.unlocked.saturating_sub(spent_sum);
             }
         }
-
-        let tx_hash = tx.hash();
-        let hex = hex_lowercase(&tx_hash);
 
         {
             let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
@@ -3024,6 +3023,8 @@ fn wallet_send_with_filter_impl(
     }
 
     // Mark spent + adjust totals
+    let tx_hash = tx.hash();
+    let hex = hex_lowercase(&tx_hash);
     {
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
         if let Some(state) = map.get_mut(id) {
@@ -3034,16 +3035,13 @@ fn wallet_send_with_filter_impl(
                     .iter_mut()
                     .find(|o| o.tx_hash == t.tx_hash && o.index_in_tx == t.index_in_tx)
                 {
-                    o.spent = true;
+                    mark_tracked_output_spent(o, Some(tx_hash));
                 }
             }
             state.total = state.total.saturating_sub(spent_sum);
             state.unlocked = state.unlocked.saturating_sub(spent_sum);
         }
     }
-
-    let tx_hash = tx.hash();
-    let hex = hex_lowercase(&tx_hash);
 
     let result_json = match serde_json::to_string(&serde_json::json!({
         "txid": hex,

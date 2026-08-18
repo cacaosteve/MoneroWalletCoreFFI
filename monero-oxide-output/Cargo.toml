@@ -5,7 +5,8 @@ edition = "2021"
 
 [lib]
 name = "monerowalletcore"
-crate-type = ["cdylib", "staticlib"]
+# rlib: Rust apps (nexawal-gpui). cdylib/staticlib: Swift/JNI FFI.
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
 # Enable scanner micro-profiler plumbing (compile-time + runtime).
@@ -50,7 +51,7 @@ bytes = "1"
 
 # Portable storage (EPEE) encoder used to correctly construct monerod *.bin request bodies
 # (e.g. /get_blocks_by_height.bin) instead of hand-rolling the binary format.
-cuprate-epee-encoding = { git = "https://github.com/Cuprate/cuprate", package = "cuprate-epee-encoding" }
+cuprate-epee-encoding = { git = "https://github.com/Cuprate/cuprate", rev = "c170b77ce4b0e490ba3309ebe79230b117dc3beb", package = "cuprate-epee-encoding" }
 
 once_cell = "1.19"
 ureq = { version = "2", features = ["tls", "json"] }
