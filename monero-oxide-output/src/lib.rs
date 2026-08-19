@@ -418,8 +418,8 @@ pub(crate) fn bulk_mode_str(mode: BulkFetchMode) -> &'static str {
 pub(crate) fn bulk_fetch_mode_from_env() -> BulkFetchMode {
     // Bulk mode selection:
     //
-    // - WALLETCORE_BULK_MODE=wallet2  => Wallet2FastBlocks (default)
-    // - WALLETCORE_BULK_MODE=range    => RangeBlocks
+    // - WALLETCORE_BULK_MODE=range    => RangeBlocks (default)
+    // - WALLETCORE_BULK_MODE=wallet2  => Wallet2FastBlocks
     // - WALLETCORE_BULK_MODE=off      => PerBlock
     //
     // Back-compat:
@@ -436,7 +436,7 @@ pub(crate) fn bulk_fetch_mode_from_env() -> BulkFetchMode {
 
     let mode = std::env::var("WALLETCORE_BULK_MODE")
         .ok()
-        .unwrap_or_else(|| "wallet2".to_string())
+        .unwrap_or_else(|| "range".to_string())
         .to_ascii_lowercase();
 
     match mode.as_str() {
@@ -449,11 +449,11 @@ pub(crate) fn bulk_fetch_mode_from_env() -> BulkFetchMode {
 
 #[inline]
 pub(crate) fn bulk_fetch_batch_from_env() -> usize {
-    // Default 200, clamped to a sane range
+    // Default 75, clamped to a sane range
     let v = std::env::var("WALLETCORE_BULK_FETCH_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200);
+        .unwrap_or(75);
     v.clamp(10, 2000)
 }
 
@@ -1835,7 +1835,7 @@ impl BlockingRpcTransport {
         // - requested_info=BLOCKS_ONLY (0). This controls blocks vs pool inclusion and does NOT influence
         //   the block encoding variant in a reliable way.
         // - max_block_count: request a bounded number of blocks per call. Use the walletcore bulk batch as
-        //   the effective limit (default 200) so performance tuning is centralized.
+        //   the effective limit (default 75) so performance tuning is centralized.
         let requested_info: u8 = 0;
         let max_block_count: u64 = bulk_fetch_batch_from_env() as u64;
 

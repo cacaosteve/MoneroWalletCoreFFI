@@ -1087,10 +1087,10 @@ fn wallet_refresh_impl(
         .unwrap_or_else(|| "(unset)".to_string());
     let env_bulk_mode = std::env::var("WALLETCORE_BULK_MODE")
         .ok()
-        .unwrap_or_else(|| "(default=wallet2)".to_string());
+        .unwrap_or_else(|| "(default=range)".to_string());
     let env_bulk_fetch_batch = std::env::var("WALLETCORE_BULK_FETCH_BATCH")
         .ok()
-        .unwrap_or_else(|| "(default=200)".to_string());
+        .unwrap_or_else(|| "(default=75)".to_string());
 
     wc_log_line_android_or_stdout(&format!(
         "🧩 walletcore refresh entry: version={} build={} wallet_id={} node_url={} env{{scan_par={} scan_batch={} bulk_fetch={} bulk_mode={} bulk_fetch_batch={}}}",
@@ -1266,7 +1266,7 @@ fn wallet_refresh_impl(
     let upstream_block_batch: u64 = std::env::var("WALLETCORE_UPSTREAM_BLOCK_BATCH")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25)
+        .unwrap_or(75)
         .clamp(1, 500);
 
     walletcore_log_line(
@@ -1406,7 +1406,7 @@ fn wallet_refresh_impl(
     let _batch: usize = std::env::var("WALLETCORE_SCAN_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200);
+        .unwrap_or(75);
     let _bulk_rpc: bool = std::env::var("WALLETCORE_BULK_RPC")
         .ok()
         .map(|s| s != "0")
