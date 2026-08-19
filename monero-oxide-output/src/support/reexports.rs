@@ -9,6 +9,8 @@
 #![allow(unused_imports)]
 
 pub(crate) use crate::{
+    // Logging (module-friendly function; prefer this from submodules).
+    append_walletcore_rpc_telemetry,
     // Broadcast helper (uses /send_raw_transaction).
     broadcast_send_raw_transaction,
     // Refresh helpers / toggles.
@@ -63,7 +65,6 @@ pub(crate) use crate::{
     walletcore_disable_decoys,
     walletcore_fee_priority,
     walletcore_input_select_mode,
-    // Logging (module-friendly function; prefer this from submodules).
     walletcore_log_line,
     walletcore_send_bisect_enabled,
     walletcore_send_bisect_on_failed_enabled,

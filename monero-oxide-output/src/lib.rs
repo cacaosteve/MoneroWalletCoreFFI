@@ -562,6 +562,58 @@ fn append_walletcore_log_line(wallet_id: &str, network: MoneroNetwork, line: &st
     }
 }
 
+/// Append opt-in binary-RPC timing data for local scan diagnostics.
+///
+/// The benchmark sets `WALLETCORE_RPC_TELEMETRY_PATH` to a run-specific JSONL file. Keeping
+/// this disabled by default avoids adding I/O to ordinary wallet refreshes while allowing the
+/// desktop benchmark to measure the actual request/response sizes and transport latency.
+pub(crate) fn append_walletcore_rpc_telemetry(
+    event: &str,
+    route: &str,
+    request_bytes: usize,
+    response_bytes: Option<usize>,
+    elapsed_ms: u128,
+    status: Option<u16>,
+    error: Option<&str>,
+) {
+    use std::io::Write;
+
+    let Ok(raw_path) = std::env::var("WALLETCORE_RPC_TELEMETRY_PATH") else {
+        return;
+    };
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        return;
+    }
+
+    let path = std::path::Path::new(raw_path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let line = serde_json::json!({
+        "timestamp_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        "event": event,
+        "route": route,
+        "request_bytes": request_bytes,
+        "response_bytes": response_bytes,
+        "elapsed_ms": elapsed_ms,
+        "status": status,
+        "error": error,
+    });
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Module-friendly logging helper.
 ///
 /// Prefer calling this from submodules instead of relying on `macro_rules!`
@@ -1644,23 +1696,53 @@ impl BlockingRpcTransport {
     }
 
     fn post_bin(&self, route: &str, body: Vec<u8>) -> Result<Vec<u8>, RpcError> {
+        let request_bytes = body.len();
+        let started = std::time::Instant::now();
         if bulk_bin_debug_enabled() {
             println!("🧩 rpc(bin) POST route={}", route);
         }
-        let response = self
-            .request_for_bin(route)
-            .send_bytes(&body)
-            .map_err(|err| map_ureq_error(route, err))?;
-        println!(
-            "🧭 rpc(bin) HTTP status={} route={}",
-            response.status(),
-            route
-        );
+        let response = match self.request_for_bin(route).send_bytes(&body) {
+            Ok(response) => response,
+            Err(err) => {
+                let error = err.to_string();
+                append_walletcore_rpc_telemetry(
+                    "rpc_bin",
+                    route,
+                    request_bytes,
+                    None,
+                    started.elapsed().as_millis(),
+                    None,
+                    Some(&error),
+                );
+                return Err(map_ureq_error(route, err));
+            }
+        };
+        let status = response.status();
+        println!("🧭 rpc(bin) HTTP status={} route={}", status, route);
         let mut reader = response.into_reader();
         let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
+        if let Err(err) = reader.read_to_end(&mut buf) {
+            let error = err.to_string();
+            append_walletcore_rpc_telemetry(
+                "rpc_bin",
+                route,
+                request_bytes,
+                None,
+                started.elapsed().as_millis(),
+                Some(status),
+                Some(&error),
+            );
+            return Err(RpcError::InterfaceError(error));
+        }
+        append_walletcore_rpc_telemetry(
+            "rpc_bin",
+            route,
+            request_bytes,
+            Some(buf.len()),
+            started.elapsed().as_millis(),
+            Some(status),
+            None,
+        );
         Ok(buf)
     }
 

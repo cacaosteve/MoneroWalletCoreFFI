@@ -196,6 +196,15 @@ fn block_fetch_retry_delay(attempt: u32) -> Duration {
 fn maybe_retry_block_fetch(id: &str, err: &str, fetch_retries: &mut u32) -> bool {
     if is_transient_block_fetch_error(err) && *fetch_retries < BLOCK_FETCH_RETRY_LIMIT {
         *fetch_retries += 1;
+        append_walletcore_rpc_telemetry(
+            "retry",
+            "contiguous_scannable_blocks",
+            0,
+            None,
+            0,
+            None,
+            Some(err),
+        );
         wc_log_line_android_or_stdout(&format!(
             "🧭 wallet_refresh stage=contiguous_scannable_blocks_retry wallet_id={} attempt={} err={}",
             id, fetch_retries, err
