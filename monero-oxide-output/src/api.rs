@@ -12,15 +12,15 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    wallet_derive_subaddress_from_mnemonic, wallet_export_cache, wallet_generate_mnemonic_english,
-    wallet_get_balance, wallet_get_balance_with_filter, wallet_import_cache,
-    wallet_list_transfers_json, wallet_open_from_mnemonic, wallet_prepare_send,
-    wallet_prepare_send_with_filter, wallet_prepare_sweep, wallet_prepare_sweep_with_filter,
-    wallet_preview_fee, wallet_preview_fee_with_filter, wallet_preview_sweep,
-    wallet_preview_sweep_with_filter, wallet_primary_address_from_mnemonic, wallet_refresh_async,
-    wallet_refresh_cancel, wallet_relay_prepared, wallet_reset_tracked_outputs, wallet_send,
-    wallet_set_gap_limit, wallet_sweep, wallet_sync_status, walletcore_free_cstr,
-    walletcore_last_error_message, walletcore_version,
+    wallet_derive_subaddress_from_mnemonic, wallet_export_cache, wallet_force_rescan_from_height,
+    wallet_generate_mnemonic_english, wallet_get_balance, wallet_get_balance_with_filter,
+    wallet_import_cache, wallet_list_transfers_json, wallet_open_from_mnemonic,
+    wallet_prepare_send, wallet_prepare_send_with_filter, wallet_prepare_sweep,
+    wallet_prepare_sweep_with_filter, wallet_preview_fee, wallet_preview_fee_with_filter,
+    wallet_preview_sweep, wallet_preview_sweep_with_filter, wallet_primary_address_from_mnemonic,
+    wallet_refresh_async, wallet_refresh_cancel, wallet_relay_prepared,
+    wallet_reset_tracked_outputs, wallet_send, wallet_set_gap_limit, wallet_sweep,
+    wallet_sync_status, walletcore_free_cstr, walletcore_last_error_message, walletcore_version,
 };
 
 pub use crate::ffi::refresh::RefreshJob;
@@ -342,6 +342,15 @@ pub fn export_cache(wallet_id: &str) -> Result<Vec<u8>> {
 pub fn reset_tracked_outputs(wallet_id: &str) -> Result<()> {
     let id = cstr(wallet_id.trim())?;
     check(wallet_reset_tracked_outputs(id.as_ptr()))
+}
+
+/// Reset wallet scan state and begin again from the requested restore height.
+pub fn force_rescan_from_height(wallet_id: &str, new_restore_height: u64) -> Result<()> {
+    let id = cstr(wallet_id.trim())?;
+    check(wallet_force_rescan_from_height(
+        id.as_ptr(),
+        new_restore_height,
+    ))
 }
 
 fn take_required(ptr: *mut c_char) -> Result<String> {
