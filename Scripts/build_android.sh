@@ -4,7 +4,7 @@
 # Build Android shared libraries (.so) for the Rust `monerowalletcore` crate using the Android NDK toolchain.
 #
 # Output layout (default):
-#   MoneroWalletCoreFFI/Artifacts/android/<abi>/libmonerowalletcore.so
+#   MoneroWalletCoreFFI/.build/artifacts/android/<abi>/libmonerowalletcore.so
 #
 # Requirements:
 # - Rust toolchain + cargo
@@ -17,7 +17,7 @@
 #   PROFILE                              : release|debug (default: release)
 #   CARGO_FEATURES                        : optional cargo features (space-separated), e.g. "compile-time-generators"
 #   ABIS                                 : optional comma-separated ABI list (default: arm64-v8a,x86_64)
-#   OUT_DIR                              : output root (default: MoneroWalletCoreFFI/Artifacts/android)
+#   OUT_DIR                              : output root (default: MoneroWalletCoreFFI/.build/artifacts/android)
 #
 # Optional post-build install step:
 #   INSTALL_TO_NEXAWAL_ANDROID            : if "1", copy built .so into nexawal-android *walletcore module* jniLibs
@@ -47,7 +47,7 @@ ANDROID_API="${ANDROID_API:-26}"
 PROFILE="${PROFILE:-release}"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 ABIS="${ABIS:-arm64-v8a,x86_64}"
-OUT_DIR="${OUT_DIR:-${ARTIFACTS_DIR}/android}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/.build/artifacts/android}"
 
 # Optional: install artifacts into nexawal-android after building
 INSTALL_TO_NEXAWAL_ANDROID="${INSTALL_TO_NEXAWAL_ANDROID:-0}"

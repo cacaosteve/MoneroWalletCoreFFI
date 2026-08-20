@@ -28,7 +28,12 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "MoneroWalletCore",
-            path: "Artifacts/MoneroWalletCore.xcframework"
+            // The XCFramework is generated from source by CI and published as a
+            // versioned release asset. Keeping it out of Git makes clones and
+            // SwiftPM dependency resolution much smaller while preserving the
+            // no-Rust-required Apple consumer experience.
+            url: "https://github.com/cacaosteve/MoneroWalletCoreFFI/releases/download/walletcore-v0.1.0/MoneroWalletCore.xcframework.zip",
+            checksum: "e866682f81569b2c14b804653f178f2731d91026799f32279a1021b80b573d40"
         ),
         clibTarget,
         .target(

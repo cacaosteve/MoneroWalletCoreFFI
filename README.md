@@ -4,14 +4,14 @@
 
 - Swift package / product name: `MoneroWalletCoreFFI`
 - Repository: `https://github.com/cacaosteve/MoneroWalletCoreFFI`
-- **Active consumer branch:** `main` (prebuilt Apple + Android artifacts)
+- **Active consumer branch:** `main` (source-first; Apple release assets are fetched by SwiftPM)
 - Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) `perf/scanner-hotpath-only` (pinned rev in `monero-oxide-output/Cargo.toml`)
 - Consumers: [nexawal](https://github.com/cacaosteve/nexawal) (SPM), [nexawal-android](https://github.com/cacaosteve/nexawal-android) (git submodule)
 - License: [MIT](LICENSE)
 
 Platform outputs:
-- Apple (iOS device + simulator + macOS): prebuilt `Artifacts/MoneroWalletCore.xcframework`
-- Android: `Artifacts/android/{arm64-v8a,x86_64}/libmonerowalletcore.so` via `Scripts/build_android.sh`
+- Apple (iOS device + simulator + macOS): versioned XCFramework release asset (`walletcore-v*`)
+- Android: source-built `.so` files under `.build/artifacts/android/{arm64-v8a,x86_64}/` via `Scripts/build_android.sh`
 - Linux (Vapor/server): system-installed `libmonerowalletcore.so` via `pkg-config`
 
 This README explains how to consume the package on Apple platforms, how Linux linking works, and how the native artifacts are built.
@@ -35,9 +35,9 @@ This README explains how to consume the package on Apple platforms, how Linux li
 
 You have two ways to consume this package:
 
-1) Apple (iOS and macOS) — Prebuilt xcframework (no Rust required)
-- The package contains `Artifacts/MoneroWalletCore.xcframework` and declares a binary target pointing to it.
-- When you add the package, SPM uses that xcframework directly.
+1) Apple (iOS and macOS) — Versioned release xcframework (no Rust required)
+- `Package.swift` points to the checked-in release URL and checksum for the current `walletcore-v*` asset.
+- When you add the package, SPM downloads and verifies that XCFramework. The binary is not stored in Git.
 
 2) Linux (Vapor) — System library (no Rust required)
 - The package declares a `systemLibrary` target `CLibMoneroWalletCore` that links against an installed `libmonerowalletcore.so`.
@@ -49,7 +49,7 @@ You have two ways to consume this package:
 - File > Add Packages… and paste `https://github.com/cacaosteve/MoneroWalletCoreFFI.git`
 - Prefer branch **`main`** (or pin a specific revision). This is what NexaWal uses.
 - Select the `MoneroWalletCoreFFI` library product.
-- That’s it — the xcframework is used automatically by SPM.
+- That’s it — SPM downloads and verifies the release XCFramework automatically.
 
 Notes:
 - Apple artifacts are built as static libraries in the xcframework (device + simulator + macOS), so you don’t need runtime search paths on iOS/macOS.
@@ -80,12 +80,17 @@ targets: [
 ### Android (NexaWal pattern)
 
 - Add this repo as a git submodule tracking `main`.
-- Copy (or Gradle-sync) `Artifacts/android/<abi>/libmonerowalletcore.so` into your module `jniLibs`.
-- Rebuild artifacts after core changes:
+- Copy (or Gradle-sync) `.build/artifacts/android/<abi>/libmonerowalletcore.so` into your module `jniLibs`.
+- Rebuild source artifacts after core changes:
 
 ```bash
-PROFILE=release INSTALL_TO_NEXAWAL_ANDROID=1 ./Scripts/build_android.sh
+PROFILE=release CARGO_FEATURES=compile-time-generators ./Scripts/build_android.sh
 ```
+
+The Android `.so` files are generated under `.build/artifacts/android/` and are
+not committed. Android consumers may use the matching `MoneroWalletCore-android.zip`
+release asset for a fast local build, while F-Droid and Wallet Scrutiny should
+use the from-source Gradle path documented by `nexawal-android`.
 
 ## Linux (Vapor) setup
 
@@ -143,7 +148,7 @@ After this, any Vapor app that adds `MoneroWalletCoreFFI` via SPM will compile a
 
 ## Can Linux be “automatic” like mac?
 
-- On Apple, SPM uses the xcframework committed in this package — seamless.
+- On Apple, SPM downloads the checksum-pinned XCFramework release asset — seamless.
 - On Linux, SPM’s `systemLibrary` requires the `.so` to be present on the build system. SPM does not fetch `.so` binaries the way it does xcframeworks.
 - The closest to “automatic” on Linux is to bake `libmonerowalletcore.so` (and `monerowalletcore.pc`) into your Docker base image (or AMI), so builds don’t need extra steps. That’s why we provide `Scripts/install_linux.sh`.
 
@@ -227,9 +232,11 @@ let address = try WalletCoreFFIClient.deriveAddressFromSeed(
 ## Scripts in this repo
 
 - `Scripts/build_xcframework.sh`
-  - Builds Apple static libs across supported Apple triples and packages `Artifacts/MoneroWalletCore.xcframework`.
+  - Builds Apple static libs across supported Apple triples and packages `.build/artifacts/MoneroWalletCore.xcframework`.
 - `Scripts/build_android.sh`
   - Builds Android `.so` artifacts for `arm64-v8a` and `x86_64` by default and can install them into `nexawal-android`.
+- `Scripts/package_release_artifacts.sh`
+  - Creates release zips, a build manifest, and SHA-256 checksums for CI/GitHub Releases.
 - `Scripts/install_linux.sh`
   - Installs `libmonerowalletcore.so`, `monerowalletcore.h`, and `monerowalletcore.pc` to a prefix (default `/usr/local`), and can be used in Docker/CI.
 
@@ -237,6 +244,11 @@ These scripts let you generate/update artifacts without manual Xcode/Rust setup 
 
 
 ## CI overview
+
+The `native-release.yml` workflow builds Apple and Android native outputs from
+source on pinned Rust/NDK toolchains. On a `walletcore-v*` tag it publishes the
+XCFramework and Android zip as release assets. Consumers never need to commit
+generated native binaries to this repository.
 
 - Continuous build on pushes/PRs (no releases) validates that artifacts build on Apple/Linux and uploads them per commit as workflow artifacts.
 - An optional release workflow (triggered on tags) can publish the xcframework zip and Linux tarballs as GitHub Release assets when you’re ready to version the artifacts.
@@ -268,7 +280,7 @@ Q: Can I keep using a “lib/release” folder inside the app repo?
 - You can, but you still need headers and `pkg-config` to make SPM aware of include/link flags, and you must ensure the runtime loader finds the `.so`. It’s usually simpler to install the library system‑wide (or bake into a Docker image) and let `pkg-config` do the rest.
 
 Q: Do Apple clients need Rust?
-- No. The xcframework is prebuilt and shipped in this package, so iOS/mac apps just add the package and go.
+- No. The XCFramework is built by CI and downloaded from the versioned release asset, so iOS/mac apps just add the package and go.
 
 ## License
 
