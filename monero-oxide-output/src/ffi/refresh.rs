@@ -1379,6 +1379,7 @@ fn wallet_refresh_impl(
     // Working state
     let mut working_outputs = snapshot.tracked_outputs.clone();
     let mut seen_outpoints = snapshot.seen_outpoints.clone();
+    let mut known_tx_fees = known_transaction_fees(&snapshot.tx_ledger);
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
 
     update_scan_progress(
@@ -2379,6 +2380,24 @@ fn wallet_refresh_impl(
                     _ => scannable.transactions.as_slice(),
                 };
 
+                // Fees are part of the pruned transaction data already fetched for scanning.
+                // Keep only this block's compact txid -> fee lookup; values are promoted to the
+                // wallet-level map only when a transaction receives to or spends from this wallet.
+                let mut block_tx_fees: HashMap<[u8; 32], u64> =
+                    HashMap::with_capacity(decoded_non_miner.len().saturating_add(1));
+                block_tx_fees.insert(miner_hash, 0);
+                for (txid, tx_ref) in scannable
+                    .block
+                    .transactions
+                    .iter()
+                    .copied()
+                    .zip(decoded_non_miner.iter())
+                {
+                    if let Some(fee) = transaction_network_fee(tx_ref) {
+                        block_tx_fees.insert(txid, fee);
+                    }
+                }
+
                 let apply_spend =
                     |tx_ref: &monero_wallet::transaction::Transaction<
                         monero_wallet::transaction::Pruned,
@@ -2386,7 +2405,8 @@ fn wallet_refresh_impl(
                      spend_txid: Option<[u8; 32]>,
                      working_outputs: &mut Vec<TrackedOutput>,
                      key_image_to_output_index: &HashMap<[u8; 32], usize>,
-                     spent_inputs_by_txid: &mut HashMap<[u8; 32], u64>| {
+                     spent_inputs_by_txid: &mut HashMap<[u8; 32], u64>,
+                     known_tx_fees: &mut HashMap<String, u64>| {
                         for input in &tx_ref.prefix().inputs {
                             if let monero_wallet::transaction::Input::ToKey { key_image, .. } =
                                 input
@@ -2431,6 +2451,11 @@ fn wallet_refresh_impl(
                                         }
                                         let e = spent_inputs_by_txid.entry(spend_txid).or_insert(0);
                                         *e = e.saturating_add(spent_amount);
+                                        if let Some(fee) = block_tx_fees.get(&spend_txid) {
+                                            known_tx_fees
+                                                .entry(hex_lowercase(&spend_txid))
+                                                .or_insert(*fee);
+                                        }
                                     }
                                     if walletcore_debug_spend_detect_enabled() {
                                         walletcore_log_line(
@@ -2482,6 +2507,7 @@ fn wallet_refresh_impl(
                         &mut working_outputs,
                         &key_image_to_output_index,
                         &mut spent_inputs_by_txid,
+                        &mut known_tx_fees,
                     );
                 }
 
@@ -2496,6 +2522,7 @@ fn wallet_refresh_impl(
                             &mut working_outputs,
                             &key_image_to_output_index,
                             &mut spent_inputs_by_txid,
+                            &mut known_tx_fees,
                         );
                     }
                 }
@@ -2697,6 +2724,12 @@ fn wallet_refresh_impl(
                         spending_txid: None,
                         spending_height: None,
                     });
+
+                    if let Some(fee) = block_tx_fees.get(&output.transaction()) {
+                        known_tx_fees
+                            .entry(hex_lowercase(&output.transaction()))
+                            .or_insert(*fee);
+                    }
 
                     outputs_added_in_batch = outputs_added_in_batch.saturating_add(1);
                 }
@@ -3100,6 +3133,7 @@ fn wallet_refresh_impl(
     let computed_ledger = rebuild_transfer_ledger(
         &working_outputs,
         &snapshot.pending_outgoing,
+        &known_tx_fees,
         daemon.top_block_timestamp,
     );
 

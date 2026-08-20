@@ -470,7 +470,10 @@ use monero_address::{
 };
 use monero_ed25519::{Point as EdPoint, Scalar as EdScalar};
 use monero_seed::{Language as MoneroSeedLanguage, Seed as MoneroSeed};
-use monero_wallet::{transaction::Timelock, ViewPair};
+use monero_wallet::{
+    transaction::{Input as MoneroInput, Pruned, Timelock, Transaction},
+    ViewPair,
+};
 
 pub(crate) fn fingerprint32(label: &str, bytes: &[u8]) -> String {
     use sha3::{Digest, Keccak256};
@@ -2423,7 +2426,7 @@ pub(crate) struct ObservedTransfer {
     txid: String,
     direction: String, // "in" | "out" | "self"
     amount: u64,       // piconero (positive; interpret via direction)
-    fee: Option<u64>,  // piconero (outgoing)
+    fee: Option<u64>,  // piconero (transaction network fee; informational for incoming)
     height: Option<u64>,
     timestamp: Option<u64>,
     confirmations: u64,
@@ -2447,7 +2450,7 @@ struct LedgerEntry {
     txid: String,
     direction: String, // "in" | "out" | "self"
     amount: u64,       // piconero (positive; interpret via direction)
-    fee: Option<u64>,  // piconero (outgoing)
+    fee: Option<u64>,  // piconero (transaction network fee; informational for incoming)
     height: Option<u64>,
     timestamp: Option<u64>,
     is_pending: bool,
@@ -2461,6 +2464,52 @@ struct TxLedgerAgg {
     is_coinbase: bool,
     spent: u64,
     spend_height: Option<u64>,
+}
+
+/// Return the network fee carried by transaction data that was already downloaded for scanning.
+///
+/// RingCT keeps the fee in the non-prunable proof base, while legacy v1 transactions expose
+/// amounts publicly and require input-total minus output-total. Coinbase transactions pay no fee.
+/// `None` is reserved for incomplete, malformed, or unsupported data.
+pub(crate) fn transaction_network_fee(tx: &Transaction<Pruned>) -> Option<u64> {
+    if matches!(tx.prefix().inputs.first(), Some(MoneroInput::Gen(_))) {
+        return Some(0);
+    }
+
+    match tx {
+        Transaction::V2 {
+            proofs: Some(proofs),
+            ..
+        } => Some(proofs.base.fee),
+        Transaction::V2 { proofs: None, .. } => None,
+        Transaction::V1 { prefix, .. } => {
+            let input_total = prefix.inputs.iter().try_fold(0u64, |total, input| {
+                let MoneroInput::ToKey {
+                    amount: Some(amount),
+                    ..
+                } = input
+                else {
+                    return None;
+                };
+                total.checked_add(*amount)
+            })?;
+            let output_total = prefix
+                .outputs
+                .iter()
+                .try_fold(0u64, |total, output| total.checked_add(output.amount?))?;
+            input_total.checked_sub(output_total)
+        }
+    }
+}
+
+/// Preserve fees already learned by a prior refresh or imported cache.
+pub(crate) fn known_transaction_fees(
+    ledger: &HashMap<String, LedgerEntry>,
+) -> HashMap<String, u64> {
+    ledger
+        .iter()
+        .filter_map(|(txid, entry)| entry.fee.map(|fee| (txid.clone(), fee)))
+        .collect()
 }
 
 fn bump_height(slot: &mut Option<u64>, height: u64) {
@@ -2484,6 +2533,7 @@ fn bump_height(slot: &mut Option<u64>, height: u64) {
 pub(crate) fn rebuild_transfer_ledger(
     outputs: &[TrackedOutput],
     pending_outgoing: &[PendingOutgoingTx],
+    known_fees: &HashMap<String, u64>,
     chain_time: u64,
 ) -> HashMap<String, LedgerEntry> {
     let mut by_txid: HashMap<String, TxLedgerAgg> = HashMap::new();
@@ -2565,6 +2615,7 @@ pub(crate) fn rebuild_transfer_ledger(
     let mut ledger: HashMap<String, LedgerEntry> = HashMap::new();
 
     for (txid, agg) in by_txid {
+        let fee = known_fees.get(&txid).copied();
         if agg.spent > 0 {
             ledger.insert(
                 txid.clone(),
@@ -2572,7 +2623,7 @@ pub(crate) fn rebuild_transfer_ledger(
                     txid,
                     direction: "out".to_string(),
                     amount: agg.spent.saturating_sub(agg.incoming),
-                    fee: None,
+                    fee,
                     height: agg.spend_height.or(agg.incoming_height),
                     timestamp,
                     is_pending: false,
@@ -2586,7 +2637,7 @@ pub(crate) fn rebuild_transfer_ledger(
                     txid,
                     direction: "in".to_string(),
                     amount: agg.incoming,
-                    fee: None,
+                    fee,
                     height: agg.incoming_height,
                     timestamp,
                     is_pending: false,
@@ -3455,7 +3506,35 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
 #[cfg(test)]
 mod ledger_rebuild_tests {
     use super::*;
-    use monero_wallet::transaction::Timelock;
+    use monero_wallet::{
+        ed25519::CompressedPoint,
+        ringct::{PrunedRctProofs, RctBase, RctType},
+        transaction::{Input, Output, Timelock, TransactionPrefix},
+    };
+
+    fn prefix(inputs: Vec<Input>, output_amounts: Vec<Option<u64>>) -> TransactionPrefix {
+        TransactionPrefix {
+            additional_timelock: Timelock::None,
+            inputs,
+            outputs: output_amounts
+                .into_iter()
+                .map(|amount| Output {
+                    amount,
+                    key: CompressedPoint::G,
+                    view_tag: None,
+                })
+                .collect(),
+            extra: vec![],
+        }
+    }
+
+    fn public_input(amount: Option<u64>) -> Input {
+        Input::ToKey {
+            amount,
+            key_offsets: vec![1],
+            key_image: CompressedPoint::H,
+        }
+    }
 
     fn out(
         tx_hash: [u8; 32],
@@ -3484,12 +3563,14 @@ mod ledger_rebuild_tests {
     fn receive_is_not_double_counted() {
         let tx = [1u8; 32];
         let outputs = vec![out(tx, 1_427_934_399, false, None, None)];
-        let first = rebuild_transfer_ledger(&outputs, &[], 0);
-        let second = rebuild_transfer_ledger(&outputs, &[], 0);
         let txid = hex_lowercase(&tx);
+        let known_fees = HashMap::from([(txid.clone(), 24_680_000)]);
+        let first = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
+        let second = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
         assert_eq!(first.get(&txid).map(|e| e.amount), Some(1_427_934_399));
         assert_eq!(second.get(&txid).map(|e| e.amount), Some(1_427_934_399));
         assert_eq!(first.get(&txid).map(|e| e.direction.as_str()), Some("in"));
+        assert_eq!(first.get(&txid).and_then(|e| e.fee), Some(24_680_000));
     }
 
     #[test]
@@ -3501,9 +3582,10 @@ mod ledger_rebuild_tests {
             out(incoming_tx, 8_042_082_635, true, Some(spend_tx), Some(20)),
             out(spend_tx, 6_997_642_635, false, None, None),
         ];
-        let ledger = rebuild_transfer_ledger(&outputs, &[], 0);
         let in_id = hex_lowercase(&incoming_tx);
         let out_id = hex_lowercase(&spend_tx);
+        let known_fees = HashMap::from([(out_id.clone(), 44_440_000)]);
+        let ledger = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
         assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
         assert_eq!(ledger.get(&in_id).map(|e| e.amount), Some(8_042_082_635));
         assert_eq!(
@@ -3511,6 +3593,7 @@ mod ledger_rebuild_tests {
             Some("out")
         );
         assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
+        assert_eq!(ledger.get(&out_id).and_then(|e| e.fee), Some(44_440_000));
     }
 
     #[test]
@@ -3524,7 +3607,7 @@ mod ledger_rebuild_tests {
         // Change output is created in the spend block.
         let mut outputs = outputs;
         outputs[1].block_height = 20;
-        let ledger = rebuild_transfer_ledger(&outputs, &[], 0);
+        let ledger = rebuild_transfer_ledger(&outputs, &[], &HashMap::new(), 0);
         let in_id = hex_lowercase(&incoming_tx);
         let out_id = hex_lowercase(&spend_tx);
         assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
@@ -3549,13 +3632,118 @@ mod ledger_rebuild_tests {
             fee: 44_440_000,
             created_at: 0,
         }];
-        let ledger = rebuild_transfer_ledger(&outputs, &pending, 0);
         let out_id = hex_lowercase(&spend_tx);
+        let known_fees = HashMap::from([(out_id.clone(), 44_440_000)]);
+        let ledger = rebuild_transfer_ledger(&outputs, &pending, &known_fees, 0);
         assert_eq!(
             ledger.get(&out_id).map(|e| e.direction.as_str()),
             Some("out")
         );
         assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
+        assert_eq!(ledger.get(&out_id).and_then(|e| e.fee), Some(44_440_000));
+        assert_eq!(ledger.get(&out_id).map(|e| e.is_pending), Some(false));
+    }
+
+    #[test]
+    fn pruned_ringct_fee_comes_from_proof_base() {
+        let tx = Transaction::<Pruned>::V2 {
+            prefix: prefix(vec![public_input(None)], vec![None]),
+            proofs: Some(PrunedRctProofs {
+                rct_type: RctType::ClsagBulletproofPlus,
+                base: RctBase {
+                    fee: 31_240_000,
+                    pseudo_outs: vec![],
+                    encrypted_amounts: vec![],
+                    commitments: vec![],
+                },
+            }),
+        };
+        assert_eq!(transaction_network_fee(&tx), Some(31_240_000));
+    }
+
+    #[test]
+    fn legacy_v1_fee_is_public_inputs_minus_outputs() {
+        let tx = Transaction::<Pruned>::V1 {
+            prefix: prefix(
+                vec![public_input(Some(9_000)), public_input(Some(3_000))],
+                vec![Some(10_750), Some(1_000)],
+            ),
+            signatures: (),
+        };
+        assert_eq!(transaction_network_fee(&tx), Some(250));
+    }
+
+    #[test]
+    fn coinbase_fee_is_zero() {
+        let tx = Transaction::<Pruned>::V1 {
+            prefix: prefix(vec![Input::Gen(100)], vec![Some(600_000_000_000)]),
+            signatures: (),
+        };
+        assert_eq!(transaction_network_fee(&tx), Some(0));
+    }
+
+    #[test]
+    fn malformed_or_incomplete_transaction_fee_is_none() {
+        let missing_ringct_proofs = Transaction::<Pruned>::V2 {
+            prefix: prefix(vec![public_input(None)], vec![None]),
+            proofs: None,
+        };
+        let legacy_underflow = Transaction::<Pruned>::V1 {
+            prefix: prefix(vec![public_input(Some(10))], vec![Some(11)]),
+            signatures: (),
+        };
+        assert_eq!(transaction_network_fee(&missing_ringct_proofs), None);
+        assert_eq!(transaction_network_fee(&legacy_underflow), None);
+    }
+
+    #[test]
+    fn cache_round_trip_preserves_fee_during_ledger_rebuild() {
+        let tx = [9u8; 32];
+        let txid = hex_lowercase(&tx);
+        let output = out(tx, 4_200_000_000, false, None, None);
+        let ledger = rebuild_transfer_ledger(
+            std::slice::from_ref(&output),
+            &[],
+            &HashMap::from([(txid.clone(), 28_760_000)]),
+            1_700_000_000,
+        );
+        let persisted = PersistedWallet {
+            cache_version: WALLETCORE_CACHE_VERSION,
+            network: PersistedNetwork::Mainnet,
+            restore_height: 1,
+            last_scanned: 10,
+            total: output.amount,
+            unlocked: output.amount,
+            chain_height: 20,
+            chain_time: 1_700_000_000,
+            gap_limit: 50,
+            tracked_outputs: vec![PersistedOutput::from(&output)],
+            seen_outpoints: vec![(output.tx_hash, output.index_in_tx)],
+            pending_outgoing: vec![],
+            tx_ledger: ledger,
+            invalid_input_quarantine: vec![],
+            recent_block_hashes_start_height: 1,
+            recent_block_hashes: vec![],
+        };
+
+        let bytes = bincode::serialize(&persisted).expect("serialize cache");
+        let decoded: PersistedWallet = bincode::deserialize(&bytes).expect("deserialize cache");
+        let known_fees = known_transaction_fees(&decoded.tx_ledger);
+        let outputs: Vec<TrackedOutput> = decoded
+            .tracked_outputs
+            .into_iter()
+            .map(TrackedOutput::from)
+            .collect();
+        let rebuilt = rebuild_transfer_ledger(
+            &outputs,
+            &decoded.pending_outgoing,
+            &known_fees,
+            decoded.chain_time,
+        );
+        assert_eq!(
+            rebuilt.get(&txid).and_then(|entry| entry.fee),
+            Some(28_760_000)
+        );
     }
 }
 

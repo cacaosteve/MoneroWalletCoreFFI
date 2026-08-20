@@ -75,9 +75,11 @@ pub extern "C" fn wallet_import_cache(
 
             // Rebuild from tracked outputs on every import. Previous incoming-only rebuild
             // overwrote spend rows with change-as-receive and ignored outgoing net amounts.
+            let known_fees = known_transaction_fees(&state.tx_ledger);
             state.tx_ledger = rebuild_transfer_ledger(
                 &state.tracked_outputs,
                 &state.pending_outgoing,
+                &known_fees,
                 state.chain_time,
             );
 

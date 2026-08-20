@@ -32,6 +32,7 @@ pub(crate) use crate::{
     is_failed_send_raw_tx_error,
     is_http_client_failed_error,
     is_invalid_input_send_raw_tx_error,
+    known_transaction_fees,
     last_error_clone,
     // Binary-decoy provider constructor.
     make_bin_decoy_daemon,
@@ -50,6 +51,7 @@ pub(crate) use crate::{
     // Shared key image derivation helper (used by refresh + send).
     support::key_image::derive_key_image_bytes,
 
+    transaction_network_fee,
     update_scan_progress,
     // Debugging helpers.
     walletcore_debug_dump_tracked_outputs,
