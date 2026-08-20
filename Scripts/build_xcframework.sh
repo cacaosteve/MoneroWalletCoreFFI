@@ -120,7 +120,11 @@ build_target() {
       )
       ;;
   esac
-  (cd "${CRATE_DIR}" && env "${extra_env[@]}" "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+  if [[ "${#extra_env[@]}" -gt 0 ]]; then
+    (cd "${CRATE_DIR}" && env "${extra_env[@]}" "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+  else
+    (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+  fi
 }
 
 lib_path_for() {
