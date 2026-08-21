@@ -22,6 +22,10 @@ This README explains how to consume the package on Apple platforms, how Linux li
 - Pruned block ownership scans run concurrently, with results applied and checkpointed in block
   order. The automatic limit is eight workers on desktop and four on iOS/Android; set
   `WALLETCORE_SCAN_PAR=1` for the serial baseline or a positive value to override the worker count.
+- Desktop, Catalyst, and server builds default to 500-block range responses with ordered parallel
+  response decoding. iOS and Android retain the 75-block, serial-decoding memory profile.
+  `WALLETCORE_BULK_FETCH_BATCH`, `WALLETCORE_UPSTREAM_BLOCK_BATCH`, and
+  `WALLETCORE_RANGE_DECODE_PAR` remain available as explicit diagnostic overrides.
 - Balance, transfers, subaddress derivation, fee preview
 - Send / sweep via **prepare → durable local persist → relay** (apps recover pending prepares across relaunch)
 - Secret hygiene: in-memory keys (not a long-lived mnemonic string); KI/amount diagnostic dumps are env-gated

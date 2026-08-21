@@ -456,7 +456,7 @@ fn configured_scan_parallelism(available: usize, configured: Option<&str>) -> us
 fn configured_upstream_block_batch(configured: Option<&str>) -> u64 {
     configured
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(75)
+        .unwrap_or_else(|| crate::default_range_block_batch() as u64)
         .clamp(1, MAX_UPSTREAM_BLOCK_BATCH)
 }
 
@@ -470,17 +470,32 @@ fn scan_parallelism_from_env() -> usize {
     )
 }
 
-fn range_decode_parallel_enabled() -> bool {
-    std::env::var("WALLETCORE_RANGE_DECODE_PAR")
-        .ok()
+const fn default_range_decode_parallel_enabled() -> bool {
+    !cfg!(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))
+}
+
+fn configured_range_decode_parallel(configured: Option<&str>, default: bool) -> bool {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(|value| {
-            let value = value.trim();
-            !value.is_empty()
-                && value != "0"
+            value != "0"
                 && !value.eq_ignore_ascii_case("false")
                 && !value.eq_ignore_ascii_case("off")
         })
-        .unwrap_or(false)
+        .unwrap_or(default)
+}
+
+fn range_decode_parallel_enabled() -> bool {
+    configured_range_decode_parallel(
+        std::env::var("WALLETCORE_RANGE_DECODE_PAR").ok().as_deref(),
+        default_range_decode_parallel_enabled(),
+    )
 }
 
 /// Perform only monero-oxide's read-only ownership scan in parallel. Results are flattened in
@@ -1410,7 +1425,7 @@ fn wallet_refresh_impl(
         .unwrap_or_else(|| "(default=range)".to_string());
     let env_bulk_fetch_batch = std::env::var("WALLETCORE_BULK_FETCH_BATCH")
         .ok()
-        .unwrap_or_else(|| "(default=75)".to_string());
+        .unwrap_or_else(|| format!("(default={})", crate::default_range_block_batch()));
 
     wc_log_line_android_or_stdout(&format!(
         "🧩 walletcore refresh entry: version={} build={} wallet_id={} node_url={} env{{scan_par={} scan_batch={} bulk_fetch={} bulk_mode={} bulk_fetch_batch={}}}",
@@ -1779,7 +1794,7 @@ fn wallet_refresh_impl(
     let _batch: usize = std::env::var("WALLETCORE_SCAN_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(75);
+        .unwrap_or_else(crate::default_range_block_batch);
     let _bulk_rpc: bool = std::env::var("WALLETCORE_BULK_RPC")
         .ok()
         .map(|s| s != "0")
@@ -3611,8 +3626,9 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     use super::clear_stale_prefetches;
     use super::{
-        automatic_scan_parallelism, commit_refresh_checkpoint, configured_scan_parallelism,
-        configured_upstream_block_batch, decode_range_block_entry, decode_range_transaction,
+        automatic_scan_parallelism, commit_refresh_checkpoint, configured_range_decode_parallel,
+        configured_scan_parallelism, configured_upstream_block_batch, decode_range_block_entry,
+        decode_range_transaction, default_range_decode_parallel_enabled,
         fetch_scannable_blocks_range_bin, finish_refresh_job, is_json_batch_or_shape_error,
         is_transient_block_fetch_error, next_height_after_response, scan_blocks_parallel_ordered,
         try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
@@ -3710,12 +3726,25 @@ mod tests {
 
     #[test]
     fn upstream_block_batch_defaults_and_override_are_bounded() {
-        assert_eq!(configured_upstream_block_batch(None), 75);
-        assert_eq!(configured_upstream_block_batch(Some("invalid")), 75);
+        let default = crate::default_range_block_batch() as u64;
+        assert_eq!(configured_upstream_block_batch(None), default);
+        assert_eq!(configured_upstream_block_batch(Some("invalid")), default);
         assert_eq!(configured_upstream_block_batch(Some("0")), 1);
         assert_eq!(configured_upstream_block_batch(Some("750")), 750);
         assert_eq!(configured_upstream_block_batch(Some("1000")), 1_000);
         assert_eq!(configured_upstream_block_batch(Some("2000")), 1_000);
+    }
+
+    #[test]
+    fn range_decode_parallel_default_and_override_are_explicit() {
+        let default = default_range_decode_parallel_enabled();
+        assert_eq!(configured_range_decode_parallel(None, default), default);
+        assert_eq!(configured_range_decode_parallel(Some(""), default), default);
+        assert!(configured_range_decode_parallel(Some("1"), false));
+        assert!(configured_range_decode_parallel(Some("true"), false));
+        assert!(!configured_range_decode_parallel(Some("0"), true));
+        assert!(!configured_range_decode_parallel(Some("false"), true));
+        assert!(!configured_range_decode_parallel(Some("off"), true));
     }
 
     #[test]

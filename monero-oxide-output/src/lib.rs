@@ -448,12 +448,27 @@ pub(crate) fn bulk_fetch_mode_from_env() -> BulkFetchMode {
 }
 
 #[inline]
+pub(crate) const fn default_range_block_batch() -> usize {
+    if cfg!(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )) {
+        75
+    } else {
+        500
+    }
+}
+
+#[inline]
 pub(crate) fn bulk_fetch_batch_from_env() -> usize {
-    // Default 75, clamped to a sane range
+    // Larger desktop responses substantially reduce RPC round trips. Mobile keeps the
+    // established smaller memory envelope unless a consumer explicitly overrides it.
     let v = std::env::var("WALLETCORE_BULK_FETCH_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(75);
+        .unwrap_or_else(default_range_block_batch);
     v.clamp(10, 2000)
 }
 
