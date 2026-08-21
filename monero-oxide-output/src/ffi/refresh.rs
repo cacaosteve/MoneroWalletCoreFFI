@@ -25,6 +25,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn next_height_after_response(start_height: u64, returned_blocks: usize) -> u64 {
+    start_height.saturating_add(u64::try_from(returned_blocks).unwrap_or(u64::MAX))
+}
+
+#[cfg(not(target_os = "android"))]
+fn clear_stale_prefetches<Ready, Pending>(
+    ready: &mut VecDeque<Ready>,
+    in_flight: &mut VecDeque<tokio::task::JoinHandle<Pending>>,
+) -> (usize, usize) {
+    let discarded_ready = ready.len();
+    ready.clear();
+
+    let aborted_in_flight = in_flight.len();
+    for handle in in_flight.drain(..) {
+        handle.abort();
+    }
+
+    (discarded_ready, aborted_in_flight)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshJob {
     Idle,
@@ -1810,6 +1830,25 @@ fn wallet_refresh_impl(
                             batch_fetch_rpc_ms = pf_rpc_ms;
                             pf_vec
                         } else {
+                            // Every later speculative range was based on the same stale cursor.
+                            // Drop it before fetching from the actual scan cursor.
+                            let (discarded_ready, aborted_in_flight) = clear_stale_prefetches(
+                                &mut next_scannables_q,
+                                &mut prefetch_in_flight,
+                            );
+                            if log_batch_events {
+                                wc_log_line_android_or_stdout(&format!(
+                                    "🧭 wallet_refresh stage=prefetch_rebase wallet_id={} reason=range_mismatch expected={}..={} received={}..={} discarded_ready={} aborted_in_flight={}",
+                                    id,
+                                    start_bn_u64,
+                                    end_bn_inclusive_u64,
+                                    pf_start,
+                                    pf_end,
+                                    discarded_ready,
+                                    aborted_in_flight
+                                ));
+                            }
+
                             // Prefetch mismatch; fetch synchronously (with hard timeout).
                             let fetch_t0 = Instant::now();
                             let start_bn_local = start_bn;
@@ -2340,11 +2379,33 @@ fn wallet_refresh_impl(
             }
             let actual_end_bn_inclusive =
                 start_bn.saturating_add(scannables.len().saturating_sub(1));
+            let actual_next_height = next_height_after_response(start_bn_u64, scannables.len());
+
+            // Daemons may legally stop get_blocks.bin before the requested end because of
+            // response-size or transaction-count limits. Any deeper speculative requests were
+            // calculated from the requested end and now leave a gap, so cancel them and rebase
+            // the pipeline on the first height the daemon did not return.
+            #[cfg(not(target_os = "android"))]
+            if actual_next_height != end_exclusive {
+                let (discarded_ready, aborted_in_flight) =
+                    clear_stale_prefetches(&mut next_scannables_q, &mut prefetch_in_flight);
+                if log_batch_events || discarded_ready > 0 || aborted_in_flight > 0 {
+                    wc_log_line_android_or_stdout(&format!(
+                        "🧭 wallet_refresh stage=prefetch_rebase wallet_id={} reason=partial_response requested_next={} actual_next={} returned_blocks={} discarded_ready={} aborted_in_flight={}",
+                        id,
+                        end_exclusive,
+                        actual_next_height,
+                        scannables.len(),
+                        discarded_ready,
+                        aborted_in_flight
+                    ));
+                }
+            }
 
             // Ensure prefetch depth (non-Android only).
             #[cfg(not(target_os = "android"))]
             {
-                let mut cursor_for_prefetch = end_exclusive;
+                let mut cursor_for_prefetch = actual_next_height;
                 for _ in next_scannables_q.iter() {
                     cursor_for_prefetch = cursor_for_prefetch.saturating_add(upstream_block_batch);
                 }
@@ -3416,11 +3477,14 @@ fn wallet_refresh_impl(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "android"))]
+    use super::clear_stale_prefetches;
     use super::{
         automatic_scan_parallelism, commit_refresh_checkpoint, configured_scan_parallelism,
         decode_range_transaction, fetch_scannable_blocks_range_bin, finish_refresh_job,
-        is_json_batch_or_shape_error, is_transient_block_fetch_error, scan_blocks_parallel_ordered,
-        try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
+        is_json_batch_or_shape_error, is_transient_block_fetch_error, next_height_after_response,
+        scan_blocks_parallel_ordered, try_start_refresh_job, with_refresh_stopped, RangeFetchError,
+        RefreshJob,
     };
     use crate::support::{
         refresh_cancelled_for_wallet, set_refresh_cancel_for_wallet, RpcClient, TrackedOutput,
@@ -3431,7 +3495,7 @@ mod tests {
     use monero_wallet::block::{Block as MoneroBlock, BlockHeader};
     use monero_wallet::transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix};
     use monero_wallet::{ScanError, Scanner};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::CString;
 
     const TEST_MNEMONIC: &str =
@@ -3510,6 +3574,39 @@ mod tests {
             configured_scan_parallelism(8, Some("invalid")),
             automatic_scan_parallelism(8)
         );
+    }
+
+    #[test]
+    fn partial_response_rebases_prefetch_on_actual_next_height() {
+        let start = 3_519_450;
+        let requested_end_exclusive = start + 500;
+
+        assert_eq!(
+            next_height_after_response(start, 500),
+            requested_end_exclusive
+        );
+        assert_eq!(next_height_after_response(start, 287), start + 287);
+        assert_ne!(
+            next_height_after_response(start, 287),
+            requested_end_exclusive
+        );
+        assert_eq!(next_height_after_response(u64::MAX - 1, 2), u64::MAX);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn stale_prefetch_pipeline_is_discarded_and_aborted() {
+        let mut ready = VecDeque::from([1u8, 2u8]);
+        let mut in_flight = VecDeque::from([
+            crate::TOKIO_RUNTIME.spawn(std::future::pending::<()>()),
+            crate::TOKIO_RUNTIME.spawn(std::future::pending::<()>()),
+        ]);
+
+        let counts = clear_stale_prefetches(&mut ready, &mut in_flight);
+
+        assert_eq!(counts, (2, 2));
+        assert!(ready.is_empty());
+        assert!(in_flight.is_empty());
     }
 
     #[test]
