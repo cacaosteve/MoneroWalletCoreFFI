@@ -10,6 +10,7 @@
 
 pub(crate) use crate::{
     // Logging (module-friendly function; prefer this from submodules).
+    append_walletcore_range_decode_telemetry,
     append_walletcore_rpc_telemetry,
     // Broadcast helper (uses /send_raw_transaction).
     broadcast_send_raw_transaction,

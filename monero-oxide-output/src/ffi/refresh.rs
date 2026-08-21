@@ -248,6 +248,7 @@ fn try_json_batch_error_fallback(
     end_bn_inclusive: usize,
     bulk_fetch_mode: BulkFetchMode,
     err_s: &str,
+    decode_pool: Option<&rayon::ThreadPool>,
 ) -> Option<(Vec<ScannableBlock>, bool)> {
     if !is_json_batch_or_shape_error(err_s) {
         return None;
@@ -258,7 +259,13 @@ fn try_json_batch_error_fallback(
             "🧭 wallet_refresh stage=fetch_range_bin_fallback start={} end={}",
             start_bn, end_bn_inclusive
         ));
-        match fetch_scannable_blocks_range_bin(rpc_client, base_url, start_bn, end_bn_inclusive) {
+        match fetch_scannable_blocks_range_bin(
+            rpc_client,
+            base_url,
+            start_bn,
+            end_bn_inclusive,
+            decode_pool,
+        ) {
             Ok(blocks) if !blocks.is_empty() => {
                 wc_log_line_android_or_stdout(&format!(
                     "🧭 wallet_refresh stage=fetch_range_bin_fallback_ok blocks={}",
@@ -461,6 +468,19 @@ fn scan_parallelism_from_env() -> usize {
         available,
         std::env::var("WALLETCORE_SCAN_PAR").ok().as_deref(),
     )
+}
+
+fn range_decode_parallel_enabled() -> bool {
+    std::env::var("WALLETCORE_RANGE_DECODE_PAR")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
 }
 
 /// Perform only monero-oxide's read-only ownership scan in parallel. Results are flattened in
@@ -711,12 +731,70 @@ fn decode_range_transaction(
     Ok(Transaction::from(tx_full))
 }
 
+struct DecodedRangeBlock {
+    block: MoneroBlock,
+    transactions: Vec<Transaction<Pruned>>,
+}
+
+/// Decode one block entry without touching shared wallet state or making fallback RPC calls.
+/// Keeping this phase pure allows a response's blocks to be decoded concurrently while the
+/// indexed parallel iterator preserves daemon order for the sequential finalization phase.
+fn decode_range_block_entry(
+    block_idx: usize,
+    entry: crate::support::bulk_models::BlockCompleteEntry,
+) -> Result<DecodedRangeBlock, RangeFetchError> {
+    let mut block_reader: &[u8] = entry.block.as_slice();
+    let block = MoneroBlock::read(&mut block_reader).map_err(|error| {
+        RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] decode failed: {error}"
+        ))
+    })?;
+    if !block_reader.is_empty() {
+        return Err(RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] had {} trailing bytes",
+            block_reader.len()
+        ))
+        .into());
+    }
+
+    if block.transactions.len() != entry.txs.len() {
+        return Err(RpcError::InvalidInterface(format!(
+            "range get_blocks.bin block[{block_idx}] had {} tx hashes but {} tx blobs",
+            block.transactions.len(),
+            entry.txs.len()
+        ))
+        .into());
+    }
+
+    let mut transactions = Vec::with_capacity(entry.txs.len());
+    for (tx_idx, (expected_hash, tx_entry)) in block
+        .transactions
+        .iter()
+        .zip(entry.txs.into_iter())
+        .enumerate()
+    {
+        transactions.push(decode_range_transaction(
+            &tx_entry.blob,
+            tx_entry.prunable_hash,
+            *expected_hash,
+            block_idx,
+            tx_idx,
+        )?);
+    }
+
+    Ok(DecodedRangeBlock {
+        block,
+        transactions,
+    })
+}
+
 fn fetch_scannable_blocks_range_bin_with_prune(
     rpc_client: &RpcClient,
     base_url: &str,
     start_bn: usize,
     end_bn_inclusive: usize,
     prune: bool,
+    decode_pool: Option<&rayon::ThreadPool>,
 ) -> Result<Vec<ScannableBlock>, RangeFetchError> {
     let requested_blocks = end_bn_inclusive
         .checked_sub(start_bn)
@@ -783,59 +861,53 @@ fn fetch_scannable_blocks_range_bin_with_prune(
     }
 
     let output_indices_by_block = resp.output_indices.unwrap_or_default();
-    let mut out = Vec::with_capacity(resp.blocks.len());
+    let decode_started = Instant::now();
+    let decode_threads = decode_pool
+        .map(rayon::ThreadPool::current_num_threads)
+        .unwrap_or(1);
+    let decode_mode = if decode_pool.is_some() {
+        "parallel-shared"
+    } else {
+        "serial"
+    };
+    let decoded_results: Vec<Result<DecodedRangeBlock, RangeFetchError>> =
+        if let Some(pool) = decode_pool {
+            pool.install(|| {
+                resp.blocks
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(block_idx, entry)| decode_range_block_entry(block_idx, entry))
+                    .collect()
+            })
+        } else {
+            resp.blocks
+                .into_iter()
+                .enumerate()
+                .map(|(block_idx, entry)| decode_range_block_entry(block_idx, entry))
+                .collect()
+        };
+    let mut decoded_blocks = Vec::with_capacity(decoded_results.len());
+    for result in decoded_results {
+        decoded_blocks.push(result?);
+    }
+    let decode_ms = decode_started.elapsed().as_millis();
+    let transaction_count = decoded_blocks
+        .iter()
+        .map(|decoded| decoded.transactions.len())
+        .sum::<usize>();
+    let finalize_started = Instant::now();
+    let mut out = Vec::with_capacity(decoded_blocks.len());
 
-    for (block_idx, entry) in resp.blocks.into_iter().enumerate() {
-        let mut block_reader: &[u8] = entry.block.as_slice();
-        let block = MoneroBlock::read(&mut block_reader).map_err(|e| {
-            RpcError::InvalidInterface(format!(
-                "range get_blocks.bin block[{block_idx}] decode failed: {e}"
-            ))
-        })?;
-        if !block_reader.is_empty() {
-            return Err(RpcError::InvalidInterface(format!(
-                "range get_blocks.bin block[{block_idx}] had {} trailing bytes",
-                block_reader.len()
-            ))
-            .into());
-        }
-
-        if block.transactions.len() != entry.txs.len() {
-            return Err(RpcError::InvalidInterface(format!(
-                "range get_blocks.bin block[{block_idx}] had {} tx hashes but {} tx blobs",
-                block.transactions.len(),
-                entry.txs.len()
-            ))
-            .into());
-        }
-
-        if block_idx == 0 {
-            wc_log_line_android_or_stdout(&format!(
-                "🧭 range_get_blocks_bin block_ok block_idx=0 tx_hashes={} tx_blobs={}",
-                block.transactions.len(),
-                entry.txs.len()
-            ));
-        }
-
-        let mut transactions: Vec<Transaction<Pruned>> = Vec::with_capacity(entry.txs.len());
-        for (tx_idx, (expected_hash, tx_entry)) in block
-            .transactions
-            .iter()
-            .zip(entry.txs.into_iter())
-            .enumerate()
-        {
-            transactions.push(decode_range_transaction(
-                &tx_entry.blob,
-                tx_entry.prunable_hash,
-                *expected_hash,
-                block_idx,
-                tx_idx,
-            )?);
-        }
+    for (block_idx, decoded) in decoded_blocks.into_iter().enumerate() {
+        let DecodedRangeBlock {
+            block,
+            transactions,
+        } = decoded;
 
         if block_idx == 0 {
             wc_log_line_android_or_stdout(&format!(
-                "🧭 range_get_blocks_bin txs_ok block_idx=0 txs={}",
+                "🧭 range_get_blocks_bin decoded block_idx=0 tx_hashes={} txs={}",
+                block.transactions.len(),
                 transactions.len()
             ));
         }
@@ -930,6 +1002,26 @@ fn fetch_scannable_blocks_range_bin_with_prune(
         });
     }
 
+    let finalize_ms = finalize_started.elapsed().as_millis();
+    append_walletcore_range_decode_telemetry(
+        decode_mode,
+        decode_threads,
+        out.len(),
+        transaction_count,
+        decode_ms,
+        finalize_ms,
+    );
+    wc_log_line_android_or_stdout(&format!(
+        "⏱️ range_get_blocks_bin stage=decode_timing mode={} threads={} blocks={} txs={} decode_ms={} finalize_ms={} total_ms={}",
+        decode_mode,
+        decode_threads,
+        out.len(),
+        transaction_count,
+        decode_ms,
+        finalize_ms,
+        decode_ms.saturating_add(finalize_ms)
+    ));
+
     Ok(out)
 }
 
@@ -938,6 +1030,7 @@ fn fetch_scannable_blocks_range_bin(
     base_url: &str,
     start_bn: usize,
     end_bn_inclusive: usize,
+    decode_pool: Option<&rayon::ThreadPool>,
 ) -> Result<Vec<ScannableBlock>, RpcError> {
     match fetch_scannable_blocks_range_bin_with_prune(
         rpc_client,
@@ -945,6 +1038,7 @@ fn fetch_scannable_blocks_range_bin(
         start_bn,
         end_bn_inclusive,
         true,
+        decode_pool,
     ) {
         Ok(blocks) => Ok(blocks),
         Err(RangeFetchError::RetryUnpruned(pruned_error)) => {
@@ -958,6 +1052,7 @@ fn fetch_scannable_blocks_range_bin(
                 start_bn,
                 end_bn_inclusive,
                 false,
+                decode_pool,
             ) {
                 Ok(blocks) => Ok(blocks),
                 Err(RangeFetchError::Rpc(error) | RangeFetchError::RetryUnpruned(error)) => {
@@ -1048,6 +1143,7 @@ impl AndroidContiguousFetchWorker {
                         &base_url,
                         start_bn,
                         end_bn_inclusive,
+                        None,
                     ),
                     _ => TOKIO_RUNTIME.block_on(async {
                         client
@@ -1068,6 +1164,7 @@ impl AndroidContiguousFetchWorker {
                                 &base_url,
                                 start_bn,
                                 end_bn_inclusive,
+                                None,
                             ),
                             _ => TOKIO_RUNTIME.block_on(async {
                                 client
@@ -1629,7 +1726,7 @@ fn wallet_refresh_impl(
             .thread_name(|index| format!("walletcore-scan-{index}"))
             .build()
         {
-            Ok(pool) => Some(pool),
+            Ok(pool) => Some(std::sync::Arc::new(pool)),
             Err(err) => {
                 wc_log_line_android_or_stdout(&format!(
                     "⚠️ wallet_refresh stage=parallel_scan_pool_failed wallet_id={} requested_threads={} err={} fallback=serial",
@@ -1643,8 +1740,13 @@ fn wallet_refresh_impl(
     };
     let effective_scan_parallelism = scan_pool
         .as_ref()
-        .map(rayon::ThreadPool::current_num_threads)
+        .map(|pool| pool.current_num_threads())
         .unwrap_or(1);
+    let range_decode_pool = if !cfg!(target_os = "android") && range_decode_parallel_enabled() {
+        scan_pool.clone()
+    } else {
+        None
+    };
     let scan_parallelism_line = format!(
         "🧵 wallet_refresh stage=parallel_scan_config wallet_id={} threads={} mode={}",
         id,
@@ -1657,6 +1759,21 @@ fn wallet_refresh_impl(
     );
     walletcore_log_line(id, snapshot.network, &scan_parallelism_line);
     wc_log_line_android_or_stdout(&scan_parallelism_line);
+    let range_decode_line = format!(
+        "🧵 wallet_refresh stage=range_decode_config wallet_id={} mode={} threads={}",
+        id,
+        if range_decode_pool.is_some() {
+            "parallel-shared"
+        } else {
+            "serial"
+        },
+        range_decode_pool
+            .as_ref()
+            .map(|pool| pool.current_num_threads())
+            .unwrap_or(1)
+    );
+    walletcore_log_line(id, snapshot.network, &range_decode_line);
+    wc_log_line_android_or_stdout(&range_decode_line);
 
     // Legacy batch/RPC env plumbing retained for compatibility with existing test plans.
     let _batch: usize = std::env::var("WALLETCORE_SCAN_BATCH")
@@ -1868,6 +1985,7 @@ fn wallet_refresh_impl(
                                 let rpc_client_for_timeout = rpc_client.clone();
                                 let base_url_for_timeout = base_url.clone();
                                 let bulk_fetch_mode_for_timeout = bulk_fetch_mode;
+                                let decode_pool_for_timeout = range_decode_pool.clone();
                                 recv_timeout_block_on(
                                     CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                                     move || async move {
@@ -1878,6 +1996,7 @@ fn wallet_refresh_impl(
                                                     &base_url_for_timeout,
                                                     start_bn_local,
                                                     end_bn_inclusive_local,
+                                                    decode_pool_for_timeout.as_deref(),
                                                 )
                                             }
                                             _ => rpc_client_for_timeout
@@ -1957,6 +2076,7 @@ fn wallet_refresh_impl(
                                         end_bn_inclusive_local,
                                         bulk_fetch_mode,
                                         &err_s,
+                                        range_decode_pool.as_deref(),
                                     ) {
                                         if used_range {
                                             bulk_fetch_mode = BulkFetchMode::RangeBlocks;
@@ -2053,6 +2173,7 @@ fn wallet_refresh_impl(
                             let rpc_client_for_timeout = rpc_client.clone();
                             let base_url_for_timeout = base_url.clone();
                             let bulk_fetch_mode_for_timeout = bulk_fetch_mode;
+                            let decode_pool_for_timeout = range_decode_pool.clone();
                             recv_timeout_block_on(
                                 CONTIGUOUS_BLOCKS_TIMEOUT_SECS,
                                 move || async move {
@@ -2063,6 +2184,7 @@ fn wallet_refresh_impl(
                                                 &base_url_for_timeout,
                                                 start_bn_local,
                                                 end_bn_inclusive_local,
+                                                decode_pool_for_timeout.as_deref(),
                                             )
                                         }
                                         _ => rpc_client_for_timeout
@@ -2142,6 +2264,7 @@ fn wallet_refresh_impl(
                                     end_bn_inclusive_local,
                                     bulk_fetch_mode,
                                     &err_s,
+                                    range_decode_pool.as_deref(),
                                 ) {
                                     if used_range {
                                         bulk_fetch_mode = BulkFetchMode::RangeBlocks;
@@ -2452,6 +2575,7 @@ fn wallet_refresh_impl(
                     let prefetch_client = prefetch_rpc_client.clone();
                     let prefetch_base_url = base_url.clone();
                     let prefetch_mode = bulk_fetch_mode;
+                    let prefetch_decode_pool = range_decode_pool.clone();
                     let handle = TOKIO_RUNTIME.spawn(async move {
                         let t0 = Instant::now();
                         let res = match prefetch_mode {
@@ -2460,6 +2584,7 @@ fn wallet_refresh_impl(
                                 &prefetch_base_url,
                                 next_start_bn,
                                 next_end_bn,
+                                prefetch_decode_pool.as_deref(),
                             ),
                             _ => prefetch_client
                                 .contiguous_scannable_blocks(next_start_bn..=next_end_bn)
@@ -3487,7 +3612,7 @@ mod tests {
     use super::clear_stale_prefetches;
     use super::{
         automatic_scan_parallelism, commit_refresh_checkpoint, configured_scan_parallelism,
-        configured_upstream_block_batch, decode_range_transaction,
+        configured_upstream_block_batch, decode_range_block_entry, decode_range_transaction,
         fetch_scannable_blocks_range_bin, finish_refresh_job, is_json_batch_or_shape_error,
         is_transient_block_fetch_error, next_height_after_response, scan_blocks_parallel_ordered,
         try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
@@ -3501,6 +3626,7 @@ mod tests {
     use monero_wallet::block::{Block as MoneroBlock, BlockHeader};
     use monero_wallet::transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix};
     use monero_wallet::{ScanError, Scanner};
+    use rayon::prelude::*;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::CString;
 
@@ -3658,6 +3784,49 @@ mod tests {
     }
 
     #[test]
+    fn parallel_range_decode_results_remain_in_block_order() {
+        let entries = (17u8..=20)
+            .enumerate()
+            .map(|(offset, version)| {
+                let scannable = unsupported_scannable_block(version, 100 + offset);
+                crate::support::bulk_models::BlockCompleteEntry {
+                    block: scannable.block.serialize(),
+                    txs: vec![],
+                    pruned: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_hashes = entries
+            .iter()
+            .map(|entry| {
+                let mut reader = entry.block.as_slice();
+                MoneroBlock::read(&mut reader)
+                    .expect("synthetic block")
+                    .hash()
+            })
+            .collect::<Vec<_>>();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("decode pool");
+
+        let decoded = pool.install(|| {
+            entries
+                .into_par_iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    decode_range_block_entry(index, entry)
+                        .expect("range decode")
+                        .block
+                        .hash()
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(decoded, expected_hashes);
+    }
+
+    #[test]
     #[ignore = "requires a live wallet RPC node"]
     fn live_parallel_scan_matches_serial_and_reports_speedup() {
         let base_url = std::env::var("WALLETCORE_TEST_NODE")
@@ -3681,6 +3850,7 @@ mod tests {
             &base_url,
             start,
             start.saturating_add(block_count).saturating_sub(1),
+            None,
         )
         .expect("range fetch");
 
@@ -3894,8 +4064,9 @@ mod tests {
             })
             .expect("failed to build rpc client");
 
-        let blocks = fetch_scannable_blocks_range_bin(&client, &base_url, 3_630_413, 3_630_437)
-            .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
+        let blocks =
+            fetch_scannable_blocks_range_bin(&client, &base_url, 3_630_413, 3_630_437, None)
+                .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
 
         eprintln!("fetched scannable blocks={}", blocks.len());
         assert_eq!(blocks.len(), 25);
@@ -3911,8 +4082,9 @@ mod tests {
             })
             .expect("failed to build rpc client");
 
-        let blocks = fetch_scannable_blocks_range_bin(&client, base_url, 3_519_450, 3_519_474)
-            .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
+        let blocks =
+            fetch_scannable_blocks_range_bin(&client, base_url, 3_519_450, 3_519_474, None)
+                .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
 
         eprintln!("fetched iOS-window scannable blocks={}", blocks.len());
         assert_eq!(blocks.len(), 25);

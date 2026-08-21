@@ -617,6 +617,57 @@ pub(crate) fn append_walletcore_rpc_telemetry(
     }
 }
 
+/// Append opt-in range-response decoding telemetry to the benchmark JSONL stream.
+///
+/// This deliberately shares `WALLETCORE_RPC_TELEMETRY_PATH` with the transport events so one
+/// benchmark artifact can distinguish daemon/network time from the CPU work required to turn a
+/// decoded portable-storage response into ordered `ScannableBlock`s.
+pub(crate) fn append_walletcore_range_decode_telemetry(
+    mode: &str,
+    threads: usize,
+    blocks: usize,
+    transactions: usize,
+    decode_ms: u128,
+    finalize_ms: u128,
+) {
+    use std::io::Write;
+
+    let Ok(raw_path) = std::env::var("WALLETCORE_RPC_TELEMETRY_PATH") else {
+        return;
+    };
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        return;
+    }
+
+    let path = std::path::Path::new(raw_path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let line = serde_json::json!({
+        "timestamp_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        "event": "range_decode",
+        "mode": mode,
+        "threads": threads,
+        "blocks": blocks,
+        "transactions": transactions,
+        "decode_ms": decode_ms,
+        "finalize_ms": finalize_ms,
+    });
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Module-friendly logging helper.
 ///
 /// Prefer calling this from submodules instead of relying on `macro_rules!`
