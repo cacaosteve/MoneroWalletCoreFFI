@@ -418,6 +418,7 @@ const CONTIGUOUS_BLOCKS_TIMEOUT_SECS: u64 = 30;
 
 const DESKTOP_SCAN_THREADS_CAP: usize = 8;
 const MOBILE_SCAN_THREADS_CAP: usize = 4;
+const MAX_UPSTREAM_BLOCK_BATCH: u64 = 1_000;
 
 fn automatic_scan_parallelism(available: usize) -> usize {
     let available = available.max(1);
@@ -443,6 +444,13 @@ fn configured_scan_parallelism(available: usize, configured: Option<&str>) -> us
         Ok(requested) => requested.min(available.max(1)).max(1),
         Err(_) => automatic,
     }
+}
+
+fn configured_upstream_block_batch(configured: Option<&str>) -> u64 {
+    configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(75)
+        .clamp(1, MAX_UPSTREAM_BLOCK_BATCH)
 }
 
 fn scan_parallelism_from_env() -> usize {
@@ -1478,11 +1486,9 @@ fn wallet_refresh_impl(
         }
     };
 
-    let upstream_block_batch: u64 = std::env::var("WALLETCORE_UPSTREAM_BLOCK_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(75)
-        .clamp(1, 500);
+    let configured_upstream_batch = std::env::var("WALLETCORE_UPSTREAM_BLOCK_BATCH").ok();
+    let upstream_block_batch =
+        configured_upstream_block_batch(configured_upstream_batch.as_deref());
 
     walletcore_log_line(
         id,
@@ -3481,10 +3487,10 @@ mod tests {
     use super::clear_stale_prefetches;
     use super::{
         automatic_scan_parallelism, commit_refresh_checkpoint, configured_scan_parallelism,
-        decode_range_transaction, fetch_scannable_blocks_range_bin, finish_refresh_job,
-        is_json_batch_or_shape_error, is_transient_block_fetch_error, next_height_after_response,
-        scan_blocks_parallel_ordered, try_start_refresh_job, with_refresh_stopped, RangeFetchError,
-        RefreshJob,
+        configured_upstream_block_batch, decode_range_transaction,
+        fetch_scannable_blocks_range_bin, finish_refresh_job, is_json_batch_or_shape_error,
+        is_transient_block_fetch_error, next_height_after_response, scan_blocks_parallel_ordered,
+        try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
     };
     use crate::support::{
         refresh_cancelled_for_wallet, set_refresh_cancel_for_wallet, RpcClient, TrackedOutput,
@@ -3574,6 +3580,16 @@ mod tests {
             configured_scan_parallelism(8, Some("invalid")),
             automatic_scan_parallelism(8)
         );
+    }
+
+    #[test]
+    fn upstream_block_batch_defaults_and_override_are_bounded() {
+        assert_eq!(configured_upstream_block_batch(None), 75);
+        assert_eq!(configured_upstream_block_batch(Some("invalid")), 75);
+        assert_eq!(configured_upstream_block_batch(Some("0")), 1);
+        assert_eq!(configured_upstream_block_batch(Some("750")), 750);
+        assert_eq!(configured_upstream_block_batch(Some("1000")), 1_000);
+        assert_eq!(configured_upstream_block_batch(Some("2000")), 1_000);
     }
 
     #[test]
