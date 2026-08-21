@@ -17,6 +17,7 @@ use crate::support::*;
 
 use core::ffi::{c_char, c_int};
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{CStr, CString},
@@ -380,7 +381,7 @@ use monero_interface::{PrunedTransactionWithPrunableHash, ScannableBlock};
 use monero_wallet::{
     block::Block as MoneroBlock,
     transaction::{NotPruned, Pruned, Transaction},
-    Scanner,
+    ScanError, Scanner, WalletOutput,
 };
 
 // scanner micro-profiler is feature-gated by monero-wallet.
@@ -394,6 +395,79 @@ use crate::RpcError;
 // Hard timeout to prevent indefinite hangs when fetching scannable blocks.
 // This is intentionally enforced at the walletcore layer so we can always surface a diagnostic.
 const CONTIGUOUS_BLOCKS_TIMEOUT_SECS: u64 = 30;
+
+const DESKTOP_SCAN_THREADS_CAP: usize = 8;
+const MOBILE_SCAN_THREADS_CAP: usize = 4;
+
+fn automatic_scan_parallelism(available: usize) -> usize {
+    let available = available.max(1);
+    let cap = if cfg!(any(target_os = "android", target_os = "ios")) {
+        MOBILE_SCAN_THREADS_CAP
+    } else {
+        DESKTOP_SCAN_THREADS_CAP
+    };
+    available.min(cap).max(1)
+}
+
+fn configured_scan_parallelism(available: usize, configured: Option<&str>) -> usize {
+    let automatic = automatic_scan_parallelism(available);
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return automatic;
+    };
+    if configured.eq_ignore_ascii_case("auto") {
+        return automatic;
+    }
+    match configured.parse::<usize>() {
+        // Zero explicitly disables the parallel scanner. One is the serial baseline.
+        Ok(0 | 1) => 1,
+        Ok(requested) => requested.min(available.max(1)).max(1),
+        Err(_) => automatic,
+    }
+}
+
+fn scan_parallelism_from_env() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    configured_scan_parallelism(
+        available,
+        std::env::var("WALLETCORE_SCAN_PAR").ok().as_deref(),
+    )
+}
+
+/// Perform only monero-oxide's read-only ownership scan in parallel. Results are flattened in
+/// input order so the caller can apply outputs, spends, fees, and checkpoints sequentially.
+fn scan_blocks_parallel_ordered(
+    pool: &rayon::ThreadPool,
+    scanner: &Scanner,
+    scannables: &[ScannableBlock],
+) -> VecDeque<Result<Vec<WalletOutput>, ScanError>> {
+    if scannables.is_empty() {
+        return VecDeque::new();
+    }
+
+    let worker_count = pool.current_num_threads().min(scannables.len()).max(1);
+    let chunk_size = scannables.len().div_ceil(worker_count);
+    pool.install(|| {
+        scannables
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut scanner = scanner.clone();
+                chunk
+                    .iter()
+                    .map(|block| {
+                        scanner
+                            .scan(block.clone())
+                            .map(|outputs| outputs.ignore_additional_timelock())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
 
 #[derive(serde::Deserialize)]
 struct GetTransactionsOutputIndicesResponse {
@@ -1522,11 +1596,43 @@ fn wallet_refresh_impl(
     let overall_start: Option<Instant> = if log_perf { Some(Instant::now()) } else { None };
     let initial_outputs: usize = working_outputs.len();
 
-    // (Legacy env plumbing retained even though parallel path is currently disabled)
-    let _par: usize = std::env::var("WALLETCORE_SCAN_PAR")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let requested_scan_parallelism = scan_parallelism_from_env();
+    let scan_pool = if requested_scan_parallelism > 1 {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(requested_scan_parallelism)
+            .thread_name(|index| format!("walletcore-scan-{index}"))
+            .build()
+        {
+            Ok(pool) => Some(pool),
+            Err(err) => {
+                wc_log_line_android_or_stdout(&format!(
+                    "⚠️ wallet_refresh stage=parallel_scan_pool_failed wallet_id={} requested_threads={} err={} fallback=serial",
+                    id, requested_scan_parallelism, err
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let effective_scan_parallelism = scan_pool
+        .as_ref()
+        .map(rayon::ThreadPool::current_num_threads)
+        .unwrap_or(1);
+    let scan_parallelism_line = format!(
+        "🧵 wallet_refresh stage=parallel_scan_config wallet_id={} threads={} mode={}",
+        id,
+        effective_scan_parallelism,
+        if effective_scan_parallelism > 1 {
+            "ordered-batch"
+        } else {
+            "serial"
+        }
+    );
+    walletcore_log_line(id, snapshot.network, &scan_parallelism_line);
+    wc_log_line_android_or_stdout(&scan_parallelism_line);
+
+    // Legacy batch/RPC env plumbing retained for compatibility with existing test plans.
     let _batch: usize = std::env::var("WALLETCORE_SCAN_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -2370,6 +2476,17 @@ fn wallet_refresh_impl(
             let mut outputs_added_in_batch: usize = 0;
             let blocks_in_batch: usize = scannables.len();
 
+            if refresh_cancelled_for_wallet(id) {
+                return record_error(-30, "wallet_refresh: cancelled");
+            }
+
+            // Ownership scanning is independent per block. Compute it on the bounded pool, but
+            // retain the original ScannableBlocks for ordered spend/fee/state application below.
+            let mut parallel_scan_results = scan_pool.as_ref().and_then(|pool| {
+                (scannables.len() > 1)
+                    .then(|| scan_blocks_parallel_ordered(pool, &scanner, &scannables))
+            });
+
             // Android-only: scan heartbeat (detect if we're CPU-bound vs deadlocked inside scan).
             #[cfg(target_os = "android")]
             let mut last_scan_heartbeat = Instant::now();
@@ -2775,12 +2892,22 @@ fn wallet_refresh_impl(
                     }
                 }
 
-                let outputs = match scanner.scan(scannable) {
-                    Ok(result) => result.ignore_additional_timelock(),
-                    Err(_) => {
+                let scan_result = match parallel_scan_results.as_mut() {
+                    Some(results) => results.pop_front().unwrap_or_else(|| {
+                        Err(ScanError::InvalidScannableBlock(
+                            "parallel scanner returned too few results",
+                        ))
+                    }),
+                    None => scanner
+                        .scan(scannable)
+                        .map(|result| result.ignore_additional_timelock()),
+                };
+                let outputs = match scan_result {
+                    Ok(outputs) => outputs,
+                    Err(err) => {
                         return record_error(
                             -16,
-                            format!("wallet_refresh: scanner failed at height {}", th),
+                            format!("wallet_refresh: scanner failed at height {}: {}", th, err),
                         );
                     }
                 };
@@ -3290,8 +3417,9 @@ fn wallet_refresh_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_refresh_checkpoint, decode_range_transaction, fetch_scannable_blocks_range_bin,
-        finish_refresh_job, is_json_batch_or_shape_error, is_transient_block_fetch_error,
+        automatic_scan_parallelism, commit_refresh_checkpoint, configured_scan_parallelism,
+        decode_range_transaction, fetch_scannable_blocks_range_bin, finish_refresh_job,
+        is_json_batch_or_shape_error, is_transient_block_fetch_error, scan_blocks_parallel_ordered,
         try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
     };
     use crate::support::{
@@ -3299,8 +3427,10 @@ mod tests {
         WALLET_STORE,
     };
     use crate::{BlockingRpcTransport, PersistedWallet};
-    use monero_wallet::block::Block as MoneroBlock;
+    use monero_interface::ScannableBlock;
+    use monero_wallet::block::{Block as MoneroBlock, BlockHeader};
     use monero_wallet::transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix};
+    use monero_wallet::{ScanError, Scanner};
     use std::collections::{HashMap, HashSet};
     use std::ffi::CString;
 
@@ -3333,6 +3463,157 @@ mod tests {
             spending_txid: None,
             spending_height: None,
         }
+    }
+
+    fn unsupported_scannable_block(hardfork_version: u8, height: usize) -> ScannableBlock {
+        let miner_transaction = Transaction::V1 {
+            prefix: TransactionPrefix {
+                additional_timelock: Timelock::None,
+                inputs: vec![Input::Gen(height)],
+                outputs: vec![],
+                extra: vec![],
+            },
+            signatures: vec![],
+        };
+        let block = MoneroBlock::new(
+            BlockHeader {
+                hardfork_version,
+                hardfork_signal: hardfork_version,
+                timestamp: 0,
+                previous: [0; 32],
+                nonce: 0,
+            },
+            miner_transaction,
+            vec![],
+        )
+        .expect("synthetic block");
+        ScannableBlock {
+            block,
+            transactions: vec![],
+            output_index_for_first_ringct_output: Some(0),
+        }
+    }
+
+    #[test]
+    fn scan_parallelism_defaults_and_override_are_bounded() {
+        let automatic = automatic_scan_parallelism(64);
+        assert!((1..=8).contains(&automatic));
+        assert_eq!(configured_scan_parallelism(8, Some("0")), 1);
+        assert_eq!(configured_scan_parallelism(8, Some("1")), 1);
+        assert_eq!(configured_scan_parallelism(8, Some("3")), 3);
+        assert_eq!(configured_scan_parallelism(4, Some("99")), 4);
+        assert_eq!(
+            configured_scan_parallelism(8, Some("auto")),
+            automatic_scan_parallelism(8)
+        );
+        assert_eq!(
+            configured_scan_parallelism(8, Some("invalid")),
+            automatic_scan_parallelism(8)
+        );
+    }
+
+    #[test]
+    fn parallel_scan_results_remain_in_block_order() {
+        let scanner = Scanner::new(
+            crate::master_keys_from_mnemonic_str(TEST_MNEMONIC)
+                .expect("keys")
+                .to_view_pair()
+                .expect("view pair"),
+        );
+        let blocks = (17u8..=20)
+            .enumerate()
+            .map(|(offset, version)| unsupported_scannable_block(version, 100 + offset))
+            .collect::<Vec<_>>();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("scan pool");
+        let results = scan_blocks_parallel_ordered(&pool, &scanner, &blocks);
+        let errors = results
+            .into_iter()
+            .map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            vec![
+                ScanError::UnsupportedProtocol(17),
+                ScanError::UnsupportedProtocol(18),
+                ScanError::UnsupportedProtocol(19),
+                ScanError::UnsupportedProtocol(20),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live wallet RPC node"]
+    fn live_parallel_scan_matches_serial_and_reports_speedup() {
+        let base_url = std::env::var("WALLETCORE_TEST_NODE")
+            .unwrap_or_else(|_| "https://rpc.nexatrode.com".to_string());
+        let start = std::env::var("WALLETCORE_TEST_START_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3_519_450);
+        let block_count = std::env::var("WALLETCORE_TEST_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(300)
+            .clamp(2, 500);
+        let client: RpcClient = crate::TOKIO_RUNTIME
+            .block_on(async {
+                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()).await
+            })
+            .expect("failed to build rpc client");
+        let blocks = fetch_scannable_blocks_range_bin(
+            &client,
+            &base_url,
+            start,
+            start.saturating_add(block_count).saturating_sub(1),
+        )
+        .expect("range fetch");
+
+        let scanner = Scanner::new(
+            crate::master_keys_from_mnemonic_str(TEST_MNEMONIC)
+                .expect("keys")
+                .to_view_pair()
+                .expect("view pair"),
+        );
+        let serial_started = std::time::Instant::now();
+        let mut serial_scanner = scanner.clone();
+        let serial = blocks
+            .iter()
+            .cloned()
+            .map(|block| {
+                serial_scanner
+                    .scan(block)
+                    .map(|outputs| outputs.ignore_additional_timelock())
+            })
+            .collect::<Vec<_>>();
+        let serial_elapsed = serial_started.elapsed();
+
+        let threads = automatic_scan_parallelism(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("scan pool");
+        let parallel_started = std::time::Instant::now();
+        let parallel = scan_blocks_parallel_ordered(&pool, &scanner, &blocks)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parallel_elapsed = parallel_started.elapsed();
+
+        assert_eq!(parallel, serial);
+        eprintln!(
+            "live scan comparison: blocks={} threads={} serial_ms={} parallel_ms={} speedup={:.2}x",
+            blocks.len(),
+            threads,
+            serial_elapsed.as_millis(),
+            parallel_elapsed.as_millis(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64()
+        );
     }
 
     #[test]

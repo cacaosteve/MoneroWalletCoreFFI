@@ -1829,6 +1829,7 @@ dependencies = [
  "monero-wallet",
  "once_cell",
  "rand",
+ "rayon",
  "serde",
  "serde_json",
  "sha3",
