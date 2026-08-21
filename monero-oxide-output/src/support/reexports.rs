@@ -42,6 +42,7 @@ pub(crate) use crate::{
     parse_hex_32,
     // Recent hash tracking (wallet2-style).
     push_recent_block_hash,
+    push_recent_block_hash_parts,
     rebuild_transfer_ledger,
     record_error,
     refresh_cancelled_for_wallet,

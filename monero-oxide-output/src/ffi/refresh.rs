@@ -40,12 +40,106 @@ fn set_refresh_job(id: &str, job: RefreshJob) {
     }
 }
 
+fn try_start_refresh_job(id: &str) -> bool {
+    let Ok(mut map) = REFRESH_JOBS.lock() else {
+        return false;
+    };
+    if matches!(map.get(id), Some(RefreshJob::Running)) {
+        return false;
+    }
+    map.insert(id.to_string(), RefreshJob::Running);
+    true
+}
+
+/// Run a state mutation only while no refresh owns this wallet. Holding the job
+/// registry lock across the operation closes the check-then-start race: a new
+/// scanner cannot claim the wallet until the mutation has finished.
+pub(crate) fn with_refresh_stopped<T>(id: &str, operation: impl FnOnce() -> T) -> Result<T, ()> {
+    let map = REFRESH_JOBS.lock().map_err(|_| ())?;
+    if matches!(map.get(id), Some(RefreshJob::Running)) {
+        return Err(());
+    }
+    Ok(operation())
+}
+
+fn finish_refresh_job(id: &str, rc: c_int) {
+    if rc == 0 || rc == -30 {
+        set_refresh_job(id, RefreshJob::Idle);
+    } else {
+        let message = last_error_clone().unwrap_or_else(|| format!("refresh stopped ({rc})"));
+        set_refresh_job(id, RefreshJob::Failed(message));
+    }
+}
+
 pub fn refresh_job(id: &str) -> RefreshJob {
     REFRESH_JOBS
         .lock()
         .ok()
         .and_then(|map| map.get(id).cloned())
         .unwrap_or(RefreshJob::Idle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_refresh_checkpoint(
+    id: &str,
+    scan_cursor: u64,
+    chain_height: u64,
+    chain_time: u64,
+    working_outputs: &[TrackedOutput],
+    seen_outpoints: &HashSet<([u8; 32], u64)>,
+    known_tx_fees: &HashMap<String, u64>,
+    recent_block_hashes_start_height: u64,
+    recent_block_hashes: &[[u8; 32]],
+) -> Result<(), c_int> {
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(state) = map.get_mut(id) else {
+        return Err(-13);
+    };
+
+    let computed_ledger = rebuild_transfer_ledger(
+        working_outputs,
+        &state.pending_outgoing,
+        known_tx_fees,
+        chain_time,
+    );
+    let mut pending_outgoing = state.pending_outgoing.clone();
+    pending_outgoing.retain(|pending| match computed_ledger.get(&pending.txid) {
+        Some(entry) => entry.direction == "out" && entry.is_pending,
+        None => true,
+    });
+
+    let mut total = 0u64;
+    let mut unlocked = 0u64;
+    for output in working_outputs {
+        if output.spent {
+            continue;
+        }
+        total = total.saturating_add(output.amount);
+        if output.is_unlocked(chain_height, chain_time) {
+            unlocked = unlocked.saturating_add(output.amount);
+        }
+    }
+
+    let normalized_cursor = scan_cursor.max(state.restore_height);
+    state.last_scanned = if chain_height > 0 {
+        normalized_cursor.min(chain_height)
+    } else {
+        normalized_cursor
+    };
+    state.total = total;
+    state.unlocked = unlocked;
+    state.chain_height = chain_height;
+    state.chain_time = chain_time;
+    if chain_time > 0 {
+        state.last_refresh_timestamp = chain_time;
+    }
+    state.tracked_outputs = working_outputs.to_vec();
+    state.seen_outpoints = seen_outpoints.clone();
+    state.tx_ledger = computed_ledger;
+    state.pending_outgoing = pending_outgoing;
+    state.recent_block_hashes_start_height = recent_block_hashes_start_height;
+    state.recent_block_hashes = recent_block_hashes.to_vec();
+    Ok(())
 }
 
 fn is_channel_closed_error(err: &str) -> bool {
@@ -992,6 +1086,36 @@ pub extern "C" fn wallet_refresh(
     node_url: *const c_char,
     out_last_scanned: *mut u64,
 ) -> c_int {
+    let id = if wallet_id.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(wallet_id) }
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let Some(id) = id else {
+        return wallet_refresh_caught(wallet_id, node_url, out_last_scanned);
+    };
+    if !try_start_refresh_job(&id) {
+        return record_error(
+            -31,
+            format!("wallet_refresh: refresh already running for wallet '{id}'"),
+        );
+    }
+    set_refresh_cancel_for_wallet(&id, false);
+    let rc = wallet_refresh_caught(wallet_id, node_url, out_last_scanned);
+    finish_refresh_job(&id, rc);
+    rc
+}
+
+fn wallet_refresh_caught(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    out_last_scanned: *mut u64,
+) -> c_int {
     // NOTE:
     // Android builds often end up with panic=abort, which turns Rust panics into SIGABRT with no
     // useful message in logcat. Wrap the entire implementation so we can surface panics via
@@ -1039,9 +1163,6 @@ fn wallet_refresh_impl(
 
     // Install panic hook once per process for better crash diagnostics.
     let _ = &*PANIC_HOOK_INSTALLED;
-
-    // Clear any stale cancellation request from a previous refresh before starting.
-    set_refresh_cancel_for_wallet(id, false);
 
     // Stage logging to diagnose early refresh termination.
     // IMPORTANT: on Android, stdout/stderr is often not captured, so emit directly to logcat.
@@ -1380,6 +1501,8 @@ fn wallet_refresh_impl(
     let mut working_outputs = snapshot.tracked_outputs.clone();
     let mut seen_outpoints = snapshot.seen_outpoints.clone();
     let mut known_tx_fees = known_transaction_fees(&snapshot.tx_ledger);
+    let mut working_recent_block_hashes_start_height = snapshot.recent_block_hashes_start_height;
+    let mut working_recent_block_hashes = snapshot.recent_block_hashes.clone();
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
 
     update_scan_progress(
@@ -2292,15 +2415,15 @@ fn wallet_refresh_impl(
                     }
                 }
 
-                // Recent hash history
-                {
-                    let block_hash = scannable.block.hash();
-                    if let Ok(mut map) = WALLET_STORE.lock() {
-                        if let Some(state) = map.get_mut(id) {
-                            push_recent_block_hash(state, th, block_hash);
-                        }
-                    }
-                }
+                // Recent hash history is part of the same working snapshot as outputs and
+                // spends. Publish it only at a completed batch boundary.
+                push_recent_block_hash_parts(
+                    snapshot.restore_height,
+                    &mut working_recent_block_hashes_start_height,
+                    &mut working_recent_block_hashes,
+                    th,
+                    scannable.block.hash(),
+                );
 
                 let miner_hash = scannable.block.miner_transaction().hash();
 
@@ -2947,6 +3070,24 @@ fn wallet_refresh_impl(
 
             scan_cursor = th;
 
+            // Commit a coherent restart point. The public cursor must never move ahead of the
+            // outputs, spends, fees, ledger, balances, and hash history represented by a cache
+            // export. If cancellation happens inside the next batch, this complete batch remains
+            // the durable in-memory checkpoint and the partial batch is discarded.
+            if let Err(code) = commit_refresh_checkpoint(
+                id,
+                scan_cursor,
+                daemon.height,
+                daemon.top_block_timestamp,
+                &working_outputs,
+                &seen_outpoints,
+                &known_tx_fees,
+                working_recent_block_hashes_start_height,
+                &working_recent_block_hashes,
+            ) {
+                return code;
+            }
+
             // Close this persist span now that we've advanced the cursor (per-batch persist boundary).
             if let Some(p0) = persist_span_start.take() {
                 let persist_ms = p0.elapsed().as_millis();
@@ -2982,14 +3123,6 @@ fn wallet_refresh_impl(
                     id, scan_cursor
                 ));
             }
-
-            update_scan_progress(
-                id,
-                scan_cursor.min(daemon.height),
-                daemon.height,
-                daemon.top_block_timestamp,
-                snapshot.restore_height,
-            );
         }
 
         if scan_cursor < daemon.height {
@@ -3128,56 +3261,20 @@ fn wallet_refresh_impl(
         }
     }
 
-    // Rebuild transfer ledger from owned outputs + spends. Clone-and-add double-counted
-    // receives across refresh batches, and change outputs were overwriting spends as "in".
-    let computed_ledger = rebuild_transfer_ledger(
-        &working_outputs,
-        &snapshot.pending_outgoing,
-        &known_tx_fees,
+    // Ensure even a zero-block refresh publishes a coherent chain/timestamp snapshot. Normal
+    // scans already committed at every complete batch above, so this is cheap and idempotent.
+    if let Err(code) = commit_refresh_checkpoint(
+        id,
+        scan_cursor,
+        daemon.height,
         daemon.top_block_timestamp,
-    );
-
-    // Drop pending_outgoing entries that are now confirmed in the ledger.
-    let mut pending_outgoing = snapshot.pending_outgoing.clone();
-    pending_outgoing.retain(|p| {
-        if let Some(entry) = computed_ledger.get(&p.txid) {
-            entry.direction == "out" && entry.is_pending
-        } else {
-            true
-        }
-    });
-
-    // Balances reflect currently spendable wallet value; spent outputs stay in history only.
-    let mut total = 0u64;
-    let mut unlocked = 0u64;
-    for output in &working_outputs {
-        if output.spent {
-            continue;
-        }
-        total = total.saturating_add(output.amount);
-        if output.is_unlocked(daemon.height, daemon.top_block_timestamp) {
-            unlocked = unlocked.saturating_add(output.amount);
-        }
-    }
-
-    // Persist into WALLET_STORE.
-    {
-        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-        let Some(state) = map.get_mut(id) else {
-            return -13;
-        };
-        state.last_scanned = scan_cursor.max(state.restore_height);
-        state.total = total;
-        state.unlocked = unlocked;
-        state.chain_height = daemon.height;
-        state.chain_time = daemon.top_block_timestamp;
-        if daemon.top_block_timestamp > 0 {
-            state.last_refresh_timestamp = daemon.top_block_timestamp;
-        }
-        state.tracked_outputs = working_outputs;
-        state.seen_outpoints = seen_outpoints;
-        state.tx_ledger = computed_ledger;
-        state.pending_outgoing = pending_outgoing;
+        &working_outputs,
+        &seen_outpoints,
+        &known_tx_fees,
+        working_recent_block_hashes_start_height,
+        &working_recent_block_hashes,
+    ) {
+        return code;
     }
 
     if !out_last_scanned.is_null() {
@@ -3193,13 +3290,146 @@ fn wallet_refresh_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_range_transaction, fetch_scannable_blocks_range_bin, is_json_batch_or_shape_error,
-        is_transient_block_fetch_error, RangeFetchError,
+        commit_refresh_checkpoint, decode_range_transaction, fetch_scannable_blocks_range_bin,
+        finish_refresh_job, is_json_batch_or_shape_error, is_transient_block_fetch_error,
+        try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
     };
-    use crate::support::RpcClient;
-    use crate::BlockingRpcTransport;
+    use crate::support::{
+        refresh_cancelled_for_wallet, set_refresh_cancel_for_wallet, RpcClient, TrackedOutput,
+        WALLET_STORE,
+    };
+    use crate::{BlockingRpcTransport, PersistedWallet};
     use monero_wallet::block::Block as MoneroBlock;
     use monero_wallet::transaction::{Input, Pruned, Timelock, Transaction, TransactionPrefix};
+    use std::collections::{HashMap, HashSet};
+    use std::ffi::CString;
+
+    const TEST_MNEMONIC: &str =
+        "ability pockets lordship tomorrow gypsy match neutral uncle avatar \
+        betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring \
+        paradise psychic betting";
+
+    fn open_test_wallet(id: &str, restore_height: u64) {
+        let id = CString::new(id).expect("wallet id");
+        let mnemonic = CString::new(TEST_MNEMONIC).expect("mnemonic");
+        assert_eq!(
+            crate::wallet_open_from_mnemonic(id.as_ptr(), mnemonic.as_ptr(), restore_height, 1,),
+            0
+        );
+    }
+
+    fn tracked_output(tag: u8, amount: u64, height: u64) -> TrackedOutput {
+        TrackedOutput {
+            tx_hash: [tag; 32],
+            index_in_tx: 0,
+            key_image: [tag.wrapping_add(1); 32],
+            amount,
+            block_height: height,
+            additional_timelock: Timelock::None,
+            is_coinbase: false,
+            subaddress_major: 0,
+            subaddress_minor: 0,
+            spent: false,
+            spending_txid: None,
+            spending_height: None,
+        }
+    }
+
+    #[test]
+    fn completed_batch_checkpoint_is_cache_coherent() {
+        let id = "checkpoint-cache-coherent";
+        open_test_wallet(id, 100);
+        let output = tracked_output(7, 42_000, 125);
+        let outputs = vec![output.clone()];
+        let seen = HashSet::from([(output.tx_hash, output.index_in_tx)]);
+        let fees = HashMap::from([(crate::hex_lowercase(&output.tx_hash), 9_000)]);
+        let hashes = vec![[3; 32], [4; 32]];
+
+        commit_refresh_checkpoint(
+            id,
+            150,
+            200,
+            1_700_000_000,
+            &outputs,
+            &seen,
+            &fees,
+            149,
+            &hashes,
+        )
+        .expect("checkpoint");
+
+        let persisted = {
+            let map = WALLET_STORE.lock().expect("wallet store");
+            let state = map.get(id).expect("wallet");
+            assert_eq!(state.last_scanned, 150);
+            assert_eq!(state.total, 42_000);
+            assert_eq!(state.tracked_outputs.len(), 1);
+            assert_eq!(state.seen_outpoints, seen);
+            assert_eq!(state.recent_block_hashes_start_height, 149);
+            assert_eq!(state.recent_block_hashes, hashes);
+            let ledger = state
+                .tx_ledger
+                .get(&crate::hex_lowercase(&output.tx_hash))
+                .expect("incoming ledger row");
+            assert_eq!(ledger.fee, Some(9_000));
+            PersistedWallet::from(state)
+        };
+        assert_eq!(persisted.last_scanned, 150);
+        assert_eq!(persisted.tracked_outputs.len(), 1);
+        WALLET_STORE.lock().expect("wallet store").remove(id);
+    }
+
+    #[test]
+    fn uncommitted_partial_batch_cannot_advance_exported_cursor() {
+        let id = "checkpoint-partial-discard";
+        open_test_wallet(id, 100);
+        let first = tracked_output(11, 10_000, 125);
+        let committed_outputs = vec![first.clone()];
+        let committed_seen = HashSet::from([(first.tx_hash, first.index_in_tx)]);
+        commit_refresh_checkpoint(
+            id,
+            150,
+            250,
+            1_700_000_000,
+            &committed_outputs,
+            &committed_seen,
+            &HashMap::new(),
+            149,
+            &[[1; 32], [2; 32]],
+        )
+        .expect("first checkpoint");
+
+        // Model cancellation halfway through the next batch: working state changes locally, but
+        // no checkpoint call occurs. Cache export must still describe the complete first batch.
+        let mut partial_outputs = committed_outputs;
+        partial_outputs.push(tracked_output(12, 20_000, 175));
+        assert_eq!(partial_outputs.len(), 2);
+        let persisted = {
+            let map = WALLET_STORE.lock().expect("wallet store");
+            PersistedWallet::from(map.get(id).expect("wallet"))
+        };
+        assert_eq!(persisted.last_scanned, 150);
+        assert_eq!(persisted.tracked_outputs.len(), 1);
+        WALLET_STORE.lock().expect("wallet store").remove(id);
+    }
+
+    #[test]
+    fn refresh_job_claim_prevents_cancel_token_revival() {
+        let id = "refresh-job-exclusive";
+        super::set_refresh_job(id, RefreshJob::Idle);
+        set_refresh_cancel_for_wallet(id, false);
+        assert!(try_start_refresh_job(id));
+        set_refresh_cancel_for_wallet(id, true);
+        assert!(!try_start_refresh_job(id));
+        assert!(with_refresh_stopped(id, || ()).is_err());
+        assert!(refresh_cancelled_for_wallet(id));
+
+        finish_refresh_job(id, -30);
+        assert_eq!(super::refresh_job(id), RefreshJob::Idle);
+        assert!(try_start_refresh_job(id));
+        finish_refresh_job(id, -30);
+        assert!(with_refresh_stopped(id, || 42).is_ok_and(|value| value == 42));
+    }
 
     fn synthetic_pruned_v2() -> (Vec<u8>, [u8; 32], [u8; 32]) {
         let transaction = Transaction::<Pruned>::V2 {
@@ -3376,9 +3606,6 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
         return record_error(-14, "wallet_refresh_async: wallet_id was empty");
     }
 
-    // Clear any stale cancellation request from a previous refresh before starting.
-    set_refresh_cancel_for_wallet(id_str, false);
-
     let id_owned = id_str.to_string();
 
     let node_owned = if node_url.is_null() {
@@ -3402,7 +3629,18 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
         }
     };
 
-    set_refresh_job(&id_owned, RefreshJob::Running);
+    if !try_start_refresh_job(&id_owned) {
+        return record_error(
+            -31,
+            format!(
+                "wallet_refresh_async: refresh already running for wallet '{}'",
+                id_owned
+            ),
+        );
+    }
+    // Only the job that successfully claimed this wallet may clear its cancellation token.
+    // A racing restart must not revive the previous worker before it observes cancellation.
+    set_refresh_cancel_for_wallet(&id_owned, false);
     std::thread::spawn(move || {
         if let Ok(wallet_cstr) = CString::new(id_owned.clone()) {
             let node_cstr = node_owned.and_then(|url| CString::new(url).ok());
@@ -3411,21 +3649,19 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null::<c_char>());
-            let rc = wallet_refresh(
+            let rc = wallet_refresh_caught(
                 wallet_cstr.as_ptr(),
                 node_ptr,
                 &mut last_scanned as *mut u64,
             );
-            if rc == 0 || rc == -30 {
-                set_refresh_job(&id_owned, RefreshJob::Idle);
-            } else {
+            if rc != 0 && rc != -30 {
                 let msg = last_error_clone().unwrap_or_else(|| format!("refresh stopped ({rc})"));
                 wc_log_line_android_or_stdout(&format!(
                     "🧭 wallet_refresh_async finished wallet_id={} rc={} err={}",
                     id_owned, rc, msg
                 ));
-                set_refresh_job(&id_owned, RefreshJob::Failed(msg));
             }
+            finish_refresh_job(&id_owned, rc);
         } else {
             set_refresh_job(
                 &id_owned,

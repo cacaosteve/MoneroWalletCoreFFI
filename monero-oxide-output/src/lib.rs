@@ -1140,54 +1140,71 @@ fn recent_hash_height_range(state: &StoredWallet) -> Option<(u64, u64)> {
 /// - We only append hashes in increasing-height order.
 /// - If a reorg or gap is detected, we reset the window to start at `height` with a single hash.
 /// - The window is bounded to `RECENT_BLOCK_HASHES_MAX` by dropping from the front.
-pub(crate) fn push_recent_block_hash(state: &mut StoredWallet, height: u64, hash: [u8; 32]) {
-    maybe_init_recent_hash_window(state);
+pub(crate) fn push_recent_block_hash_parts(
+    restore_height: u64,
+    start_height: &mut u64,
+    hashes: &mut Vec<[u8; 32]>,
+    height: u64,
+    hash: [u8; 32],
+) {
+    if *start_height == 0 {
+        *start_height = restore_height;
+    }
 
-    if state.recent_block_hashes.is_empty() {
-        state.recent_block_hashes_start_height = height;
-        state.recent_block_hashes.push(hash);
+    if hashes.is_empty() {
+        *start_height = height;
+        hashes.push(hash);
         return;
     }
 
-    let start = state.recent_block_hashes_start_height;
-    let expected_next_height = start.saturating_add(state.recent_block_hashes.len() as u64);
+    let start = *start_height;
+    let expected_next_height = start.saturating_add(hashes.len() as u64);
 
     if height == expected_next_height {
-        state.recent_block_hashes.push(hash);
+        hashes.push(hash);
     } else if height < expected_next_height {
         // Possible reorg or duplicate update. If it overlaps our window, truncate to that height.
         if height >= start {
             let idx = (height - start) as usize;
-            if idx < state.recent_block_hashes.len() {
-                state.recent_block_hashes.truncate(idx);
-                state.recent_block_hashes.push(hash);
+            if idx < hashes.len() {
+                hashes.truncate(idx);
+                hashes.push(hash);
             } else {
                 // Shouldn't happen, but reset defensively.
-                state.recent_block_hashes_start_height = height;
-                state.recent_block_hashes.clear();
-                state.recent_block_hashes.push(hash);
+                *start_height = height;
+                hashes.clear();
+                hashes.push(hash);
             }
         } else {
             // Height is before our window; reset to avoid inconsistent state.
-            state.recent_block_hashes_start_height = height;
-            state.recent_block_hashes.clear();
-            state.recent_block_hashes.push(hash);
+            *start_height = height;
+            hashes.clear();
+            hashes.push(hash);
         }
     } else {
         // Gap detected; reset window to this height.
-        state.recent_block_hashes_start_height = height;
-        state.recent_block_hashes.clear();
-        state.recent_block_hashes.push(hash);
+        *start_height = height;
+        hashes.clear();
+        hashes.push(hash);
     }
 
     // Enforce bounded window size
-    if state.recent_block_hashes.len() > RECENT_BLOCK_HASHES_MAX {
-        let overflow = state.recent_block_hashes.len() - RECENT_BLOCK_HASHES_MAX;
-        state.recent_block_hashes.drain(0..overflow);
-        state.recent_block_hashes_start_height = state
-            .recent_block_hashes_start_height
-            .saturating_add(overflow as u64);
+    if hashes.len() > RECENT_BLOCK_HASHES_MAX {
+        let overflow = hashes.len() - RECENT_BLOCK_HASHES_MAX;
+        hashes.drain(0..overflow);
+        *start_height = start_height.saturating_add(overflow as u64);
     }
+}
+
+pub(crate) fn push_recent_block_hash(state: &mut StoredWallet, height: u64, hash: [u8; 32]) {
+    maybe_init_recent_hash_window(state);
+    push_recent_block_hash_parts(
+        state.restore_height,
+        &mut state.recent_block_hashes_start_height,
+        &mut state.recent_block_hashes,
+        height,
+        hash,
+    );
 }
 
 /// Get a hash from the recent hash window by height (if present).
@@ -3383,39 +3400,50 @@ pub extern "C" fn wallet_force_rescan_from_height(
             );
         }
     };
-    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-    match map.get_mut(id) {
-        Some(state) => {
-            // Reset scanning window to the requested restore height
-            state.restore_height = new_restore_height;
-            state.last_scanned = new_restore_height;
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get_mut(id) {
+            Some(state) => {
+                // Reset scanning window to the requested restore height
+                state.restore_height = new_restore_height;
+                state.last_scanned = new_restore_height;
 
-            // Clear balances; they will be recomputed on next refresh
-            state.total = 0;
-            state.unlocked = 0;
+                // Clear balances; they will be recomputed on next refresh
+                state.total = 0;
+                state.unlocked = 0;
 
-            // Normalize chain markers; keep at least restore height
-            state.chain_height = state.chain_height.max(new_restore_height);
-            state.chain_time = 0;
-            state.last_refresh_timestamp = 0;
+                // Normalize chain markers; keep at least restore height
+                state.chain_height = state.chain_height.max(new_restore_height);
+                state.chain_time = 0;
+                state.last_refresh_timestamp = 0;
 
-            // Drop tracked outputs and seen outpoints to force a clean rescan
-            state.tracked_outputs.clear();
-            state.seen_outpoints.clear();
+                // Drop tracked outputs and chain history to force a clean rescan.
+                state.tracked_outputs.clear();
+                state.seen_outpoints.clear();
+                state.invalid_input_quarantine.clear();
+                state.recent_block_hashes_start_height = new_restore_height;
+                state.recent_block_hashes.clear();
 
-            // IMPORTANT: a forced rescan resets our view of wallet state. Any "pending outgoing"
-            // records are now untrustworthy (they may refer to txs we won't rediscover until refresh,
-            // or may cause us to exclude/consider outputs incorrectly). Clear them so sweep/input
-            // selection doesn't accidentally treat unconfirmed change as safely spendable.
-            state.pending_outgoing.clear();
-            state.tx_ledger.clear();
+                // IMPORTANT: a forced rescan resets our view of wallet state. Any "pending outgoing"
+                // records are now untrustworthy (they may refer to txs we won't rediscover until refresh,
+                // or may cause us to exclude/consider outputs incorrectly). Clear them so sweep/input
+                // selection doesn't accidentally treat unconfirmed change as safely spendable.
+                state.pending_outgoing.clear();
+                state.tx_ledger.clear();
 
-            clear_last_error();
-            0
+                clear_last_error();
+                0
+            }
+            None => record_error(
+                -13,
+                format!("wallet_force_rescan_from_height: wallet '{id}' not opened"),
+            ),
         }
-        None => record_error(
-            -13,
-            format!("wallet_force_rescan_from_height: wallet '{id}' not opened"),
+    }) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_force_rescan_from_height: refresh still running for wallet '{id}'"),
         ),
     }
 }
@@ -3468,31 +3496,39 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
         }
     };
 
-    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-    match map.get_mut(id) {
-        Some(state) => {
-            // Drop output bookkeeping and quarantine without changing restore height.
-            // This allows the app to "heal" after derivation changes or inconsistent node behavior,
-            // while keeping the user's restore height hint intact.
-            state.tracked_outputs.clear();
-            state.seen_outpoints.clear();
-            state.invalid_input_quarantine.clear();
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get_mut(id) {
+            Some(state) => {
+                // Drop output bookkeeping and quarantine without changing restore height.
+                // This allows the app to "heal" after derivation changes or inconsistent node behavior,
+                // while keeping the user's restore height hint intact.
+                state.tracked_outputs.clear();
+                state.seen_outpoints.clear();
+                state.invalid_input_quarantine.clear();
 
-            // Pending outgoing may refer to now-untracked outputs/change; clear for safety.
-            state.pending_outgoing.clear();
-            // Stale ledger rows would otherwise survive the next refresh as ghost history.
-            state.tx_ledger.clear();
+                // Pending outgoing may refer to now-untracked outputs/change; clear for safety.
+                state.pending_outgoing.clear();
+                // Stale ledger rows would otherwise survive the next refresh as ghost history.
+                state.tx_ledger.clear();
 
-            // Balances will be recomputed on next refresh.
-            state.total = 0;
-            state.unlocked = 0;
+                // Balances will be recomputed on next refresh.
+                state.total = 0;
+                state.unlocked = 0;
 
-            clear_last_error();
-            0
+                clear_last_error();
+                0
+            }
+            None => record_error(
+                -13,
+                format!("wallet_reset_tracked_outputs: wallet '{id}' not opened"),
+            ),
         }
-        None => record_error(
-            -13,
-            format!("wallet_reset_tracked_outputs: wallet '{id}' not opened"),
+    }) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_reset_tracked_outputs: refresh still running for wallet '{id}'"),
         ),
     }
 }
