@@ -9,6 +9,22 @@ import CLibMoneroWalletCore
 #endif
 
 public extension WalletCoreFFIClient {
+    struct RefreshJobStatus: Equatable, Sendable {
+        public enum State: String, Sendable {
+            case idle
+            case running
+            case failed
+        }
+
+        public let state: State
+        public let error: String?
+
+        public init(state: State, error: String?) {
+            self.state = state
+            self.error = error
+        }
+    }
+
     static func version() -> String {
         guard let c = walletcore_version() else { return "unknown" }
         let s = String(cString: c)
@@ -115,6 +131,33 @@ public extension WalletCoreFFIClient {
             wallet_refresh_cancel(cId)
         }
         try WalletCoreFFISupport.checkRC(rc, context: "wallet_refresh_cancel")
+    }
+
+    /// Return the core worker's authoritative per-wallet lifecycle state.
+    /// Failure text is retained by WalletCore until another refresh starts.
+    static func refreshJobStatus(walletId: String) throws -> RefreshJobStatus {
+        let pointer = walletId.withCString { cId in
+            wallet_refresh_job_status_json(cId)
+        }
+        guard let pointer else {
+            let detail = lastErrorMessage() ?? "unknown error"
+            throw WalletCoreFFIError.nullPointer(
+                "wallet_refresh_job_status_json failed: \(detail)"
+            )
+        }
+        defer { _ = walletcore_free_cstr(pointer) }
+
+        let data = Data(String(cString: pointer).utf8)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any],
+              let rawState = dictionary["state"] as? String,
+              let state = RefreshJobStatus.State(rawValue: rawState) else {
+            throw WalletCoreFFIError.decode("invalid refresh job status JSON")
+        }
+        return RefreshJobStatus(
+            state: state,
+            error: dictionary["error"] as? String
+        )
     }
 
     static func syncStatus(walletId: String) throws -> SyncStatus {

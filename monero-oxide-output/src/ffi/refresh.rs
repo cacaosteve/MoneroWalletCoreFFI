@@ -6,6 +6,7 @@
 //! Exposes:
 //! - `wallet_refresh`
 //! - `wallet_refresh_async`
+//! - `wallet_refresh_job_status_json`
 //! - `wallet_sync_status`
 
 #![allow(clippy::too_many_arguments)]
@@ -98,6 +99,20 @@ pub fn refresh_job(id: &str) -> RefreshJob {
         .ok()
         .and_then(|map| map.get(id).cloned())
         .unwrap_or(RefreshJob::Idle)
+}
+
+fn refresh_job_status_json(id: &str) -> String {
+    let job = refresh_job(id);
+    let (state, error): (&str, Option<&str>) = match &job {
+        RefreshJob::Idle => ("idle", None),
+        RefreshJob::Running => ("running", None),
+        RefreshJob::Failed(message) => ("failed", Some(message.as_str())),
+    };
+    serde_json::json!({
+        "state": state,
+        "error": error,
+    })
+    .to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3631,11 +3646,12 @@ mod tests {
         decode_range_transaction, default_range_decode_parallel_enabled,
         fetch_scannable_blocks_range_bin, finish_refresh_job, is_json_batch_or_shape_error,
         is_transient_block_fetch_error, next_height_after_response, scan_blocks_parallel_ordered,
-        try_start_refresh_job, with_refresh_stopped, RangeFetchError, RefreshJob,
+        try_start_refresh_job, wallet_refresh_job_status_json, with_refresh_stopped,
+        RangeFetchError, RefreshJob,
     };
     use crate::support::{
-        refresh_cancelled_for_wallet, set_refresh_cancel_for_wallet, RpcClient, TrackedOutput,
-        WALLET_STORE,
+        clear_last_error, last_error_clone, record_error, refresh_cancelled_for_wallet,
+        set_refresh_cancel_for_wallet, RpcClient, TrackedOutput, WALLET_STORE,
     };
     use crate::{BlockingRpcTransport, PersistedWallet};
     use monero_interface::ScannableBlock;
@@ -4024,6 +4040,49 @@ mod tests {
         assert!(with_refresh_stopped(id, || 42).is_ok_and(|value| value == 42));
     }
 
+    #[test]
+    fn refresh_job_status_retains_wallet_failure() {
+        let id = "refresh-job-status-failure";
+        super::set_refresh_job(id, RefreshJob::Failed("daemon rejected batch".into()));
+        let id = CString::new(id).expect("wallet id");
+        let pointer = wallet_refresh_job_status_json(id.as_ptr());
+        assert!(!pointer.is_null());
+        let json = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("status utf8")
+            .to_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("status json"),
+            serde_json::json!({
+                "state": "failed",
+                "error": "daemon rejected batch",
+            })
+        );
+        assert_eq!(crate::walletcore_free_cstr(pointer), 0);
+        super::set_refresh_job(id.to_str().expect("wallet id utf8"), RefreshJob::Idle);
+    }
+
+    #[test]
+    fn worker_error_survives_global_clear_from_polling_thread() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            clear_last_error();
+            record_error(-16, "worker-owned failure");
+            ready_tx.send(()).expect("signal ready");
+            continue_rx.recv().expect("continue worker");
+            last_error_clone()
+        });
+
+        ready_rx.recv().expect("worker ready");
+        clear_last_error();
+        continue_tx.send(()).expect("continue worker");
+        assert_eq!(
+            worker.join().expect("worker join").as_deref(),
+            Some("worker-owned failure")
+        );
+    }
+
     fn synthetic_pruned_v2() -> (Vec<u8>, [u8; 32], [u8; 32]) {
         let transaction = Transaction::<Pruned>::V2 {
             prefix: TransactionPrefix {
@@ -4266,6 +4325,50 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
     });
 
     0
+}
+
+/// Return the authoritative per-wallet async refresh state as JSON.
+///
+/// The returned string has the shape `{ "state": "idle|running|failed", "error": string|null }`
+/// and must be released with `walletcore_free_cstr`. Unlike the legacy process-global last-error
+/// slot, a failed state remains attached to this wallet until its next refresh starts.
+#[no_mangle]
+pub extern "C" fn wallet_refresh_job_status_json(wallet_id: *const c_char) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        record_error(
+            -11,
+            "wallet_refresh_job_status_json: wallet_id pointer was null",
+        );
+        return std::ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(value) if !value.trim().is_empty() => value.trim(),
+        Ok(_) => {
+            record_error(-14, "wallet_refresh_job_status_json: wallet_id was empty");
+            return std::ptr::null_mut();
+        }
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_refresh_job_status_json: wallet_id contained invalid UTF-8",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    match CString::new(refresh_job_status_json(id)) {
+        Ok(value) => value.into_raw(),
+        Err(_) => {
+            record_error(
+                -20,
+                "wallet_refresh_job_status_json: status contained an interior NUL",
+            );
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]

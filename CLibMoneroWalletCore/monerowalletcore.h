@@ -181,6 +181,15 @@ int32_t wallet_refresh_async(
 );
 
 /*
+ * Return authoritative per-wallet async refresh state as JSON:
+ *   {"state":"idle|running|failed","error":string|null}
+ *
+ * The failed state and error remain available until the next refresh starts. The returned string
+ * must be released with walletcore_free_cstr.
+ */
+char* wallet_refresh_job_status_json(const char* wallet_id);
+
+/*
  * Request cancellation of the in-flight refresh for a specific wallet.
  *
  * This sets a per-wallet cancel flag that the refresh loop checks frequently.

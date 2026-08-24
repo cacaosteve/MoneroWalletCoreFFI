@@ -1,5 +1,6 @@
 use bytes::Buf;
 use std::{
+    cell::RefCell,
     collections::{hash_map::Entry, HashMap, HashSet},
     convert::TryInto,
     ffi::{CStr, CString},
@@ -794,6 +795,14 @@ const RECENT_BLOCK_HASHES_MAX: usize = 4096;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
+// Keep the error produced by the current native call on its originating thread as well as in the
+// legacy process-global slot. Async refresh workers must be able to capture their own terminal
+// error even while a UI polling thread calls another FFI function (which traditionally clears the
+// global slot at entry).
+thread_local! {
+    static THREAD_LAST_ERROR_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 // Bulk-bin decoding debug flags were previously maintained here, but the decoding logic has been
 // extracted into `support::bulk_bin` / `support::bulk_models`. Any debug gating/state should live
 // alongside that code.
@@ -946,12 +955,19 @@ pub(crate) fn set_refresh_cancel_for_wallet(wallet_id: &str, cancelled: bool) {
 }
 
 fn set_last_error<S: Into<String>>(message: S) {
+    let message = message.into();
+    THREAD_LAST_ERROR_MESSAGE.with(|slot| {
+        *slot.borrow_mut() = Some(message.clone());
+    });
     if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
-        *slot = Some(message.into());
+        *slot = Some(message);
     }
 }
 
 fn clear_last_error() {
+    THREAD_LAST_ERROR_MESSAGE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
     if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
         *slot = None;
     }
@@ -1144,7 +1160,9 @@ fn record_error(code: c_int, message: impl Into<String>) -> c_int {
 }
 
 pub(crate) fn last_error_clone() -> Option<String> {
-    LAST_ERROR_MESSAGE.lock().ok().and_then(|slot| slot.clone())
+    THREAD_LAST_ERROR_MESSAGE
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| LAST_ERROR_MESSAGE.lock().ok().and_then(|slot| slot.clone()))
 }
 
 pub(crate) fn update_scan_progress(
@@ -3234,47 +3252,55 @@ pub extern "C" fn wallet_open_from_mnemonic(
         MoneroNetwork::Stagenet
     };
 
-    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-    match map.entry(id.to_string()) {
-        Entry::Occupied(mut slot) => {
-            let state = slot.get_mut();
-            state.keys = keys;
-            state.network = network;
-            if restore_height < state.restore_height {
-                state.restore_height = restore_height;
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.entry(id.to_string()) {
+            Entry::Occupied(mut slot) => {
+                let state = slot.get_mut();
+                state.keys = keys;
+                state.network = network;
+                if restore_height < state.restore_height {
+                    state.restore_height = restore_height;
+                }
+                if state.last_scanned < state.restore_height {
+                    state.last_scanned = state.restore_height;
+                }
+                if state.gap_limit == 0 {
+                    state.gap_limit = 50;
+                }
             }
-            if state.last_scanned < state.restore_height {
-                state.last_scanned = state.restore_height;
-            }
-            if state.gap_limit == 0 {
-                state.gap_limit = 50;
-            }
-        }
-        Entry::Vacant(slot) => {
-            slot.insert(StoredWallet {
-                keys,
-                restore_height,
-                network,
-                last_scanned: restore_height,
-                total: 0,
-                unlocked: 0,
-                chain_height: restore_height,
-                chain_time: 0,
-                last_refresh_timestamp: 0,
-                gap_limit: 50,
-                tracked_outputs: Vec::new(),
-                seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
-                pending_outgoing: Vec::new(),
-                tx_ledger: HashMap::new(),
-                invalid_input_quarantine: HashSet::<([u8; 32], u64)>::new(),
+            Entry::Vacant(slot) => {
+                slot.insert(StoredWallet {
+                    keys,
+                    restore_height,
+                    network,
+                    last_scanned: restore_height,
+                    total: 0,
+                    unlocked: 0,
+                    chain_height: restore_height,
+                    chain_time: 0,
+                    last_refresh_timestamp: 0,
+                    gap_limit: 50,
+                    tracked_outputs: Vec::new(),
+                    seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
+                    pending_outgoing: Vec::new(),
+                    tx_ledger: HashMap::new(),
+                    invalid_input_quarantine: HashSet::<([u8; 32], u64)>::new(),
 
-                // Start empty; will be populated during refresh.
-                recent_block_hashes_start_height: restore_height,
-                recent_block_hashes: Vec::new(),
-            });
+                    // Start empty; will be populated during refresh.
+                    recent_block_hashes_start_height: restore_height,
+                    recent_block_hashes: Vec::new(),
+                });
+            }
         }
+        0
+    }) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_open_from_mnemonic: refresh already running for wallet '{id}'"),
+        ),
     }
-    0
 }
 
 #[no_mangle]
@@ -3296,16 +3322,24 @@ pub extern "C" fn wallet_set_gap_limit(wallet_id: *const c_char, gap_limit: u32)
     };
 
     let normalized = gap_limit.clamp(1, 100_000);
-    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-    match map.get_mut(id) {
-        Some(state) => {
-            state.gap_limit = normalized;
-            clear_last_error();
-            0
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get_mut(id) {
+            Some(state) => {
+                state.gap_limit = normalized;
+                clear_last_error();
+                0
+            }
+            None => record_error(
+                -13,
+                format!("wallet_set_gap_limit: wallet '{id}' not opened"),
+            ),
         }
-        None => record_error(
-            -13,
-            format!("wallet_set_gap_limit: wallet '{id}' not opened"),
+    }) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_set_gap_limit: refresh already running for wallet '{id}'"),
         ),
     }
 }
@@ -3526,6 +3560,7 @@ pub use crate::ffi::preview_fee::wallet_preview_fee;
 pub use crate::ffi::preview_fee::wallet_preview_fee_with_filter;
 pub use crate::ffi::refresh::wallet_refresh;
 pub use crate::ffi::refresh::wallet_refresh_async;
+pub use crate::ffi::refresh::wallet_refresh_job_status_json;
 pub use crate::ffi::refresh::wallet_sync_status;
 pub use crate::ffi::send::wallet_prepare_send;
 pub use crate::ffi::send::wallet_prepare_send_with_filter;

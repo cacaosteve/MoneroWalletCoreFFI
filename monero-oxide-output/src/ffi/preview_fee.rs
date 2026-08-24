@@ -26,8 +26,53 @@ use monero_address::MoneroAddress;
 use monero_interface::{FeeError, FeeRate};
 use monero_wallet::Scanner;
 
+fn run_while_refresh_stopped(
+    wallet_id: *const c_char,
+    context: &str,
+    operation: impl FnOnce() -> *mut c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if wallet_id.is_null() {
+        record_error(-11, format!("{context}: wallet_id pointer was null"));
+        return ptr::null_mut();
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(value) if !value.trim().is_empty() => value.trim(),
+        Ok(_) => {
+            record_error(-14, format!("{context}: wallet_id was empty"));
+            return ptr::null_mut();
+        }
+        Err(_) => {
+            record_error(-10, format!("{context}: wallet_id contained invalid UTF-8"));
+            return ptr::null_mut();
+        }
+    };
+
+    match crate::ffi::refresh::with_refresh_stopped(id, operation) {
+        Ok(result) => result,
+        Err(()) => {
+            record_error(
+                -31,
+                format!("{context}: refresh already running for wallet '{id}'"),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn wallet_preview_fee(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    run_while_refresh_stopped(wallet_id, "wallet_preview_fee", || {
+        wallet_preview_fee_impl(wallet_id, node_url, destinations_json, ring_len)
+    })
+}
+
+fn wallet_preview_fee_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     destinations_json: *const c_char,
@@ -588,6 +633,24 @@ pub extern "C" fn wallet_preview_fee(
 
 #[no_mangle]
 pub extern "C" fn wallet_preview_fee_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    run_while_refresh_stopped(wallet_id, "wallet_preview_fee_with_filter", || {
+        wallet_preview_fee_with_filter_impl(
+            wallet_id,
+            node_url,
+            destinations_json,
+            filter_json,
+            ring_len,
+        )
+    })
+}
+
+fn wallet_preview_fee_with_filter_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     destinations_json: *const c_char,

@@ -67,46 +67,54 @@ pub extern "C" fn wallet_import_cache(
         );
     }
 
-    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-    match map.get_mut(id) {
-        Some(state) => {
-            // Apply persisted snapshot onto in-memory state.
-            persisted.apply_to_state(state);
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get_mut(id) {
+            Some(state) => {
+                // Apply persisted snapshot onto in-memory state.
+                persisted.apply_to_state(state);
 
-            // Rebuild from tracked outputs on every import. Previous incoming-only rebuild
-            // overwrote spend rows with change-as-receive and ignored outgoing net amounts.
-            let known_fees = known_transaction_fees(&state.tx_ledger);
-            state.tx_ledger = rebuild_transfer_ledger(
-                &state.tracked_outputs,
-                &state.pending_outgoing,
-                &known_fees,
-                state.chain_time,
-            );
+                // Rebuild from tracked outputs on every import. Previous incoming-only rebuild
+                // overwrote spend rows with change-as-receive and ignored outgoing net amounts.
+                let known_fees = known_transaction_fees(&state.tx_ledger);
+                state.tx_ledger = rebuild_transfer_ledger(
+                    &state.tracked_outputs,
+                    &state.pending_outgoing,
+                    &known_fees,
+                    state.chain_time,
+                );
 
-            // Invariant enforcement:
-            // Cache blobs may have been exported mid-refresh (or from older versions), which can result in
-            // tracked outputs/ledger being present while total/unlocked are stale (e.g., 0).
-            // Recompute balances from currently unspent tracked outputs using the imported chain height/time.
-            let mut total: u64 = 0;
-            let mut unlocked: u64 = 0;
-            for o in state.tracked_outputs.iter() {
-                if o.spent {
-                    continue;
+                // Invariant enforcement:
+                // Cache blobs may have been exported mid-refresh (or from older versions), which can result in
+                // tracked outputs/ledger being present while total/unlocked are stale (e.g., 0).
+                // Recompute balances from currently unspent tracked outputs using the imported chain height/time.
+                let mut total: u64 = 0;
+                let mut unlocked: u64 = 0;
+                for o in state.tracked_outputs.iter() {
+                    if o.spent {
+                        continue;
+                    }
+                    total = total.saturating_add(o.amount);
+                    if o.is_unlocked(state.chain_height, state.chain_time) {
+                        unlocked = unlocked.saturating_add(o.amount);
+                    }
                 }
-                total = total.saturating_add(o.amount);
-                if o.is_unlocked(state.chain_height, state.chain_time) {
-                    unlocked = unlocked.saturating_add(o.amount);
-                }
+                state.total = total;
+                state.unlocked = unlocked;
+
+                clear_last_error();
+                0
             }
-            state.total = total;
-            state.unlocked = unlocked;
-
-            clear_last_error();
-            0
+            None => record_error(
+                -13,
+                format!("wallet_import_cache: wallet '{id}' not opened"),
+            ),
         }
-        None => record_error(
-            -13,
-            format!("wallet_import_cache: wallet '{id}' not opened"),
+    }) {
+        Ok(rc) => rc,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_import_cache: refresh already running for wallet '{id}'"),
         ),
     }
 }

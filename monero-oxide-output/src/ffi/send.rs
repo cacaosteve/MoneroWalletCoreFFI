@@ -28,6 +28,43 @@ use monero_wallet::{
     Scanner,
 };
 
+/// Hold the refresh job registry lock for the complete send/prepare/relay operation. This closes
+/// both races: an operation cannot snapshot wallet outputs while a scanner is running, and a new
+/// scanner cannot start until the operation has finished updating local spent state.
+fn run_while_refresh_stopped(
+    wallet_id: *const c_char,
+    context: &str,
+    operation: impl FnOnce() -> *mut c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if wallet_id.is_null() {
+        record_error(-11, format!("{context}: wallet_id pointer was null"));
+        return ptr::null_mut();
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(value) if !value.trim().is_empty() => value.trim(),
+        Ok(_) => {
+            record_error(-14, format!("{context}: wallet_id was empty"));
+            return ptr::null_mut();
+        }
+        Err(_) => {
+            record_error(-10, format!("{context}: wallet_id contained invalid UTF-8"));
+            return ptr::null_mut();
+        }
+    };
+
+    match crate::ffi::refresh::with_refresh_stopped(id, operation) {
+        Ok(result) => result,
+        Err(()) => {
+            record_error(
+                -31,
+                format!("{context}: refresh already running for wallet '{id}'"),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
 // Treat any broadcast failure tagged as `double_spend` as requiring spent-evidence before we
 // quarantine a candidate output.
 fn is_double_spend_tagged_broadcast_error(s: &str) -> bool {
@@ -232,6 +269,16 @@ pub extern "C" fn wallet_relay_prepared(
     node_url: *const c_char,
     prepared_json: *const c_char,
 ) -> *mut c_char {
+    run_while_refresh_stopped(wallet_id, "wallet_relay_prepared", || {
+        wallet_relay_prepared_impl(wallet_id, node_url, prepared_json)
+    })
+}
+
+fn wallet_relay_prepared_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    prepared_json: *const c_char,
+) -> *mut c_char {
     clear_last_error();
     if wallet_id.is_null() || prepared_json.is_null() {
         record_error(-11, "wallet_relay_prepared: null argument(s)");
@@ -404,14 +451,16 @@ pub extern "C" fn wallet_send(
     amount_piconero: u64,
     ring_len: u8,
 ) -> *mut c_char {
-    wallet_send_impl(
-        wallet_id,
-        node_url,
-        to_address,
-        amount_piconero,
-        ring_len,
-        false,
-    )
+    run_while_refresh_stopped(wallet_id, "wallet_send", || {
+        wallet_send_impl(
+            wallet_id,
+            node_url,
+            to_address,
+            amount_piconero,
+            ring_len,
+            false,
+        )
+    })
 }
 
 /// Build and sign a single-destination transaction without broadcasting it.
@@ -423,14 +472,16 @@ pub extern "C" fn wallet_prepare_send(
     amount_piconero: u64,
     ring_len: u8,
 ) -> *mut c_char {
-    wallet_send_impl(
-        wallet_id,
-        node_url,
-        to_address,
-        amount_piconero,
-        ring_len,
-        true,
-    )
+    run_while_refresh_stopped(wallet_id, "wallet_prepare_send", || {
+        wallet_send_impl(
+            wallet_id,
+            node_url,
+            to_address,
+            amount_piconero,
+            ring_len,
+            true,
+        )
+    })
 }
 
 fn wallet_send_impl(
@@ -2121,14 +2172,16 @@ pub extern "C" fn wallet_send_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
-    wallet_send_with_filter_impl(
-        wallet_id,
-        node_url,
-        destinations_json,
-        filter_json,
-        ring_len,
-        false,
-    )
+    run_while_refresh_stopped(wallet_id, "wallet_send_with_filter", || {
+        wallet_send_with_filter_impl(
+            wallet_id,
+            node_url,
+            destinations_json,
+            filter_json,
+            ring_len,
+            false,
+        )
+    })
 }
 
 /// Build and sign a filtered multi-destination transaction without broadcasting it.
@@ -2141,14 +2194,16 @@ pub extern "C" fn wallet_prepare_send_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
-    wallet_send_with_filter_impl(
-        wallet_id,
-        node_url,
-        destinations_json,
-        filter_json,
-        ring_len,
-        true,
-    )
+    run_while_refresh_stopped(wallet_id, "wallet_prepare_send_with_filter", || {
+        wallet_send_with_filter_impl(
+            wallet_id,
+            node_url,
+            destinations_json,
+            filter_json,
+            ring_len,
+            true,
+        )
+    })
 }
 
 fn wallet_send_with_filter_impl(
