@@ -22,9 +22,12 @@ use bytes::{Buf, BufMut};
 use cuprate_epee_encoding::{write_field, EpeeObject};
 
 use crate::support::bulk_bin::{
-    bulk_bin_debug_enabled, hex_dump_prefix, is_supported_blob_marker, read_epee_field_name,
-    read_epee_len_prefixed_bytes, read_txs_typed_array_0x8c, skip_epee_value, skip_epee_varint_u64,
-    try_decode_block_complete_entry_from_blob_payload,
+    bulk_bin_debug_enabled, checked_epee_sequence_len, epee_limits, hex_dump_prefix,
+    is_supported_blob_marker, read_epee_field_name, read_epee_len_prefixed_bytes, read_epee_value,
+    read_epee_value_limited, read_txs_typed_array_0x8c, skip_epee_value, skip_epee_varint_u64,
+    try_decode_block_complete_entry_from_blob_payload, MAX_EPEE_BLOB_BYTES,
+    MAX_EPEE_BLOCKS_PER_RESPONSE, MAX_EPEE_BLOCK_IDS_BYTES, MAX_EPEE_OUTPUTS_PER_TX,
+    MAX_EPEE_STATUS_BYTES, MAX_EPEE_TXS_PER_BLOCK,
 };
 
 /// Wallet2-style `COMMAND_RPC_GET_BLOCKS_FAST` (`/get_blocks.bin`) request model.
@@ -76,26 +79,29 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "requested_info" => {
-                self.requested_info = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.requested_info = Some(read_epee_value(r)?);
             }
             "block_ids" => {
                 // Packed POD blob (32 * N bytes)
-                self.block_ids = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.block_ids = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_BLOCK_IDS_BYTES),
+                )?);
             }
             "start_height" => {
-                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.start_height = Some(read_epee_value(r)?);
             }
             "prune" => {
-                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.prune = Some(read_epee_value(r)?);
             }
             "no_miner_tx" => {
-                self.no_miner_tx = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.no_miner_tx = Some(read_epee_value(r)?);
             }
             "pool_info_since" => {
-                self.pool_info_since = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.pool_info_since = Some(read_epee_value(r)?);
             }
             "max_block_count" => {
-                self.max_block_count = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.max_block_count = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -160,7 +166,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<TxOutputIndices> for TxOutputIndic
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "indices" => {
-                self.indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.indices = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(8, MAX_EPEE_OUTPUTS_PER_TX),
+                )?);
             }
             _ => return Ok(false),
         }
@@ -205,7 +214,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockOutputIndices> for BlockOutpu
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "indices" => {
-                self.indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.indices = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_TXS_PER_BLOCK),
+                )?);
             }
             _ => return Ok(false),
         }
@@ -275,8 +287,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 if r.has_remaining() {
                     let save = r.chunk();
                     let mut tmp: &[u8] = save;
-                    match cuprate_epee_encoding::read_epee_value::<Vec<BlockCompleteEntry>, _>(
+                    match read_epee_value_limited::<Vec<BlockCompleteEntry>, _>(
                         &mut tmp,
+                        epee_limits(32, MAX_EPEE_BLOCKS_PER_RESPONSE),
                     ) {
                         Ok(v) => {
                             let consumed = save.len().saturating_sub(tmp.len());
@@ -375,11 +388,16 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 }
 
                 // Decode elements (manual best-effort).
+                let n = checked_epee_sequence_len(
+                    n,
+                    MAX_EPEE_BLOCKS_PER_RESPONSE,
+                    "getblocks.bin blocks",
+                )?;
                 let savepoint: &[u8] = r.chunk();
 
                 // --- Attempt 1: decode as `BlockCompleteEntry` objects ---
                 let mut reader_obj: &[u8] = savepoint;
-                let mut obj_out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+                let mut obj_out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
                 let mut object_decode_ok = true;
 
                 for i in 0..n {
@@ -488,7 +506,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     obj_out.push(entry);
                 }
 
-                if object_decode_ok && obj_out.len() == n as usize {
+                if object_decode_ok && obj_out.len() == n {
                     let consumed = savepoint.len().saturating_sub(reader_obj.len());
                     r.advance(consumed);
                     self.blocks = Some(obj_out);
@@ -503,10 +521,8 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 }
 
                 // --- Attempt 2: decode as length-prefixed blob bytes ---
-                const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024;
-
                 let mut reader_blob: &[u8] = savepoint;
-                let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+                let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
 
                 for i in 0..n {
                     if reader_blob.is_empty() {
@@ -525,17 +541,8 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     let blob_payload = read_epee_len_prefixed_bytes(
                         &mut reader_blob,
                         "getblocks.bin blocks(blob_payload/shared_marker)",
+                        MAX_EPEE_BLOB_BYTES,
                     )?;
-
-                    if blob_payload.len() > MAX_BLOCK_BYTES {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={} > {MAX_BLOCK_BYTES})",
-                                blob_payload.len()
-                            )
-                            .into_boxed_str(),
-                        )));
-                    }
 
                     if let Some(entry) =
                         try_decode_block_complete_entry_from_blob_payload(&blob_payload)?
@@ -558,60 +565,63 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
             }
 
             "start_height" => {
-                self.start_height =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'start_height': {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?);
-            }
-            "current_height" => {
-                self.current_height =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'current_height': {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?);
-            }
-            "output_indices" => {
-                self.output_indices =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'output_indices': {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?);
-            }
-            "daemon_time" => {
-                self.daemon_time =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'daemon_time': {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?);
-            }
-            "pool_info_extent" => {
-                self.pool_info_extent =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'pool_info_extent': {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?);
-            }
-            "status" => {
-                self.status = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                self.start_height = Some(read_epee_value(r).map_err(|e| {
                     cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'status': {e}")
+                        format!("getblocks.bin decode failed in field 'start_height': {e}")
                             .into_boxed_str(),
                     ))
                 })?);
             }
+            "current_height" => {
+                self.current_height = Some(read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'current_height': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
+            }
+            "output_indices" => {
+                self.output_indices =
+                    Some(
+                        read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
+                            .map_err(|e| {
+                                cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'output_indices': {e}")
+                                .into_boxed_str(),
+                        ))
+                            })?,
+                    );
+            }
+            "daemon_time" => {
+                self.daemon_time = Some(read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'daemon_time': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
+            }
+            "pool_info_extent" => {
+                self.pool_info_extent = Some(read_epee_value(r).map_err(|e| {
+                    cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!("getblocks.bin decode failed in field 'pool_info_extent': {e}")
+                            .into_boxed_str(),
+                    ))
+                })?);
+            }
+            "status" => {
+                self.status = Some(
+                    read_epee_value_limited(r, epee_limits(0, MAX_EPEE_STATUS_BYTES)).map_err(
+                        |e| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'status': {e}")
+                                    .into_boxed_str(),
+                            ))
+                        },
+                    )?,
+                );
+            }
             "untrusted" => {
-                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
+                self.untrusted = Some(read_epee_value(r).map_err(|e| {
                     cuprate_epee_encoding::error::Error::Format(Box::leak(
                         format!("getblocks.bin decode failed in field 'untrusted': {e}")
                             .into_boxed_str(),
@@ -698,10 +708,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksByHeightBinRequest>
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "heights" => {
-                self.heights = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.heights = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(8, MAX_EPEE_BLOCKS_PER_RESPONSE),
+                )?);
             }
             "prune" => {
-                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.prune = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -762,13 +775,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinRequest> for GetBlocks
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "start_height" => {
-                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.start_height = Some(read_epee_value(r)?);
             }
             "count" => {
-                self.count = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.count = Some(read_epee_value(r)?);
             }
             "prune" => {
-                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.prune = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -828,10 +841,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<TxBlobEntry> for TxBlobEntryBuilde
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "blob" => {
-                self.blob = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.blob = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_BLOB_BYTES),
+                )?);
             }
             "prunable_hash" => {
-                self.prunable_hash = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.prunable_hash = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -902,7 +918,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     );
                 }
 
-                self.block = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.block = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_BLOB_BYTES),
+                )?);
 
                 if bulk_bin_debug_enabled() {
                     let rem_after = r.remaining();
@@ -947,8 +966,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     if r.has_remaining() {
                         let save = r.chunk();
                         let mut tmp: &[u8] = save;
-                        match cuprate_epee_encoding::read_epee_value::<Vec<TxBlobEntry>, _>(
+                        match read_epee_value_limited::<Vec<TxBlobEntry>, _>(
                             &mut tmp,
+                            epee_limits(32, MAX_EPEE_TXS_PER_BLOCK),
                         ) {
                             Ok(v) => {
                                 let consumed = save.len().saturating_sub(tmp.len());
@@ -967,7 +987,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     if r.has_remaining() {
                         let save = r.chunk();
                         let mut tmp: &[u8] = save;
-                        match cuprate_epee_encoding::read_epee_value::<Vec<Vec<u8>>, _>(&mut tmp) {
+                        match read_epee_value_limited::<Vec<Vec<u8>>, _>(
+                            &mut tmp,
+                            epee_limits(32, MAX_EPEE_TXS_PER_BLOCK),
+                        ) {
                             Ok(v) => {
                                 let consumed = save.len().saturating_sub(tmp.len());
                                 r.advance(consumed);
@@ -999,7 +1022,11 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                                 .collect()
                         })
                     } else {
-                        cuprate_epee_encoding::read_epee_value::<Vec<Vec<u8>>, _>(r).map(|v| {
+                        read_epee_value_limited::<Vec<Vec<u8>>, _>(
+                            r,
+                            epee_limits(32, MAX_EPEE_TXS_PER_BLOCK),
+                        )
+                        .map(|v| {
                             v.into_iter()
                                 .map(|blob| TxBlobEntry {
                                     blob,
@@ -1038,7 +1065,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         name
                     );
                 }
-                self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.txs = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(32, MAX_EPEE_TXS_PER_BLOCK),
+                )?);
             }
 
             "pruned" => {
@@ -1061,7 +1091,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     );
                 }
 
-                self.pruned = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.pruned = Some(read_epee_value(r)?);
 
                 if bulk_bin_debug_enabled() {
                     let rem_after = r.remaining();
@@ -1172,13 +1202,19 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksByHeightBinResponse>
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "blocks" => {
-                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.blocks = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(32, MAX_EPEE_BLOCKS_PER_RESPONSE),
+                )?);
             }
             "status" => {
-                self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.status = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_STATUS_BYTES),
+                )?);
             }
             "untrusted" => {
-                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.untrusted = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -1247,8 +1283,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                 if r.has_remaining() {
                     let save = r.chunk();
                     let mut tmp: &[u8] = save;
-                    match cuprate_epee_encoding::read_epee_value::<Vec<BlockCompleteEntry>, _>(
+                    match read_epee_value_limited::<Vec<BlockCompleteEntry>, _>(
                         &mut tmp,
+                        epee_limits(32, MAX_EPEE_BLOCKS_PER_RESPONSE),
                     ) {
                         Ok(v) => {
                             let consumed = save.len().saturating_sub(tmp.len());
@@ -1300,10 +1337,15 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                     }
                 };
 
+                let n = checked_epee_sequence_len(
+                    n,
+                    MAX_EPEE_BLOCKS_PER_RESPONSE,
+                    "get_blocks.bin blocks",
+                )?;
                 let savepoint: &[u8] = r.chunk();
 
                 let mut reader_obj: &[u8] = savepoint;
-                let mut obj_out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+                let mut obj_out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
                 let mut object_decode_ok = true;
 
                 for _ in 0..n {
@@ -1354,16 +1396,15 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                     obj_out.push(entry);
                 }
 
-                if object_decode_ok && obj_out.len() == n as usize {
+                if object_decode_ok && obj_out.len() == n {
                     let consumed = savepoint.len().saturating_sub(reader_obj.len());
                     r.advance(consumed);
                     self.blocks = Some(obj_out);
                     return Ok(true);
                 }
 
-                const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024;
                 let mut reader_blob: &[u8] = savepoint;
-                let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
+                let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
 
                 for i in 0..n {
                     if reader_blob.is_empty() {
@@ -1382,17 +1423,8 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                     let blob_payload = read_epee_len_prefixed_bytes(
                         &mut reader_blob,
                         "get_blocks.bin blocks(blob_payload/shared_marker)",
+                        MAX_EPEE_BLOB_BYTES,
                     )?;
-
-                    if blob_payload.len() > MAX_BLOCK_BYTES {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "get_blocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={} > {MAX_BLOCK_BYTES})",
-                                blob_payload.len()
-                            )
-                            .into_boxed_str(),
-                        )));
-                    }
 
                     if let Some(entry) =
                         try_decode_block_complete_entry_from_blob_payload(&blob_payload)?
@@ -1414,18 +1446,24 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
             }
             "output_indices" => {
                 self.output_indices =
-                    Some(cuprate_epee_encoding::read_epee_value(r).map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
+                    Some(
+                        read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
+                            .map_err(|e| {
+                                cuprate_epee_encoding::error::Error::Format(Box::leak(
                             format!("get_blocks.bin decode failed in field 'output_indices': {e}")
                                 .into_boxed_str(),
                         ))
-                    })?);
+                            })?,
+                    );
             }
             "status" => {
-                self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.status = Some(read_epee_value_limited(
+                    r,
+                    epee_limits(0, MAX_EPEE_STATUS_BYTES),
+                )?);
             }
             "untrusted" => {
-                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.untrusted = Some(read_epee_value(r)?);
             }
             _ => return Ok(false),
         }
@@ -1468,7 +1506,9 @@ impl EpeeObject for GetBlocksBinResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::GetBlocksBinResponse;
+    use super::{GetBlocksBinResponse, GetBlocksBinResponseBuilder};
+    use crate::support::bulk_bin::MAX_EPEE_BLOCKS_PER_RESPONSE;
+    use cuprate_epee_encoding::EpeeObjectBuilder;
     use monero_wallet::{
         block::Block as MoneroBlock,
         transaction::{NotPruned, Transaction},
@@ -1522,5 +1562,18 @@ mod tests {
                 tx.prunable_hash().is_some()
             );
         }
+    }
+
+    #[test]
+    fn range_blocks_fallback_rejects_oversized_sequence_before_allocation() {
+        let mut encoded = vec![0x8c];
+        cuprate_epee_encoding::write_varint(MAX_EPEE_BLOCKS_PER_RESPONSE + 1, &mut encoded)
+            .expect("test varint should encode");
+
+        let mut reader = encoded.as_slice();
+        let err = GetBlocksBinResponseBuilder::default()
+            .add_field("blocks", &mut reader)
+            .expect_err("oversized block sequence should fail");
+        assert!(err.to_string().contains("exceeds limit"));
     }
 }

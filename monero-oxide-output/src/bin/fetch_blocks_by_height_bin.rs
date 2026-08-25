@@ -99,10 +99,19 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksByHeightBinRequest>
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
             "heights" => {
-                self.heights = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.heights = Some(cuprate_epee_encoding::read_epee_value(
+                    r,
+                    cuprate_epee_encoding::EpeeValueLimits {
+                        min_element_size: 8,
+                        max_sequence_len: 2_000,
+                    },
+                )?);
             }
             "prune" => {
-                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+                self.prune = Some(cuprate_epee_encoding::read_epee_value(
+                    r,
+                    Default::default(),
+                )?);
             }
             _ => return Ok(false),
         }

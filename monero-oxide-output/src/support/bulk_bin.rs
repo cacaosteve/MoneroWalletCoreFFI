@@ -16,6 +16,74 @@
 
 use bytes::Buf;
 
+use cuprate_epee_encoding::{EpeeValue, EpeeValueLimits};
+
+/// Maximum number of blocks accepted in one wallet bulk-RPC response.
+///
+/// WalletCore clamps its configurable request batch to 2,000 blocks, so a larger response cannot
+/// be legitimate for any request issued by this crate.
+pub(crate) const MAX_EPEE_BLOCKS_PER_RESPONSE: usize = 2_000;
+
+/// Defensive upper bound derived from WalletCore's existing 10 MiB per-block fallback limit and
+/// Cuprate's conservative 32-byte minimum wire size for transaction entries.
+pub(crate) const MAX_EPEE_TXS_PER_BLOCK: usize = (10 * 1024 * 1024) / 32;
+
+/// A transaction cannot contain more output indices than the maximum number of transaction-sized
+/// entries that fit inside WalletCore's existing per-block response envelope.
+pub(crate) const MAX_EPEE_OUTPUTS_PER_TX: usize = MAX_EPEE_TXS_PER_BLOCK;
+
+/// Maximum encoded block or transaction blob accepted by the tolerant binary-RPC decoders.
+pub(crate) const MAX_EPEE_BLOB_BYTES: usize = 10 * 1024 * 1024;
+
+/// `block_ids` is a packed sequence of 32-byte hashes. WalletCore retains at most 4,096 hashes.
+pub(crate) const MAX_EPEE_BLOCK_IDS_BYTES: usize = 4_096 * 32;
+
+/// Daemon status strings are short tokens such as `OK`; leave ample room for useful diagnostics
+/// without allowing a malicious daemon to advertise an unbounded allocation.
+pub(crate) const MAX_EPEE_STATUS_BYTES: usize = 4 * 1024;
+
+#[inline]
+pub(crate) const fn epee_limits(
+    min_element_size: usize,
+    max_sequence_len: usize,
+) -> EpeeValueLimits {
+    EpeeValueLimits {
+        min_element_size,
+        max_sequence_len,
+    }
+}
+
+#[inline]
+pub(crate) fn read_epee_value<T: EpeeValue, B: Buf>(
+    r: &mut B,
+) -> cuprate_epee_encoding::error::Result<T> {
+    cuprate_epee_encoding::read_epee_value(r, EpeeValueLimits::default())
+}
+
+#[inline]
+pub(crate) fn read_epee_value_limited<T: EpeeValue, B: Buf>(
+    r: &mut B,
+    limits: EpeeValueLimits,
+) -> cuprate_epee_encoding::error::Result<T> {
+    cuprate_epee_encoding::read_epee_value(r, limits)
+}
+
+pub(crate) fn checked_epee_sequence_len(
+    len: u64,
+    max: usize,
+    _context: &'static str,
+) -> cuprate_epee_encoding::error::Result<usize> {
+    let len = usize::try_from(len).map_err(|_| {
+        cuprate_epee_encoding::error::Error::Format("EPEE sequence length overflow")
+    })?;
+    if len > max {
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "EPEE sequence length exceeds limit",
+        ));
+    }
+    Ok(len)
+}
+
 /// One-time debug logging toggle for bulk binary decoding.
 ///
 /// Enable via env var:
@@ -103,6 +171,7 @@ pub(crate) fn read_epee_field_name<B: Buf>(
 pub(crate) fn read_epee_len_prefixed_bytes<B: Buf>(
     r: &mut B,
     ctx: &'static str,
+    max_len: usize,
 ) -> cuprate_epee_encoding::error::Result<Vec<u8>> {
     let len = skip_epee_varint_u64(r)?;
     let len_usize = usize::try_from(len).map_err(|_| {
@@ -110,6 +179,12 @@ pub(crate) fn read_epee_len_prefixed_bytes<B: Buf>(
             format!("{ctx}: length overflow").into_boxed_str(),
         ))
     })?;
+
+    if len_usize > max_len {
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "EPEE byte sequence exceeds limit",
+        ));
+    }
 
     if r.remaining() < len_usize {
         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -280,9 +355,7 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
 
     // 1) Element count
     let n_u64 = skip_epee_varint_u64(r)?;
-    let n = usize::try_from(n_u64).map_err(|_| {
-        cuprate_epee_encoding::error::Error::Format("read_txs_typed_array_0x8c: count overflow")
-    })?;
+    let n = checked_epee_sequence_len(n_u64, MAX_EPEE_TXS_PER_BLOCK, "read_txs_typed_array_0x8c")?;
 
     // 2) Typed-array schema header:
     // We observed bytes like: 08 04 'blob' ...
@@ -334,7 +407,10 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
         if r.has_remaining() {
             let save = r.chunk();
             let mut tmp: &[u8] = save;
-            if let Ok(v) = cuprate_epee_encoding::read_epee_value::<Vec<Vec<u8>>, _>(&mut tmp) {
+            if let Ok(v) = read_epee_value_limited::<Vec<Vec<u8>>, _>(
+                &mut tmp,
+                epee_limits(32, MAX_EPEE_TXS_PER_BLOCK),
+            ) {
                 let consumed = save.len().saturating_sub(tmp.len());
                 r.advance(consumed);
                 return Ok(v);
@@ -368,6 +444,7 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
                         let b = read_epee_len_prefixed_bytes(
                             r,
                             "read_txs_typed_array_0x8c(blob,marker_any)",
+                            MAX_EPEE_BLOB_BYTES,
                         )?;
                         out.push(b);
                         continue;
@@ -383,6 +460,7 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
                     let b = read_epee_len_prefixed_bytes(
                         r,
                         "read_txs_typed_array_0x8c(blob,markerless)",
+                        MAX_EPEE_BLOB_BYTES,
                     )?;
                     out.push(b);
                     continue;
@@ -506,7 +584,16 @@ pub(crate) fn try_decode_block_complete_entry_from_blob_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::skip_epee_value;
+    use super::{
+        checked_epee_sequence_len, read_epee_len_prefixed_bytes, read_txs_typed_array_0x8c,
+        skip_epee_value, MAX_EPEE_BLOB_BYTES, MAX_EPEE_TXS_PER_BLOCK,
+    };
+
+    fn encoded_varint(value: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        cuprate_epee_encoding::write_varint(value, &mut bytes).expect("test varint should encode");
+        bytes
+    }
 
     #[test]
     fn skips_fixed_width_scalars_using_portable_storage_markers() {
@@ -538,5 +625,35 @@ mod tests {
         let mut sequence_value: &[u8] = &sequence;
         skip_epee_value(&mut sequence_value).expect("object sequence should be skipped");
         assert!(sequence_value.is_empty());
+    }
+
+    #[test]
+    fn rejects_sequence_lengths_above_wallet_rpc_envelope() {
+        let err = checked_epee_sequence_len(
+            (MAX_EPEE_TXS_PER_BLOCK + 1) as u64,
+            MAX_EPEE_TXS_PER_BLOCK,
+            "test sequence",
+        )
+        .expect_err("oversized sequence should fail");
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn rejects_oversized_length_prefixed_blob_before_reading_payload() {
+        let encoded = encoded_varint(MAX_EPEE_BLOB_BYTES + 1);
+        let mut reader = encoded.as_slice();
+        let err = read_epee_len_prefixed_bytes(&mut reader, "test blob", MAX_EPEE_BLOB_BYTES)
+            .expect_err("oversized blob should fail");
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn rejects_oversized_typed_transaction_sequence_before_allocation() {
+        let mut encoded = vec![0x8c];
+        encoded.extend_from_slice(&encoded_varint(MAX_EPEE_TXS_PER_BLOCK + 1));
+        let mut reader = encoded.as_slice();
+        let err = read_txs_typed_array_0x8c(&mut reader)
+            .expect_err("oversized transaction sequence should fail");
+        assert!(err.to_string().contains("exceeds limit"));
     }
 }
