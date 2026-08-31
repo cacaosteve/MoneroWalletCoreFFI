@@ -331,6 +331,96 @@ const BLOCK_FETCH_RETRY_LIMIT: u32 = 5;
 /// Parent-hash / reorg-probe failures before aborting refresh with a recoverable error.
 const REORG_PROBE_RETRY_LIMIT: u32 = 3;
 
+/// Resume-time daemon tip probe runs only when cached recent hashes exist.
+/// Continuous batch continuity uses returned block parent links — never a per-batch tip RPC.
+pub(crate) fn should_probe_reorg_on_resume(recent_hashes_len: usize) -> bool {
+    recent_hashes_len > 0
+}
+
+/// Intentionally false: the range-refresh loop must not call `on_get_block_hash` every batch.
+pub(crate) const PER_BATCH_TIP_PROBE_ENABLED: bool = false;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeReorgAction {
+    /// Local tip matches daemon (or empty window) — keep scanning from `scan_cursor`.
+    KeepCursor,
+    /// Rewind working state so the next scanned height is `scan_from`.
+    Rewind { scan_from: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParentMismatchAction {
+    /// Parent hash matches local tip — process this batch.
+    Continue,
+    /// Fork proven — cancel prefetch, rewind, continue from replacement chain.
+    Rewind {
+        scan_from: u64,
+        cancel_prefetch: bool,
+    },
+    /// Probe inconclusive — cancel prefetch, bound-retry with backoff.
+    Retry {
+        failures: u32,
+        cancel_prefetch: bool,
+    },
+    /// Retry budget exhausted — abort refresh with a recoverable error.
+    Abort {
+        failures: u32,
+        cancel_prefetch: bool,
+    },
+}
+
+/// Decision for the one-time resume tip probe (`Ok(None)` = no reorg).
+pub(crate) fn decide_resume_reorg_action(
+    scan_cursor: u64,
+    probe: Result<Option<u64>, String>,
+) -> Result<ResumeReorgAction, String> {
+    match probe {
+        Ok(Some(rewind_to)) if rewind_to < scan_cursor => {
+            Ok(ResumeReorgAction::Rewind {
+                scan_from: rewind_to,
+            })
+        }
+        Ok(_) => Ok(ResumeReorgAction::KeepCursor),
+        Err(message) => Err(message),
+    }
+}
+
+/// Decision for a first-block parent-hash mismatch against the local recent-hash tip.
+pub(crate) fn decide_parent_mismatch_action(
+    expected_prev: Option<[u8; 32]>,
+    actual_prev: [u8; 32],
+    probe: Result<Option<u64>, ()>,
+    prior_failures: u32,
+    limit: u32,
+) -> ParentMismatchAction {
+    let Some(expected) = expected_prev else {
+        return ParentMismatchAction::Continue;
+    };
+    if actual_prev == expected {
+        return ParentMismatchAction::Continue;
+    }
+    match probe {
+        Ok(Some(scan_from)) => ParentMismatchAction::Rewind {
+            scan_from,
+            cancel_prefetch: true,
+        },
+        Ok(None) | Err(()) => {
+            let failures = prior_failures.saturating_add(1);
+            if failures > limit {
+                ParentMismatchAction::Abort {
+                    failures,
+                    cancel_prefetch: true,
+                }
+            } else {
+                ParentMismatchAction::Retry {
+                    failures,
+                    cancel_prefetch: true,
+                }
+            }
+        }
+    }
+}
+
 fn block_fetch_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1u64 << attempt.min(3)))
 }
@@ -1903,7 +1993,8 @@ fn wallet_refresh_impl(
 
         // Validate cached chain tip once when resuming existing state. Continuous batch
         // anchoring uses returned block parent links below — not a per-batch RPC probe.
-        if !working_recent_block_hashes.is_empty() {
+        debug_assert!(!PER_BATCH_TIP_PROBE_ENABLED);
+        if should_probe_reorg_on_resume(working_recent_block_hashes.len()) {
             match BlockingRpcTransport::new(&base_url) {
                 Ok(transport) => {
                     match find_reorg_rewind_height(
@@ -1912,40 +2003,44 @@ fn wallet_refresh_impl(
                         &working_recent_block_hashes,
                         |height| transport.get_block_hash_by_height_json(height),
                     ) {
-                        Ok(Some(rewind_to)) if rewind_to < scan_cursor => {
-                            walletcore_log_line(
-                                id,
-                                snapshot.network,
-                                &format!(
-                                    "♻️ wallet_refresh stage=resume_reorg_rewind wallet_id={} from={} to={}",
-                                    id, scan_cursor, rewind_to
-                                ),
-                            );
-                            scan_cursor = rewind_working_state_to_height(
-                                snapshot.restore_height,
-                                rewind_to,
-                                &mut working_outputs,
-                                &mut seen_outpoints,
-                                &mut working_recent_block_hashes_start_height,
-                                &mut working_recent_block_hashes,
-                                &mut working_block_timestamps,
-                            );
-                            if let Err(code) = commit_refresh_checkpoint(
-                                id,
-                                scan_cursor,
-                                daemon.height,
-                                daemon.top_block_timestamp,
-                                &working_outputs,
-                                &seen_outpoints,
-                                &known_tx_fees,
-                                working_recent_block_hashes_start_height,
-                                &working_recent_block_hashes,
-                                &working_block_timestamps,
-                            ) {
-                                return code;
+                        Ok(opt) => match decide_resume_reorg_action(scan_cursor, Ok(opt))
+                            .expect("Ok probe cannot fail decide_resume")
+                        {
+                            ResumeReorgAction::KeepCursor => {}
+                            ResumeReorgAction::Rewind { scan_from: rewind_to } => {
+                                walletcore_log_line(
+                                    id,
+                                    snapshot.network,
+                                    &format!(
+                                        "♻️ wallet_refresh stage=resume_reorg_rewind wallet_id={} from={} to={}",
+                                        id, scan_cursor, rewind_to
+                                    ),
+                                );
+                                scan_cursor = rewind_working_state_to_height(
+                                    snapshot.restore_height,
+                                    rewind_to,
+                                    &mut working_outputs,
+                                    &mut seen_outpoints,
+                                    &mut working_recent_block_hashes_start_height,
+                                    &mut working_recent_block_hashes,
+                                    &mut working_block_timestamps,
+                                );
+                                if let Err(code) = commit_refresh_checkpoint(
+                                    id,
+                                    scan_cursor,
+                                    daemon.height,
+                                    daemon.top_block_timestamp,
+                                    &working_outputs,
+                                    &seen_outpoints,
+                                    &known_tx_fees,
+                                    working_recent_block_hashes_start_height,
+                                    &working_recent_block_hashes,
+                                    &working_block_timestamps,
+                                ) {
+                                    return code;
+                                }
                             }
-                        }
-                        Ok(_) => {}
+                        },
                         Err((code, message)) => {
                             return record_error(
                                 code,
@@ -2620,101 +2715,134 @@ fn wallet_refresh_impl(
             }
 
             // Parent-hash anchor for the first returned block against our local tip.
-            if let Some(expected_prev) = recent_hash_at(
+            let expected_prev = recent_hash_at(
                 working_recent_block_hashes_start_height,
                 &working_recent_block_hashes,
                 start_bn_u64.saturating_sub(1),
+            );
+            let actual_prev = scannables[0].block.header.previous;
+            // Only open a probe transport when the parent actually diverges.
+            let parent_probe = if expected_prev.is_some_and(|expected| expected != actual_prev) {
+                walletcore_log_line(
+                    id,
+                    snapshot.network,
+                    &format!(
+                        "♻️ wallet_refresh stage=parent_hash_mismatch wallet_id={} height={} — probing reorg",
+                        id, start_bn_u64
+                    ),
+                );
+                match BlockingRpcTransport::new(&base_url) {
+                    Ok(transport) => find_reorg_rewind_height(
+                        snapshot.restore_height,
+                        working_recent_block_hashes_start_height,
+                        &working_recent_block_hashes,
+                        |height| transport.get_block_hash_by_height_json(height),
+                    )
+                    .map_err(|_| ()),
+                    Err(_) => Err(()),
+                }
+            } else {
+                Ok(None)
+            };
+            match decide_parent_mismatch_action(
+                expected_prev,
+                actual_prev,
+                parent_probe,
+                reorg_probe_failures,
+                REORG_PROBE_RETRY_LIMIT,
             ) {
-                let actual_prev = scannables[0].block.header.previous;
-                if actual_prev != expected_prev {
-                    walletcore_log_line(
-                        id,
-                        snapshot.network,
-                        &format!(
-                            "♻️ wallet_refresh stage=parent_hash_mismatch wallet_id={} height={} — probing reorg",
-                            id, start_bn_u64
-                        ),
+                ParentMismatchAction::Continue => {}
+                ParentMismatchAction::Rewind {
+                    scan_from: rewind_to,
+                    cancel_prefetch,
+                } => {
+                    scan_cursor = rewind_working_state_to_height(
+                        snapshot.restore_height,
+                        rewind_to,
+                        &mut working_outputs,
+                        &mut seen_outpoints,
+                        &mut working_recent_block_hashes_start_height,
+                        &mut working_recent_block_hashes,
+                        &mut working_block_timestamps,
                     );
-                    let probe = match BlockingRpcTransport::new(&base_url) {
-                        Ok(transport) => find_reorg_rewind_height(
-                            snapshot.restore_height,
-                            working_recent_block_hashes_start_height,
-                            &working_recent_block_hashes,
-                            |height| transport.get_block_hash_by_height_json(height),
-                        ),
-                        Err(code) => Err((
-                            code,
-                            "failed to open transport for reorg probe".to_string(),
-                        )),
-                    };
-                    match probe {
-                        Ok(Some(rewind_to)) => {
-                            scan_cursor = rewind_working_state_to_height(
-                                snapshot.restore_height,
-                                rewind_to,
-                                &mut working_outputs,
-                                &mut seen_outpoints,
-                                &mut working_recent_block_hashes_start_height,
-                                &mut working_recent_block_hashes,
-                                &mut working_block_timestamps,
+                    if cancel_prefetch {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            let _ = clear_stale_prefetches(
+                                &mut next_scannables_q,
+                                &mut prefetch_in_flight,
                             );
-                            #[cfg(not(target_os = "android"))]
-                            {
-                                let _ = clear_stale_prefetches(
-                                    &mut next_scannables_q,
-                                    &mut prefetch_in_flight,
-                                );
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                android_next_prefetch = None;
-                            }
-                            if let Err(code) = commit_refresh_checkpoint(
-                                id,
-                                scan_cursor,
-                                daemon.height,
-                                daemon.top_block_timestamp,
-                                &working_outputs,
-                                &seen_outpoints,
-                                &known_tx_fees,
-                                working_recent_block_hashes_start_height,
-                                &working_recent_block_hashes,
-                                &working_block_timestamps,
-                            ) {
-                                return code;
-                            }
-                            fetch_retries = 0;
-                            reorg_probe_failures = 0;
-                            continue;
                         }
-                        Ok(None) | Err(_) => {
-                            reorg_probe_failures = reorg_probe_failures.saturating_add(1);
-                            if reorg_probe_failures > REORG_PROBE_RETRY_LIMIT {
-                                return record_error(
-                                    -16,
-                                    format!(
-                                        "wallet_refresh: parent hash mismatch at height {} and reorg probe failed after {} attempts",
-                                        start_bn_u64, reorg_probe_failures
-                                    ),
-                                );
-                            }
-                            #[cfg(not(target_os = "android"))]
-                            {
-                                let _ = clear_stale_prefetches(
-                                    &mut next_scannables_q,
-                                    &mut prefetch_in_flight,
-                                );
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                android_next_prefetch = None;
-                            }
-                            std::thread::sleep(block_fetch_retry_delay(
-                                reorg_probe_failures.saturating_sub(1),
-                            ));
-                            continue;
+                        #[cfg(target_os = "android")]
+                        {
+                            android_next_prefetch = None;
                         }
                     }
+                    if let Err(code) = commit_refresh_checkpoint(
+                        id,
+                        scan_cursor,
+                        daemon.height,
+                        daemon.top_block_timestamp,
+                        &working_outputs,
+                        &seen_outpoints,
+                        &known_tx_fees,
+                        working_recent_block_hashes_start_height,
+                        &working_recent_block_hashes,
+                        &working_block_timestamps,
+                    ) {
+                        return code;
+                    }
+                    fetch_retries = 0;
+                    reorg_probe_failures = 0;
+                    continue;
+                }
+                ParentMismatchAction::Retry {
+                    failures,
+                    cancel_prefetch,
+                } => {
+                    reorg_probe_failures = failures;
+                    if cancel_prefetch {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            let _ = clear_stale_prefetches(
+                                &mut next_scannables_q,
+                                &mut prefetch_in_flight,
+                            );
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            android_next_prefetch = None;
+                        }
+                    }
+                    std::thread::sleep(block_fetch_retry_delay(
+                        reorg_probe_failures.saturating_sub(1),
+                    ));
+                    continue;
+                }
+                ParentMismatchAction::Abort {
+                    failures,
+                    cancel_prefetch,
+                } => {
+                    if cancel_prefetch {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            let _ = clear_stale_prefetches(
+                                &mut next_scannables_q,
+                                &mut prefetch_in_flight,
+                            );
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            android_next_prefetch = None;
+                        }
+                    }
+                    return record_error(
+                        -16,
+                        format!(
+                            "wallet_refresh: parent hash mismatch at height {} and reorg probe failed after {} attempts",
+                            start_bn_u64, failures
+                        ),
+                    );
                 }
             }
 
@@ -3846,11 +3974,13 @@ mod tests {
     use super::{
         automatic_scan_parallelism, commit_refresh_checkpoint, configured_range_decode_parallel,
         configured_scan_parallelism, configured_upstream_block_batch, decode_range_block_entry,
-        decode_range_transaction, default_range_decode_parallel_enabled,
-        fetch_scannable_blocks_range_bin, finish_refresh_job, is_json_batch_or_shape_error,
-        is_transient_block_fetch_error, next_height_after_response, scan_blocks_parallel_ordered,
+        decode_range_transaction, decide_parent_mismatch_action, decide_resume_reorg_action,
+        default_range_decode_parallel_enabled, fetch_scannable_blocks_range_bin,
+        finish_refresh_job, is_json_batch_or_shape_error, is_transient_block_fetch_error,
+        next_height_after_response, scan_blocks_parallel_ordered, should_probe_reorg_on_resume,
         try_start_refresh_job, wallet_refresh_job_status_json, with_refresh_stopped,
-        RangeFetchError, RefreshJob,
+        ParentMismatchAction, RangeFetchError, RefreshJob, ResumeReorgAction,
+        PER_BATCH_TIP_PROBE_ENABLED, REORG_PROBE_RETRY_LIMIT,
     };
     use crate::support::{
         clear_last_error, last_error_clone, record_error, refresh_cancelled_for_wallet,
@@ -4445,6 +4575,192 @@ mod tests {
             }
             Err(err) => panic!("get_o_indexes.bin request failed: {err}"),
         }
+    }
+
+    /// Exercises the same control decisions the range-refresh loop uses for reorgs:
+    /// one-time resume probe, parent mismatch, prefetch cancellation, bounded probe
+    /// failure, rewind, and replacement-chain continuation — without a live daemon.
+    #[test]
+    fn range_refresh_reorg_control_path_resume_parent_prefetch_and_bound() {
+        assert!(!PER_BATCH_TIP_PROBE_ENABLED);
+        assert!(!should_probe_reorg_on_resume(0));
+        assert!(should_probe_reorg_on_resume(4));
+
+        let restore = 1_000u64;
+        let window_start = 1_100u64;
+        let local_hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32]]; // 1100..1103
+        let mut tip_rpc_calls = 0u32;
+
+        // --- Resume: one tip probe finds shallow fork, rewind below cursor. ---
+        let mut scan_cursor = 1_104u64;
+        let resume_probe = {
+            tip_rpc_calls += 1;
+            crate::find_reorg_rewind_height(restore, window_start, &local_hashes, |h| {
+                if h == 1_103 {
+                    Ok::<_, ()>([9; 32])
+                } else {
+                    Ok(local_hashes[(h - window_start) as usize])
+                }
+            })
+            .unwrap()
+        };
+        assert_eq!(tip_rpc_calls, 1, "resume must probe exactly once");
+        let resume = decide_resume_reorg_action(scan_cursor, Ok(resume_probe)).unwrap();
+        assert_eq!(
+            resume,
+            ResumeReorgAction::Rewind { scan_from: 1_103 }
+        );
+
+        let keep_tx = [10u8; 32];
+        let drop_tx = [11u8; 32];
+        let spend_tx = [12u8; 32];
+        let mut outputs = vec![
+            {
+                let mut o = tracked_output(10, 7_000, 1_090);
+                o.tx_hash = keep_tx;
+                o
+            },
+            {
+                let mut o = tracked_output(11, 3_000, 1_103);
+                o.tx_hash = drop_tx;
+                o
+            },
+            {
+                let mut o = tracked_output(10, 500, 1_090);
+                o.tx_hash = keep_tx;
+                o.index_in_tx = 1;
+                o.spent = true;
+                o.spending_txid = Some(spend_tx);
+                o.spending_height = Some(1_103);
+                o
+            },
+        ];
+        let mut seen = HashSet::from([(keep_tx, 0), (drop_tx, 0), (keep_tx, 1)]);
+        let mut recent_start = window_start;
+        let mut recent = local_hashes.clone();
+        let mut times = HashMap::from([(1_090u64, 1), (1_103u64, 2)]);
+        if let ResumeReorgAction::Rewind { scan_from } = resume {
+            scan_cursor = crate::rewind_working_state_to_height(
+                restore,
+                scan_from,
+                &mut outputs,
+                &mut seen,
+                &mut recent_start,
+                &mut recent,
+                &mut times,
+            );
+        }
+        assert_eq!(scan_cursor, 1_103);
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().any(|o| o.index_in_tx == 1 && !o.spent));
+        assert!(!seen.contains(&(drop_tx, 0)));
+
+        // --- Steady batches: matching parent → Continue; no tip RPC. ---
+        let tip_before_batches = tip_rpc_calls;
+        let local_tip = *recent.last().unwrap();
+        for _ in 0..3 {
+            let action = decide_parent_mismatch_action(
+                Some(local_tip),
+                local_tip,
+                Ok(None), // unused when parents match
+                0,
+                REORG_PROBE_RETRY_LIMIT,
+            );
+            assert_eq!(action, ParentMismatchAction::Continue);
+        }
+        assert_eq!(
+            tip_rpc_calls, tip_before_batches,
+            "matching parents must not add tip probes"
+        );
+
+        // --- Parent mismatch: cancel prefetch, rewind onto replacement chain. ---
+        #[cfg(not(target_os = "android"))]
+        let mut ready = VecDeque::from([1u8, 2, 3]);
+        #[cfg(not(target_os = "android"))]
+        let mut in_flight: VecDeque<tokio::task::JoinHandle<()>> = VecDeque::new();
+        let fork_parent = [0xEE; 32];
+        tip_rpc_calls += 1;
+        let mid_probe = crate::find_reorg_rewind_height(restore, recent_start, &recent, |h| {
+            if h >= 1_102 {
+                Ok::<_, ()>([9; 32])
+            } else {
+                Ok(recent[(h - recent_start) as usize])
+            }
+        })
+        .unwrap();
+        let mismatch = decide_parent_mismatch_action(
+            Some(local_tip),
+            fork_parent,
+            Ok(mid_probe),
+            0,
+            REORG_PROBE_RETRY_LIMIT,
+        );
+        match mismatch {
+            ParentMismatchAction::Rewind {
+                scan_from,
+                cancel_prefetch,
+            } => {
+                assert!(cancel_prefetch);
+                assert_eq!(scan_from, 1_102);
+                #[cfg(not(target_os = "android"))]
+                {
+                    let (discarded, aborted) = clear_stale_prefetches(&mut ready, &mut in_flight);
+                    assert_eq!(discarded, 3);
+                    assert_eq!(aborted, 0);
+                    assert!(ready.is_empty());
+                }
+                scan_cursor = crate::rewind_working_state_to_height(
+                    restore,
+                    scan_from,
+                    &mut outputs,
+                    &mut seen,
+                    &mut recent_start,
+                    &mut recent,
+                    &mut times,
+                );
+            }
+            other => panic!("expected rewind, got {other:?}"),
+        }
+        assert_eq!(scan_cursor, 1_102);
+        // Replacement-chain continuation: cursor is at fork point; pre-fork outputs remain.
+        assert!(outputs.iter().all(|o| o.block_height < 1_102));
+        assert!(outputs.iter().any(|o| o.tx_hash == keep_tx && o.amount == 7_000));
+
+        // --- Bounded probe failure: retries then Abort (never infinite). ---
+        let mut failures = 0u32;
+        let mut saw_abort = false;
+        for _ in 0..(REORG_PROBE_RETRY_LIMIT + 2) {
+            match decide_parent_mismatch_action(
+                Some([1; 32]),
+                [2; 32],
+                Err(()),
+                failures,
+                REORG_PROBE_RETRY_LIMIT,
+            ) {
+                ParentMismatchAction::Retry {
+                    failures: next,
+                    cancel_prefetch,
+                } => {
+                    assert!(cancel_prefetch);
+                    failures = next;
+                }
+                ParentMismatchAction::Abort {
+                    failures: next,
+                    cancel_prefetch,
+                } => {
+                    assert!(cancel_prefetch);
+                    assert!(next > REORG_PROBE_RETRY_LIMIT);
+                    saw_abort = true;
+                    break;
+                }
+                other => panic!("expected retry/abort, got {other:?}"),
+            }
+        }
+        assert!(saw_abort, "probe failures must abort after the bound");
+
+        // Resume probe hard failure surfaces as Err (refresh returns recoverable error).
+        let resume_err = decide_resume_reorg_action(scan_cursor, Err("daemon 502".into()));
+        assert!(resume_err.is_err());
     }
 }
 
