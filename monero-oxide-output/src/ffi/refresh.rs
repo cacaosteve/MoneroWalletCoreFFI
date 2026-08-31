@@ -328,6 +328,8 @@ fn try_json_batch_error_fallback(
 }
 
 const BLOCK_FETCH_RETRY_LIMIT: u32 = 5;
+/// Parent-hash / reorg-probe failures before aborting refresh with a recoverable error.
+const REORG_PROBE_RETRY_LIMIT: u32 = 3;
 
 fn block_fetch_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1u64 << attempt.min(3)))
@@ -1897,6 +1899,72 @@ fn wallet_refresh_impl(
         let _ = prefetch_depth;
 
         let mut fetch_retries = 0u32;
+        let mut reorg_probe_failures = 0u32;
+
+        // Validate cached chain tip once when resuming existing state. Continuous batch
+        // anchoring uses returned block parent links below — not a per-batch RPC probe.
+        if !working_recent_block_hashes.is_empty() {
+            match BlockingRpcTransport::new(&base_url) {
+                Ok(transport) => {
+                    match find_reorg_rewind_height(
+                        snapshot.restore_height,
+                        working_recent_block_hashes_start_height,
+                        &working_recent_block_hashes,
+                        |height| transport.get_block_hash_by_height_json(height),
+                    ) {
+                        Ok(Some(rewind_to)) if rewind_to < scan_cursor => {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "♻️ wallet_refresh stage=resume_reorg_rewind wallet_id={} from={} to={}",
+                                    id, scan_cursor, rewind_to
+                                ),
+                            );
+                            scan_cursor = rewind_working_state_to_height(
+                                snapshot.restore_height,
+                                rewind_to,
+                                &mut working_outputs,
+                                &mut seen_outpoints,
+                                &mut working_recent_block_hashes_start_height,
+                                &mut working_recent_block_hashes,
+                                &mut working_block_timestamps,
+                            );
+                            if let Err(code) = commit_refresh_checkpoint(
+                                id,
+                                scan_cursor,
+                                daemon.height,
+                                daemon.top_block_timestamp,
+                                &working_outputs,
+                                &seen_outpoints,
+                                &known_tx_fees,
+                                working_recent_block_hashes_start_height,
+                                &working_recent_block_hashes,
+                                &working_block_timestamps,
+                            ) {
+                                return code;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err((code, message)) => {
+                            return record_error(
+                                code,
+                                format!(
+                                    "wallet_refresh: resume reorg probe failed ({message})"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(code) => {
+                    return record_error(
+                        code,
+                        "wallet_refresh: failed to open transport for resume reorg probe",
+                    );
+                }
+            }
+        }
+
         while scan_cursor < daemon.height {
             if refresh_cancelled_for_wallet(id) {
                 if let Some(p0) = persist_span_start.take() {
@@ -1934,84 +2002,6 @@ fn wallet_refresh_impl(
                     refresh_persist_ms_total
                 ));
                 return record_error(-30, "wallet_refresh: cancelled");
-            }
-
-            // Canonical-chain anchor: compare our recent tip hash to the daemon before fetching.
-            // Keep the optimized range path; on mismatch, rewind working state and rescan.
-            if !working_recent_block_hashes.is_empty() {
-                if let Ok(transport) = BlockingRpcTransport::new(&base_url) {
-                    match find_reorg_rewind_height(
-                        snapshot.restore_height,
-                        working_recent_block_hashes_start_height,
-                        &working_recent_block_hashes,
-                        |height| transport.get_block_hash_by_height_json(height),
-                    ) {
-                        Ok(Some(rewind_to)) if rewind_to < scan_cursor => {
-                            walletcore_log_line(
-                                id,
-                                snapshot.network,
-                                &format!(
-                                    "♻️ wallet_refresh stage=reorg_rewind wallet_id={} from={} to={}",
-                                    id, scan_cursor, rewind_to
-                                ),
-                            );
-                            wc_log_line_android_or_stdout(&format!(
-                                "♻️ wallet_refresh stage=reorg_rewind wallet_id={} from={} to={}",
-                                id, scan_cursor, rewind_to
-                            ));
-
-                            scan_cursor = rewind_working_state_to_height(
-                                snapshot.restore_height,
-                                rewind_to,
-                                &mut working_outputs,
-                                &mut seen_outpoints,
-                                &mut working_recent_block_hashes_start_height,
-                                &mut working_recent_block_hashes,
-                                &mut working_block_timestamps,
-                            );
-
-                            #[cfg(not(target_os = "android"))]
-                            {
-                                let _ = clear_stale_prefetches(
-                                    &mut next_scannables_q,
-                                    &mut prefetch_in_flight,
-                                );
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                android_next_prefetch = None;
-                            }
-
-                            if let Err(code) = commit_refresh_checkpoint(
-                                id,
-                                scan_cursor,
-                                daemon.height,
-                                daemon.top_block_timestamp,
-                                &working_outputs,
-                                &seen_outpoints,
-                                &known_tx_fees,
-                                working_recent_block_hashes_start_height,
-                                &working_recent_block_hashes,
-                                &working_block_timestamps,
-                            ) {
-                                return code;
-                            }
-                            fetch_retries = 0;
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err((code, message)) => {
-                            walletcore_log_line(
-                                id,
-                                snapshot.network,
-                                &format!(
-                                    "⚠️ wallet_refresh stage=reorg_probe_failed wallet_id={} code={} err={}",
-                                    id, code, message
-                                ),
-                            );
-                        }
-                    }
-                }
             }
 
             let end_exclusive = core::cmp::min(
@@ -2615,7 +2605,8 @@ fn wallet_refresh_impl(
                     }
                 }
             };
-            fetch_retries = 0;
+            // Do not reset fetch_retries here — parent-hash / reorg handling below uses a
+            // separate bounded counter so probe failures cannot loop forever.
 
             if scannables.is_empty() {
                 return record_error(
@@ -2644,13 +2635,20 @@ fn wallet_refresh_impl(
                             id, start_bn_u64
                         ),
                     );
-                    if let Ok(transport) = BlockingRpcTransport::new(&base_url) {
-                        if let Ok(Some(rewind_to)) = find_reorg_rewind_height(
+                    let probe = match BlockingRpcTransport::new(&base_url) {
+                        Ok(transport) => find_reorg_rewind_height(
                             snapshot.restore_height,
                             working_recent_block_hashes_start_height,
                             &working_recent_block_hashes,
                             |height| transport.get_block_hash_by_height_json(height),
-                        ) {
+                        ),
+                        Err(code) => Err((
+                            code,
+                            "failed to open transport for reorg probe".to_string(),
+                        )),
+                    };
+                    match probe {
+                        Ok(Some(rewind_to)) => {
                             scan_cursor = rewind_working_state_to_height(
                                 snapshot.restore_height,
                                 rewind_to,
@@ -2686,14 +2684,42 @@ fn wallet_refresh_impl(
                                 return code;
                             }
                             fetch_retries = 0;
+                            reorg_probe_failures = 0;
+                            continue;
+                        }
+                        Ok(None) | Err(_) => {
+                            reorg_probe_failures = reorg_probe_failures.saturating_add(1);
+                            if reorg_probe_failures > REORG_PROBE_RETRY_LIMIT {
+                                return record_error(
+                                    -16,
+                                    format!(
+                                        "wallet_refresh: parent hash mismatch at height {} and reorg probe failed after {} attempts",
+                                        start_bn_u64, reorg_probe_failures
+                                    ),
+                                );
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                let _ = clear_stale_prefetches(
+                                    &mut next_scannables_q,
+                                    &mut prefetch_in_flight,
+                                );
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                android_next_prefetch = None;
+                            }
+                            std::thread::sleep(block_fetch_retry_delay(
+                                reorg_probe_failures.saturating_sub(1),
+                            ));
                             continue;
                         }
                     }
-                    // Could not locate a fork point; drop this batch and retry after a probe failure.
-                    fetch_retries = fetch_retries.saturating_add(1);
-                    continue;
                 }
             }
+
+            fetch_retries = 0;
+            reorg_probe_failures = 0;
 
             let actual_end_bn_inclusive =
                 start_bn.saturating_add(scannables.len().saturating_sub(1));
@@ -2924,12 +2950,11 @@ fn wallet_refresh_impl(
                 );
 
                 let block_timestamp = scannable.block.header.timestamp;
-                if block_timestamp > 0 {
-                    working_block_timestamps.insert(th, block_timestamp);
-                    if block_timestamp > daemon.top_block_timestamp {
-                        daemon.top_block_timestamp = block_timestamp;
-                    }
+                if block_timestamp > 0 && block_timestamp > daemon.top_block_timestamp {
+                    daemon.top_block_timestamp = block_timestamp;
                 }
+                // Timestamps for history are recorded only when this height produces
+                // wallet-relevant receives or spends (see after scan application below).
 
                 let miner_hash = scannable.block.miner_transaction().hash();
 
@@ -3404,6 +3429,15 @@ fn wallet_refresh_impl(
                             working_outputs[i].spending_txid = Some(spend_txid);
                         }
                     }
+                }
+
+                // Persist timestamps only for heights that touched this wallet.
+                if block_timestamp > 0
+                    && working_outputs.iter().any(|o| {
+                        o.block_height == th || o.spending_height == Some(th)
+                    })
+                {
+                    working_block_timestamps.insert(th, block_timestamp);
                 }
 
                 th = th.saturating_add(1);

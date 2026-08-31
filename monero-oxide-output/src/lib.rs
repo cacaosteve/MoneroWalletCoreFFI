@@ -1345,9 +1345,9 @@ pub(crate) fn find_reorg_rewind_height<E>(
         }
     }
 
-    // No overlap with the canonical chain inside our window: rescan from the
-    // older of restore_height and the window start.
-    Ok(Some(recent_start.max(restore_height)))
+    // No proven common ancestor inside the retained window: fork may predate the
+    // window, so drop all scanned state back to restore_height and rescan.
+    Ok(Some(restore_height))
 }
 
 /// Rewind in-memory scan artifacts so the next height scanned is `target_height`.
@@ -4217,10 +4217,10 @@ mod ledger_rebuild_tests {
         .unwrap();
         assert_eq!(deep, Some(112));
 
-        // No overlap in window → rewind to window start.
+        // No overlap in window → must rewind to restore_height (not window start).
         let none = find_reorg_rewind_height(restore, start, &hashes, |_h| Ok::<_, ()>([9; 32]))
             .unwrap();
-        assert_eq!(none, Some(start));
+        assert_eq!(none, Some(restore));
     }
 
     #[test]
@@ -4270,6 +4270,177 @@ mod ledger_rebuild_tests {
         assert!(!times.contains_key(&150));
         assert_eq!(recent_start, 120);
         assert_eq!(recent.len(), 10); // heights 120..129
+    }
+
+    #[test]
+    fn reorg_scenario_shallow_deep_restore_and_cache_round_trip() {
+        let restore = 1_000u64;
+        // Window holds 1_100..1_103 (4 hashes) — deeper-than-window means no common ancestor.
+        let window_start = 1_100u64;
+        let hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32]];
+
+        // Shallow: tip diverges, common at 1_102 → rewind to 1_103.
+        let shallow = find_reorg_rewind_height(restore, window_start, &hashes, |h| {
+            if h == 1_103 {
+                Ok::<_, ()>([9; 32])
+            } else {
+                Ok(hashes[(h - window_start) as usize])
+            }
+        })
+        .unwrap();
+        assert_eq!(shallow, Some(1_103));
+
+        // Deep-within-window: common at 1_100 → rewind to 1_101.
+        let mid = find_reorg_rewind_height(restore, window_start, &hashes, |h| {
+            if h >= 1_101 {
+                Ok::<_, ()>([9; 32])
+            } else {
+                Ok(hashes[(h - window_start) as usize])
+            }
+        })
+        .unwrap();
+        assert_eq!(mid, Some(1_101));
+
+        // Deeper than window: no common → restore_height (not window start).
+        let deep = find_reorg_rewind_height(restore, window_start, &hashes, |_| {
+            Ok::<_, ()>([9; 32])
+        })
+        .unwrap();
+        assert_eq!(deep, Some(restore));
+
+        // Apply deep rewind: fork outputs/spends/hashes/timestamps must vanish.
+        let pre_fork = [10u8; 32];
+        let fork_recv = [11u8; 32];
+        let fork_spend = [12u8; 32];
+        let mut outputs = vec![
+            {
+                let mut o = out(pre_fork, 7_000, false, None, None);
+                o.block_height = restore; // at restore height boundary — kept if height < rewind target
+                o
+            },
+            {
+                let mut o = out(fork_recv, 3_000, false, None, None);
+                o.block_height = 1_050;
+                o
+            },
+            {
+                let mut o = out(pre_fork, 1_000, true, Some(fork_spend), Some(1_080));
+                o.index_in_tx = 1;
+                o.block_height = restore + 1;
+                o
+            },
+        ];
+        // First output at restore height: rewind_to restore keeps height < restore? No —
+        // retain is block_height < h, so restore-height outputs are dropped when h==restore.
+        // That's correct for a full rescan from restore_height.
+        let mut seen = HashSet::new();
+        let mut recent_start = window_start;
+        let mut recent = hashes.clone();
+        let mut times = HashMap::from([
+            (restore, 10u64),
+            (1_050, 20),
+            (1_080, 30),
+        ]);
+        let next = rewind_working_state_to_height(
+            restore,
+            deep.unwrap(),
+            &mut outputs,
+            &mut seen,
+            &mut recent_start,
+            &mut recent,
+            &mut times,
+        );
+        assert_eq!(next, restore);
+        assert!(outputs.is_empty(), "all outputs at/after restore must be cleared");
+        assert!(seen.is_empty());
+        assert!(recent.is_empty());
+        assert_eq!(recent_start, restore);
+        assert!(times.is_empty());
+
+        // Replacement-chain discovery path: after rewind, a shallow common ancestor keeps
+        // pre-fork receives and unspends fork spends.
+        let mut outputs = vec![
+            {
+                let mut o = out(pre_fork, 7_000, false, None, None);
+                o.block_height = 1_090;
+                o
+            },
+            {
+                let mut o = out(fork_recv, 3_000, false, None, None);
+                o.block_height = 1_102;
+                o
+            },
+            {
+                let mut o = out(pre_fork, 500, true, Some(fork_spend), Some(1_102));
+                o.index_in_tx = 1;
+                o.block_height = 1_090;
+                o
+            },
+        ];
+        let mut seen = HashSet::from([(pre_fork, 0), (fork_recv, 0), (pre_fork, 1)]);
+        let mut recent_start = window_start;
+        let mut recent = hashes.clone();
+        let mut times = HashMap::from([(1_090u64, 1), (1_102u64, 2)]);
+        let next = rewind_working_state_to_height(
+            restore,
+            mid.unwrap(),
+            &mut outputs,
+            &mut seen,
+            &mut recent_start,
+            &mut recent,
+            &mut times,
+        );
+        assert_eq!(next, 1_101);
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|o| o.block_height < 1_101));
+        assert!(outputs.iter().any(|o| o.index_in_tx == 1 && !o.spent));
+        assert!(!seen.contains(&(fork_recv, 0)));
+        assert!(!times.contains_key(&1_102));
+
+        // Cache round-trip after rewind preserves the truncated window / cleared ledger inputs.
+        let ledger = rebuild_transfer_ledger(
+            &outputs,
+            &[],
+            &HashMap::new(),
+            1_700_000_000,
+            &times,
+        );
+        assert!(ledger.values().all(|e| e.height.unwrap_or(0) < 1_101));
+        let persisted = PersistedWallet {
+            cache_version: WALLETCORE_CACHE_VERSION,
+            bound_primary_address: "test".into(),
+            network: PersistedNetwork::Mainnet,
+            restore_height: restore,
+            last_scanned: next,
+            total: outputs.iter().filter(|o| !o.spent).map(|o| o.amount).sum(),
+            unlocked: 0,
+            chain_height: 1_200,
+            chain_time: 1_700_000_000,
+            gap_limit: 50,
+            tracked_outputs: outputs.iter().map(PersistedOutput::from).collect(),
+            seen_outpoints: seen.iter().copied().collect(),
+            pending_outgoing: vec![],
+            tx_ledger: ledger,
+            invalid_input_quarantine: vec![],
+            recent_block_hashes_start_height: recent_start,
+            recent_block_hashes: recent.clone(),
+            block_timestamps: times.clone(),
+        };
+        let bytes = bincode::serialize(&persisted).expect("serialize");
+        let decoded: PersistedWallet = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded.last_scanned, next);
+        assert_eq!(decoded.tracked_outputs.len(), 2);
+        assert_eq!(decoded.recent_block_hashes.len(), recent.len());
+        assert!(!decoded.block_timestamps.contains_key(&1_102));
+    }
+
+    #[test]
+    fn reorg_probe_failure_is_distinct_from_no_reorg() {
+        // Daemon hash probe errors must surface as Err, not Ok(None).
+        let err = find_reorg_rewind_height(10, 20, &[[1; 32]], |_h| {
+            Err("probe failed")
+        });
+        assert!(err.is_err());
     }
 }
 
