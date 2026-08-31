@@ -32,8 +32,8 @@ let package = Package(
             // versioned release asset. Keeping it out of Git makes clones and
             // SwiftPM dependency resolution much smaller while preserving the
             // no-Rust-required Apple consumer experience.
-            url: "https://github.com/cacaosteve/MoneroWalletCoreFFI/releases/download/walletcore-v0.1.5/MoneroWalletCore.xcframework.zip",
-            checksum: "6b0a297495222dd805249aab25cfa01f0d695ad4586e4b0da765a2716b6083bb"
+            url: "https://github.com/cacaosteve/MoneroWalletCoreFFI/releases/download/walletcore-v0.1.6/MoneroWalletCore.xcframework.zip",
+            checksum: "1c87888101f2e8403f727d24bc25eeca6d68800eb361a909814ca538c2937111"
         ),
         clibTarget,
         .target(
