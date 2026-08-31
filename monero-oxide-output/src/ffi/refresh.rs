@@ -1936,6 +1936,84 @@ fn wallet_refresh_impl(
                 return record_error(-30, "wallet_refresh: cancelled");
             }
 
+            // Canonical-chain anchor: compare our recent tip hash to the daemon before fetching.
+            // Keep the optimized range path; on mismatch, rewind working state and rescan.
+            if !working_recent_block_hashes.is_empty() {
+                if let Ok(transport) = BlockingRpcTransport::new(&base_url) {
+                    match find_reorg_rewind_height(
+                        snapshot.restore_height,
+                        working_recent_block_hashes_start_height,
+                        &working_recent_block_hashes,
+                        |height| transport.get_block_hash_by_height_json(height),
+                    ) {
+                        Ok(Some(rewind_to)) if rewind_to < scan_cursor => {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "♻️ wallet_refresh stage=reorg_rewind wallet_id={} from={} to={}",
+                                    id, scan_cursor, rewind_to
+                                ),
+                            );
+                            wc_log_line_android_or_stdout(&format!(
+                                "♻️ wallet_refresh stage=reorg_rewind wallet_id={} from={} to={}",
+                                id, scan_cursor, rewind_to
+                            ));
+
+                            scan_cursor = rewind_working_state_to_height(
+                                snapshot.restore_height,
+                                rewind_to,
+                                &mut working_outputs,
+                                &mut seen_outpoints,
+                                &mut working_recent_block_hashes_start_height,
+                                &mut working_recent_block_hashes,
+                                &mut working_block_timestamps,
+                            );
+
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                let _ = clear_stale_prefetches(
+                                    &mut next_scannables_q,
+                                    &mut prefetch_in_flight,
+                                );
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                android_next_prefetch = None;
+                            }
+
+                            if let Err(code) = commit_refresh_checkpoint(
+                                id,
+                                scan_cursor,
+                                daemon.height,
+                                daemon.top_block_timestamp,
+                                &working_outputs,
+                                &seen_outpoints,
+                                &known_tx_fees,
+                                working_recent_block_hashes_start_height,
+                                &working_recent_block_hashes,
+                                &working_block_timestamps,
+                            ) {
+                                return code;
+                            }
+                            fetch_retries = 0;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err((code, message)) => {
+                            walletcore_log_line(
+                                id,
+                                snapshot.network,
+                                &format!(
+                                    "⚠️ wallet_refresh stage=reorg_probe_failed wallet_id={} code={} err={}",
+                                    id, code, message
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
             let end_exclusive = core::cmp::min(
                 daemon.height,
                 scan_cursor.saturating_add(upstream_block_batch),
@@ -2549,6 +2627,74 @@ fn wallet_refresh_impl(
                     ),
                 );
             }
+
+            // Parent-hash anchor for the first returned block against our local tip.
+            if let Some(expected_prev) = recent_hash_at(
+                working_recent_block_hashes_start_height,
+                &working_recent_block_hashes,
+                start_bn_u64.saturating_sub(1),
+            ) {
+                let actual_prev = scannables[0].block.header.previous;
+                if actual_prev != expected_prev {
+                    walletcore_log_line(
+                        id,
+                        snapshot.network,
+                        &format!(
+                            "♻️ wallet_refresh stage=parent_hash_mismatch wallet_id={} height={} — probing reorg",
+                            id, start_bn_u64
+                        ),
+                    );
+                    if let Ok(transport) = BlockingRpcTransport::new(&base_url) {
+                        if let Ok(Some(rewind_to)) = find_reorg_rewind_height(
+                            snapshot.restore_height,
+                            working_recent_block_hashes_start_height,
+                            &working_recent_block_hashes,
+                            |height| transport.get_block_hash_by_height_json(height),
+                        ) {
+                            scan_cursor = rewind_working_state_to_height(
+                                snapshot.restore_height,
+                                rewind_to,
+                                &mut working_outputs,
+                                &mut seen_outpoints,
+                                &mut working_recent_block_hashes_start_height,
+                                &mut working_recent_block_hashes,
+                                &mut working_block_timestamps,
+                            );
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                let _ = clear_stale_prefetches(
+                                    &mut next_scannables_q,
+                                    &mut prefetch_in_flight,
+                                );
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                android_next_prefetch = None;
+                            }
+                            if let Err(code) = commit_refresh_checkpoint(
+                                id,
+                                scan_cursor,
+                                daemon.height,
+                                daemon.top_block_timestamp,
+                                &working_outputs,
+                                &seen_outpoints,
+                                &known_tx_fees,
+                                working_recent_block_hashes_start_height,
+                                &working_recent_block_hashes,
+                                &working_block_timestamps,
+                            ) {
+                                return code;
+                            }
+                            fetch_retries = 0;
+                            continue;
+                        }
+                    }
+                    // Could not locate a fork point; drop this batch and retry after a probe failure.
+                    fetch_retries = fetch_retries.saturating_add(1);
+                    continue;
+                }
+            }
+
             let actual_end_bn_inclusive =
                 start_bn.saturating_add(scannables.len().saturating_sub(1));
             let actual_next_height = next_height_after_response(start_bn_u64, scannables.len());

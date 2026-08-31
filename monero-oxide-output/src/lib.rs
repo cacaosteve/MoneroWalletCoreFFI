@@ -1292,14 +1292,113 @@ pub(crate) fn push_recent_block_hash(state: &mut StoredWallet, height: u64, hash
     );
 }
 
-/// Get a hash from the recent hash window by height (if present).
-fn get_recent_block_hash(state: &StoredWallet, height: u64) -> Option<[u8; 32]> {
-    let start = state.recent_block_hashes_start_height;
-    if height < start {
+/// Get a hash from a recent-hash window by height (if present).
+pub(crate) fn recent_hash_at(
+    start_height: u64,
+    hashes: &[[u8; 32]],
+    height: u64,
+) -> Option<[u8; 32]> {
+    if hashes.is_empty() || height < start_height {
         return None;
     }
-    let idx = (height - start) as usize;
-    state.recent_block_hashes.get(idx).copied()
+    let idx = (height - start_height) as usize;
+    hashes.get(idx).copied()
+}
+
+/// Get a hash from the recent hash window by height (if present).
+fn get_recent_block_hash(state: &StoredWallet, height: u64) -> Option<[u8; 32]> {
+    recent_hash_at(
+        state.recent_block_hashes_start_height,
+        &state.recent_block_hashes,
+        height,
+    )
+}
+
+/// Locate the exclusive rewind height after a reorg (`next height to scan`).
+///
+/// `get_daemon_hash(height)` should return the canonical hash at that height.
+/// Returns:
+/// - `Ok(None)` if the local tip matches the daemon (no reorg)
+/// - `Ok(Some(h))` to rewind working state so scanning resumes at `h`
+pub(crate) fn find_reorg_rewind_height<E>(
+    restore_height: u64,
+    recent_start: u64,
+    recent_hashes: &[[u8; 32]],
+    get_daemon_hash: impl Fn(u64) -> Result<[u8; 32], E>,
+) -> Result<Option<u64>, E> {
+    if recent_hashes.is_empty() {
+        return Ok(None);
+    }
+    let tip_height = recent_start.saturating_add(recent_hashes.len() as u64 - 1);
+    let local_tip = recent_hashes[recent_hashes.len() - 1];
+    let remote_tip = get_daemon_hash(tip_height)?;
+    if remote_tip == local_tip {
+        return Ok(None);
+    }
+
+    // Walk newest→oldest for the highest common ancestor still in our window.
+    for i in (0..recent_hashes.len() - 1).rev() {
+        let height = recent_start.saturating_add(i as u64);
+        let remote = get_daemon_hash(height)?;
+        if remote == recent_hashes[i] {
+            return Ok(Some(height.saturating_add(1).max(restore_height)));
+        }
+    }
+
+    // No overlap with the canonical chain inside our window: rescan from the
+    // older of restore_height and the window start.
+    Ok(Some(recent_start.max(restore_height)))
+}
+
+/// Rewind in-memory scan artifacts so the next height scanned is `target_height`.
+///
+/// - Drops outputs received at height >= target
+/// - Clears spends observed at height >= target
+/// - Rebuilds `seen_outpoints` from remaining outputs
+/// - Truncates recent hash window and block timestamps
+pub(crate) fn rewind_working_state_to_height(
+    restore_height: u64,
+    target_height: u64,
+    outputs: &mut Vec<TrackedOutput>,
+    seen_outpoints: &mut HashSet<([u8; 32], u64)>,
+    recent_start: &mut u64,
+    recent_hashes: &mut Vec<[u8; 32]>,
+    block_timestamps: &mut HashMap<u64, u64>,
+) -> u64 {
+    let h = target_height.max(restore_height);
+
+    outputs.retain(|output| output.block_height < h);
+    for output in outputs.iter_mut() {
+        let spent_on_fork = output
+            .spending_height
+            .map(|spend_h| spend_h >= h)
+            .unwrap_or(false);
+        if spent_on_fork {
+            output.spent = false;
+            output.spending_txid = None;
+            output.spending_height = None;
+        }
+    }
+
+    seen_outpoints.clear();
+    for output in outputs.iter() {
+        seen_outpoints.insert((output.tx_hash, output.index_in_tx));
+    }
+
+    if !recent_hashes.is_empty() {
+        if h <= *recent_start {
+            recent_hashes.clear();
+            *recent_start = restore_height;
+        } else {
+            let keep = (h - *recent_start) as usize;
+            if keep < recent_hashes.len() {
+                recent_hashes.truncate(keep);
+            }
+        }
+    }
+
+    block_timestamps.retain(|&height, _| height < h);
+    h
 }
 
 /// Build a wallet2-style short chain history (`block_ids`) from the bounded recent hash window.
@@ -4081,6 +4180,96 @@ mod ledger_rebuild_tests {
         assert!(!output.is_unlocked(100, 1_700_000_099));
         assert!(output.is_unlocked(100, 1_700_000_100));
         assert!(output.is_unlocked(100, 1_700_000_200));
+    }
+
+    #[test]
+    fn find_reorg_rewind_height_detects_shallow_and_deep_forks() {
+        let restore = 100u64;
+        let start = 110u64;
+        let hashes = vec![[1; 32], [2; 32], [3; 32], [4; 32]]; // heights 110..113
+
+        // Tip matches → no rewind.
+        let tip_ok = find_reorg_rewind_height(restore, start, &hashes, |h| {
+            Ok::<_, ()>(hashes[(h - start) as usize])
+        })
+        .unwrap();
+        assert_eq!(tip_ok, None);
+
+        // Shallow fork at tip only → rewind to 113.
+        let shallow = find_reorg_rewind_height(restore, start, &hashes, |h| {
+            if h == 113 {
+                Ok::<_, ()>([9; 32])
+            } else {
+                Ok(hashes[(h - start) as usize])
+            }
+        })
+        .unwrap();
+        assert_eq!(shallow, Some(113));
+
+        // Deeper fork: mismatch from 112 upward → common at 111 → rewind to 112.
+        let deep = find_reorg_rewind_height(restore, start, &hashes, |h| {
+            if h >= 112 {
+                Ok::<_, ()>([9; 32])
+            } else {
+                Ok(hashes[(h - start) as usize])
+            }
+        })
+        .unwrap();
+        assert_eq!(deep, Some(112));
+
+        // No overlap in window → rewind to window start.
+        let none = find_reorg_rewind_height(restore, start, &hashes, |_h| Ok::<_, ()>([9; 32]))
+            .unwrap();
+        assert_eq!(none, Some(start));
+    }
+
+    #[test]
+    fn rewind_working_state_drops_fork_outputs_and_unspends() {
+        let restore = 100u64;
+        let keep_tx = [1u8; 32];
+        let drop_tx = [2u8; 32];
+        let spend_tx = [3u8; 32];
+
+        let mut outputs = vec![
+            out(keep_tx, 1_000, false, None, None),
+            out(drop_tx, 2_000, false, None, None),
+            {
+                let mut spent = out(keep_tx, 500, true, Some(spend_tx), Some(150));
+                spent.index_in_tx = 1;
+                spent.block_height = 120;
+                spent
+            },
+        ];
+        outputs[0].block_height = 120;
+        outputs[1].block_height = 140;
+
+        let mut seen = HashSet::from([
+            (keep_tx, 0),
+            (drop_tx, 0),
+            (keep_tx, 1),
+        ]);
+        let mut recent_start = 120u64;
+        let mut recent: Vec<[u8; 32]> = (120..145).map(|h| [h as u8; 32]).collect();
+        let mut times = HashMap::from([(120u64, 1), (140u64, 2), (150u64, 3)]);
+
+        let next = rewind_working_state_to_height(
+            restore,
+            130,
+            &mut outputs,
+            &mut seen,
+            &mut recent_start,
+            &mut recent,
+            &mut times,
+        );
+        assert_eq!(next, 130);
+        assert_eq!(outputs.len(), 2); // drop_tx gone; keep receive + the spent one unspent
+        assert!(outputs.iter().all(|o| o.block_height < 130));
+        assert!(outputs.iter().any(|o| o.index_in_tx == 1 && !o.spent));
+        assert!(!seen.contains(&(drop_tx, 0)));
+        assert!(!times.contains_key(&140));
+        assert!(!times.contains_key(&150));
+        assert_eq!(recent_start, 120);
+        assert_eq!(recent.len(), 10); // heights 120..129
     }
 }
 

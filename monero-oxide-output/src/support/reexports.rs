@@ -47,6 +47,9 @@ pub(crate) use crate::{
     // Recent hash tracking (wallet2-style).
     push_recent_block_hash,
     push_recent_block_hash_parts,
+    recent_hash_at,
+    find_reorg_rewind_height,
+    rewind_working_state_to_height,
     rebuild_transfer_ledger,
     record_error,
     refresh_cancelled_for_wallet,
