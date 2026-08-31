@@ -432,7 +432,7 @@ fn apply_relayed_tx_local_state(
         .or_insert_with(|| LedgerEntry {
             txid: actual_txid.to_string(),
             direction: "out".to_string(),
-            amount: prepared.amount,
+            amount: outgoing_ledger_amount(prepared.amount, prepared.fee),
             fee: Some(prepared.fee),
             height: None,
             timestamp: Some(state.chain_time),
@@ -2113,7 +2113,7 @@ fn wallet_send_impl(
                     LedgerEntry {
                         txid: hex.clone(),
                         direction: "out".to_string(),
-                        amount: amount_piconero,
+                        amount: outgoing_ledger_amount(amount_piconero, fee_piconero),
                         fee: Some(fee_piconero),
                         height: None,
                         timestamp: Some(state.chain_time),

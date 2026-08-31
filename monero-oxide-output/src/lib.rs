@@ -2574,6 +2574,14 @@ struct LedgerEntry {
     is_coinbase: bool,
 }
 
+/// Outgoing ledger/history amount is always payment + fee.
+///
+/// `PendingOutgoingTx.amount` remains the payment (prepare/send JSON amount); fee is separate.
+/// Ledger rows and transfer history must report the Feather-style net debit.
+pub(crate) fn outgoing_ledger_amount(payment: u64, fee: u64) -> u64 {
+    payment.saturating_add(fee)
+}
+
 #[derive(Default)]
 struct TxLedgerAgg {
     incoming: u64,
@@ -2765,21 +2773,25 @@ pub(crate) fn rebuild_transfer_ledger(
     }
 
     for pending in pending_outgoing {
+        let pending_amount = outgoing_ledger_amount(pending.amount, pending.fee);
+        let pending_fee = if pending.fee > 0 {
+            Some(pending.fee)
+        } else {
+            None
+        };
         match ledger.get_mut(&pending.txid) {
             Some(entry) if entry.direction == "out" => {
-                if entry.fee.is_none() && pending.fee > 0 {
-                    entry.fee = Some(pending.fee);
+                // Exact-send / relay may have inserted payment-only; normalize to payment+fee.
+                entry.amount = pending_amount;
+                if entry.fee.is_none() {
+                    entry.fee = pending_fee;
                 }
             }
             Some(entry) => {
                 // Cache/interrupt path: change was recorded as a receive of our own send.
                 entry.direction = "out".to_string();
-                entry.amount = pending.amount.saturating_add(pending.fee);
-                entry.fee = if pending.fee > 0 {
-                    Some(pending.fee)
-                } else {
-                    None
-                };
+                entry.amount = pending_amount;
+                entry.fee = pending_fee;
                 entry.is_pending = entry.height.is_none();
                 entry.is_coinbase = false;
             }
@@ -2789,12 +2801,8 @@ pub(crate) fn rebuild_transfer_ledger(
                     LedgerEntry {
                         txid: pending.txid.clone(),
                         direction: "out".to_string(),
-                        amount: pending.amount.saturating_add(pending.fee),
-                        fee: if pending.fee > 0 {
-                            Some(pending.fee)
-                        } else {
-                            None
-                        },
+                        amount: pending_amount,
+                        fee: pending_fee,
                         height: None,
                         timestamp: if pending.created_at > 0 {
                             Some(pending.created_at)
@@ -3795,6 +3803,53 @@ mod ledger_rebuild_tests {
         assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(1_044_440_000));
         assert_eq!(ledger.get(&out_id).and_then(|e| e.fee), Some(44_440_000));
         assert_eq!(ledger.get(&out_id).map(|e| e.is_pending), Some(false));
+    }
+
+    #[test]
+    fn outgoing_ledger_amount_is_payment_plus_fee() {
+        assert_eq!(outgoing_ledger_amount(1_000_000_000, 44_440_000), 1_044_440_000);
+        assert_eq!(outgoing_ledger_amount(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn pending_outgoing_normalizes_payment_only_preinserted_ledger_row() {
+        // Exact-send previously inserted payment-only ledger rows. Rebuild must coerce
+        // them to payment+fee while the send is still pending.
+        let spend_tx = [6u8; 32];
+        let out_id = hex_lowercase(&spend_tx);
+        let payment = 1_000_000_000u64;
+        let fee = 44_440_000u64;
+        let pending = [PendingOutgoingTx {
+            txid: out_id.clone(),
+            amount: payment,
+            fee,
+            created_at: 1_700_000_000,
+        }];
+        let mut ledger = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0);
+        assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(payment + fee));
+
+        // Simulate a stale payment-only row already present (relay insert before this fix).
+        ledger.insert(
+            out_id.clone(),
+            LedgerEntry {
+                txid: out_id.clone(),
+                direction: "out".to_string(),
+                amount: payment,
+                fee: Some(fee),
+                height: None,
+                timestamp: Some(1_700_000_000),
+                is_pending: true,
+                is_coinbase: false,
+            },
+        );
+        // Re-run only the pending merge path by rebuilding with empty outputs again.
+        let normalized = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0);
+        assert_eq!(
+            normalized.get(&out_id).map(|e| e.amount),
+            Some(payment + fee)
+        );
+        assert_eq!(normalized.get(&out_id).and_then(|e| e.fee), Some(fee));
+        assert_eq!(normalized.get(&out_id).map(|e| e.is_pending), Some(true));
     }
 
     #[test]

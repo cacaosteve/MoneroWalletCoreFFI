@@ -40,6 +40,7 @@ pub(crate) use crate::{
     map_rpc_error,
     mark_tracked_output_spent,
     master_keys_from_mnemonic_str,
+    outgoing_ledger_amount,
     parse_hex_32,
     // Recent hash tracking (wallet2-style).
     push_recent_block_hash,

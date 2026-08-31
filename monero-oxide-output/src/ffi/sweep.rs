@@ -1580,7 +1580,7 @@ fn wallet_sweep_with_filter_impl(
                 LedgerEntry {
                     txid: hex.clone(),
                     direction: "out".to_string(),
-                    amount: final_amount,
+                    amount: outgoing_ledger_amount(final_amount, final_fee),
                     fee: Some(final_fee),
                     height: None,
                     timestamp: Some(state.chain_time),
