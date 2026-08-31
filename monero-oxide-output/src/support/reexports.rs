@@ -48,6 +48,7 @@ pub(crate) use crate::{
     rebuild_transfer_ledger,
     record_error,
     refresh_cancelled_for_wallet,
+    resolve_daemon_tip_timestamp,
     set_refresh_cancel_for_wallet,
     spend_log_every_n_batches_from_env,
     spend_log_every_n_blocks_from_env,

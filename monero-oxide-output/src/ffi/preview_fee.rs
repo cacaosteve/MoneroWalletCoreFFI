@@ -176,7 +176,7 @@ fn wallet_preview_fee_impl(
 
     let daemon = DaemonStatus {
         height: daemon_height,
-        top_block_timestamp: 0,
+        top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
     let master = snapshot.keys.clone();
@@ -798,7 +798,7 @@ fn wallet_preview_fee_with_filter_impl(
 
     let daemon = DaemonStatus {
         height: daemon_height,
-        top_block_timestamp: 0,
+        top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
     let master = snapshot.keys.clone();

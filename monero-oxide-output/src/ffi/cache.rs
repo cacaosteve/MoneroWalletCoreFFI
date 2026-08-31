@@ -82,6 +82,7 @@ pub extern "C" fn wallet_import_cache(
                     &state.pending_outgoing,
                     &known_fees,
                     state.chain_time,
+                    &state.block_timestamps,
                 );
 
                 // Invariant enforcement:

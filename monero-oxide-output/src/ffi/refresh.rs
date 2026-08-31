@@ -126,6 +126,7 @@ fn commit_refresh_checkpoint(
     known_tx_fees: &HashMap<String, u64>,
     recent_block_hashes_start_height: u64,
     recent_block_hashes: &[[u8; 32]],
+    block_timestamps: &HashMap<u64, u64>,
 ) -> Result<(), c_int> {
     let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
     let Some(state) = map.get_mut(id) else {
@@ -137,6 +138,7 @@ fn commit_refresh_checkpoint(
         &state.pending_outgoing,
         known_tx_fees,
         chain_time,
+        block_timestamps,
     );
     let mut pending_outgoing = state.pending_outgoing.clone();
     pending_outgoing.retain(|pending| match computed_ledger.get(&pending.txid) {
@@ -175,6 +177,7 @@ fn commit_refresh_checkpoint(
     state.pending_outgoing = pending_outgoing;
     state.recent_block_hashes_start_height = recent_block_hashes_start_height;
     state.recent_block_hashes = recent_block_hashes.to_vec();
+    state.block_timestamps = block_timestamps.clone();
     Ok(())
 }
 
@@ -1630,10 +1633,19 @@ fn wallet_refresh_impl(
         id, upstream_block_batch
     ));
 
-    let daemon = DaemonStatus {
+    let tip_timestamp = resolve_daemon_tip_timestamp(&base_url);
+    let mut daemon = DaemonStatus {
         height: daemon_height,
-        top_block_timestamp: 0,
+        top_block_timestamp: tip_timestamp,
     };
+    walletcore_log_line(
+        id,
+        snapshot.network,
+        &format!(
+            "🧭 wallet_refresh stage=daemon_tip_time wallet_id={} tip_timestamp={}",
+            id, daemon.top_block_timestamp
+        ),
+    );
 
     // Keys + scanner
     let master = snapshot.keys.clone();
@@ -1730,6 +1742,7 @@ fn wallet_refresh_impl(
     let mut known_tx_fees = known_transaction_fees(&snapshot.tx_ledger);
     let mut working_recent_block_hashes_start_height = snapshot.recent_block_hashes_start_height;
     let mut working_recent_block_hashes = snapshot.recent_block_hashes.clone();
+    let mut working_block_timestamps = snapshot.block_timestamps.clone();
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
 
     update_scan_progress(
@@ -2764,6 +2777,14 @@ fn wallet_refresh_impl(
                     scannable.block.hash(),
                 );
 
+                let block_timestamp = scannable.block.header.timestamp;
+                if block_timestamp > 0 {
+                    working_block_timestamps.insert(th, block_timestamp);
+                    if block_timestamp > daemon.top_block_timestamp {
+                        daemon.top_block_timestamp = block_timestamp;
+                    }
+                }
+
                 let miner_hash = scannable.block.miner_transaction().hash();
 
                 // Spend detection: build KI map from current working_outputs
@@ -3433,6 +3454,7 @@ fn wallet_refresh_impl(
                 &known_tx_fees,
                 working_recent_block_hashes_start_height,
                 &working_recent_block_hashes,
+                &working_block_timestamps,
             ) {
                 return code;
             }
@@ -3622,6 +3644,7 @@ fn wallet_refresh_impl(
         &known_tx_fees,
         working_recent_block_hashes_start_height,
         &working_recent_block_hashes,
+        &working_block_timestamps,
     ) {
         return code;
     }
@@ -3964,6 +3987,7 @@ mod tests {
             &fees,
             149,
             &hashes,
+            &HashMap::from([(125u64, 1_700_000_000u64)]),
         )
         .expect("checkpoint");
 
@@ -3976,11 +4000,16 @@ mod tests {
             assert_eq!(state.seen_outpoints, seen);
             assert_eq!(state.recent_block_hashes_start_height, 149);
             assert_eq!(state.recent_block_hashes, hashes);
+            assert_eq!(
+                state.block_timestamps.get(&125),
+                Some(&1_700_000_000)
+            );
             let ledger = state
                 .tx_ledger
                 .get(&crate::hex_lowercase(&output.tx_hash))
                 .expect("incoming ledger row");
             assert_eq!(ledger.fee, Some(9_000));
+            assert_eq!(ledger.timestamp, Some(1_700_000_000));
             PersistedWallet::from(state)
         };
         assert_eq!(persisted.last_scanned, 150);
@@ -4005,6 +4034,7 @@ mod tests {
             &HashMap::new(),
             149,
             &[[1; 32], [2; 32]],
+            &HashMap::new(),
         )
         .expect("first checkpoint");
 

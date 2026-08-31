@@ -581,7 +581,7 @@ fn wallet_send_impl(
 
     let daemon = DaemonStatus {
         height: daemon_height,
-        top_block_timestamp: 0,
+        top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
     // Construct master keys and view pair
@@ -2342,7 +2342,7 @@ fn wallet_send_with_filter_impl(
 
     let daemon = DaemonStatus {
         height: daemon_height,
-        top_block_timestamp: 0,
+        top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
     let master = snapshot.keys.clone();

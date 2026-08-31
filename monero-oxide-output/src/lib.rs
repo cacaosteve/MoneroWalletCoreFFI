@@ -2177,6 +2177,20 @@ fn fetch_daemon_status(client: &BlockingRpcTransport) -> Result<DaemonStatus, (c
     }
 }
 
+/// Best-effort tip timestamp from `get_info` (falls back to 0).
+///
+/// Used so time-based unlocks and pending timestamps are not stuck at zero when the
+/// caller already knows the daemon height through another RPC.
+pub(crate) fn resolve_daemon_tip_timestamp(base_url: &str) -> u64 {
+    match BlockingRpcTransport::new(base_url) {
+        Ok(transport) => match fetch_daemon_status(&transport) {
+            Ok(status) => status.top_block_timestamp,
+            Err(_) => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
 fn map_rpc_error(err: RpcError) -> c_int {
     match err {
         // monero-interface error kinds (temporary alias via `type RpcError = InterfaceError`)
@@ -2660,6 +2674,7 @@ pub(crate) fn rebuild_transfer_ledger(
     pending_outgoing: &[PendingOutgoingTx],
     known_fees: &HashMap<String, u64>,
     chain_time: u64,
+    height_timestamps: &HashMap<u64, u64>,
 ) -> HashMap<String, LedgerEntry> {
     let mut by_txid: HashMap<String, TxLedgerAgg> = HashMap::new();
     let mut unattributed: Vec<(u64, Option<u64>, String)> = Vec::new();
@@ -2732,16 +2747,13 @@ pub(crate) fn rebuild_transfer_ledger(
         }
     }
 
-    let timestamp = if chain_time > 0 {
-        Some(chain_time)
-    } else {
-        None
-    };
+    let tip_timestamp = if chain_time > 0 { Some(chain_time) } else { None };
     let mut ledger: HashMap<String, LedgerEntry> = HashMap::new();
 
     for (txid, agg) in by_txid {
         let fee = known_fees.get(&txid).copied();
         if agg.spent > 0 {
+            let height = agg.spend_height.or(agg.incoming_height);
             ledger.insert(
                 txid.clone(),
                 LedgerEntry {
@@ -2749,13 +2761,14 @@ pub(crate) fn rebuild_transfer_ledger(
                     direction: "out".to_string(),
                     amount: agg.spent.saturating_sub(agg.incoming),
                     fee,
-                    height: agg.spend_height.or(agg.incoming_height),
-                    timestamp,
+                    height,
+                    timestamp: ledger_timestamp_for_height(height, height_timestamps),
                     is_pending: false,
                     is_coinbase: false,
                 },
             );
         } else if agg.incoming > 0 {
+            let height = agg.incoming_height;
             ledger.insert(
                 txid.clone(),
                 LedgerEntry {
@@ -2763,8 +2776,8 @@ pub(crate) fn rebuild_transfer_ledger(
                     direction: "in".to_string(),
                     amount: agg.incoming,
                     fee,
-                    height: agg.incoming_height,
-                    timestamp,
+                    height,
+                    timestamp: ledger_timestamp_for_height(height, height_timestamps),
                     is_pending: false,
                     is_coinbase: agg.is_coinbase,
                 },
@@ -2807,7 +2820,7 @@ pub(crate) fn rebuild_transfer_ledger(
                         timestamp: if pending.created_at > 0 {
                             Some(pending.created_at)
                         } else {
-                            timestamp
+                            tip_timestamp
                         },
                         is_pending: true,
                         is_coinbase: false,
@@ -2818,6 +2831,16 @@ pub(crate) fn rebuild_transfer_ledger(
     }
 
     ledger
+}
+
+fn ledger_timestamp_for_height(
+    height: Option<u64>,
+    height_timestamps: &HashMap<u64, u64>,
+) -> Option<u64> {
+    height
+        .filter(|h| *h > 0)
+        .and_then(|h| height_timestamps.get(&h).copied())
+        .filter(|t| *t > 0)
 }
 
 pub(crate) fn confirmations_for_height(chain_height: u64, tx_height: u64) -> u64 {
@@ -2932,6 +2955,12 @@ struct StoredWallet {
     // - `recent_block_hashes[i]` corresponds to height `recent_block_hashes_start_height + i`.
     recent_block_hashes_start_height: u64,
     recent_block_hashes: Vec<[u8; 32]>,
+
+    /// Block height → header timestamp for transfers we have scanned.
+    ///
+    /// Used so ledger history can show per-transaction block times instead of stamping
+    /// every row with the current tip time. Additive; older caches deserialize empty.
+    block_timestamps: HashMap<u64, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2999,6 +3028,10 @@ pub(crate) struct PersistedWallet {
     recent_block_hashes_start_height: u64,
     #[serde(default)]
     recent_block_hashes: Vec<[u8; 32]>,
+
+    /// Height → block header timestamp for accurate transfer history.
+    #[serde(default)]
+    block_timestamps: HashMap<u64, u64>,
 }
 
 impl From<&Timelock> for PersistedTimelock {
@@ -3105,6 +3138,7 @@ impl From<&StoredWallet> for PersistedWallet {
 
             recent_block_hashes_start_height: wallet.recent_block_hashes_start_height,
             recent_block_hashes: wallet.recent_block_hashes.clone(),
+            block_timestamps: wallet.block_timestamps.clone(),
         }
     }
 }
@@ -3143,6 +3177,7 @@ impl PersistedWallet {
         state.invalid_input_quarantine = self.invalid_input_quarantine.into_iter().collect();
         state.recent_block_hashes_start_height = self.recent_block_hashes_start_height;
         state.recent_block_hashes = self.recent_block_hashes;
+        state.block_timestamps = self.block_timestamps;
         state.network = (&self.network).into();
         state.restore_height = self.restore_height;
     }
@@ -3314,6 +3349,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
                     // Start empty; will be populated during refresh.
                     recent_block_hashes_start_height: restore_height,
                     recent_block_hashes: Vec::new(),
+                    block_timestamps: HashMap::new(),
                 });
             }
         }
@@ -3547,6 +3583,7 @@ pub extern "C" fn wallet_force_rescan_from_height(
                 state.invalid_input_quarantine.clear();
                 state.recent_block_hashes_start_height = new_restore_height;
                 state.recent_block_hashes.clear();
+                state.block_timestamps.clear();
 
                 // IMPORTANT: a forced rescan resets our view of wallet state. Any "pending outgoing"
                 // records are now untrustworthy (they may refer to txs we won't rediscover until refresh,
@@ -3636,6 +3673,8 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
                 state.pending_outgoing.clear();
                 // Stale ledger rows would otherwise survive the next refresh as ghost history.
                 state.tx_ledger.clear();
+                // Drop height→timestamp map; it will be rebuilt on the next scan.
+                state.block_timestamps.clear();
 
                 // Balances will be recomputed on next refresh.
                 state.total = 0;
@@ -3726,8 +3765,8 @@ mod ledger_rebuild_tests {
         let outputs = vec![out(tx, 1_427_934_399, false, None, None)];
         let txid = hex_lowercase(&tx);
         let known_fees = HashMap::from([(txid.clone(), 24_680_000)]);
-        let first = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
-        let second = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
+        let first = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0, &HashMap::new());
+        let second = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0, &HashMap::new());
         assert_eq!(first.get(&txid).map(|e| e.amount), Some(1_427_934_399));
         assert_eq!(second.get(&txid).map(|e| e.amount), Some(1_427_934_399));
         assert_eq!(first.get(&txid).map(|e| e.direction.as_str()), Some("in"));
@@ -3746,7 +3785,7 @@ mod ledger_rebuild_tests {
         let in_id = hex_lowercase(&incoming_tx);
         let out_id = hex_lowercase(&spend_tx);
         let known_fees = HashMap::from([(out_id.clone(), 44_440_000)]);
-        let ledger = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0);
+        let ledger = rebuild_transfer_ledger(&outputs, &[], &known_fees, 0, &HashMap::new());
         assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
         assert_eq!(ledger.get(&in_id).map(|e| e.amount), Some(8_042_082_635));
         assert_eq!(
@@ -3768,7 +3807,7 @@ mod ledger_rebuild_tests {
         // Change output is created in the spend block.
         let mut outputs = outputs;
         outputs[1].block_height = 20;
-        let ledger = rebuild_transfer_ledger(&outputs, &[], &HashMap::new(), 0);
+        let ledger = rebuild_transfer_ledger(&outputs, &[], &HashMap::new(), 0, &HashMap::new());
         let in_id = hex_lowercase(&incoming_tx);
         let out_id = hex_lowercase(&spend_tx);
         assert_eq!(ledger.get(&in_id).map(|e| e.direction.as_str()), Some("in"));
@@ -3795,7 +3834,7 @@ mod ledger_rebuild_tests {
         }];
         let out_id = hex_lowercase(&spend_tx);
         let known_fees = HashMap::from([(out_id.clone(), 44_440_000)]);
-        let ledger = rebuild_transfer_ledger(&outputs, &pending, &known_fees, 0);
+        let ledger = rebuild_transfer_ledger(&outputs, &pending, &known_fees, 0, &HashMap::new());
         assert_eq!(
             ledger.get(&out_id).map(|e| e.direction.as_str()),
             Some("out")
@@ -3825,7 +3864,7 @@ mod ledger_rebuild_tests {
             fee,
             created_at: 1_700_000_000,
         }];
-        let mut ledger = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0);
+        let mut ledger = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0, &HashMap::new());
         assert_eq!(ledger.get(&out_id).map(|e| e.amount), Some(payment + fee));
 
         // Simulate a stale payment-only row already present (relay insert before this fix).
@@ -3843,7 +3882,7 @@ mod ledger_rebuild_tests {
             },
         );
         // Re-run only the pending merge path by rebuilding with empty outputs again.
-        let normalized = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0);
+        let normalized = rebuild_transfer_ledger(&[], &pending, &HashMap::new(), 0, &HashMap::new());
         assert_eq!(
             normalized.get(&out_id).map(|e| e.amount),
             Some(payment + fee)
@@ -3914,6 +3953,7 @@ mod ledger_rebuild_tests {
             &[],
             &HashMap::from([(txid.clone(), 28_760_000)]),
             1_700_000_000,
+            &HashMap::from([(10u64, 1_700_000_000u64)]),
         );
         let persisted = PersistedWallet {
             cache_version: WALLETCORE_CACHE_VERSION,
@@ -3932,6 +3972,7 @@ mod ledger_rebuild_tests {
             invalid_input_quarantine: vec![],
             recent_block_hashes_start_height: 1,
             recent_block_hashes: vec![],
+            block_timestamps: HashMap::from([(10u64, 1_700_000_000u64)]),
         };
 
         let bytes = bincode::serialize(&persisted).expect("serialize cache");
@@ -3947,11 +3988,57 @@ mod ledger_rebuild_tests {
             &decoded.pending_outgoing,
             &known_fees,
             decoded.chain_time,
+            &decoded.block_timestamps,
         );
         assert_eq!(
             rebuilt.get(&txid).and_then(|entry| entry.fee),
             Some(28_760_000)
         );
+        assert_eq!(
+            rebuilt.get(&txid).and_then(|entry| entry.timestamp),
+            Some(1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn ledger_uses_per_block_timestamps_not_tip_time() {
+        let tx_a = [11u8; 32];
+        let tx_b = [12u8; 32];
+        let mut older = out(tx_a, 1_000, false, None, None);
+        older.block_height = 100;
+        let mut newer = out(tx_b, 2_000, false, None, None);
+        newer.block_height = 200;
+        let height_times = HashMap::from([(100u64, 1_111), (200u64, 2_222)]);
+        let tip = 9_999u64;
+        let ledger = rebuild_transfer_ledger(
+            &[older, newer],
+            &[],
+            &HashMap::new(),
+            tip,
+            &height_times,
+        );
+        assert_eq!(
+            ledger
+                .get(&hex_lowercase(&tx_a))
+                .and_then(|e| e.timestamp),
+            Some(1_111)
+        );
+        assert_eq!(
+            ledger
+                .get(&hex_lowercase(&tx_b))
+                .and_then(|e| e.timestamp),
+            Some(2_222)
+        );
+    }
+
+    #[test]
+    fn timelock_time_requires_nonzero_chain_time() {
+        let mut output = out([13u8; 32], 5_000, false, None, None);
+        output.additional_timelock = Timelock::Time(1_700_000_100);
+        assert!(!output.is_unlocked(100, 0));
+        assert!(!output.is_unlocked(100, 1_700_000_099));
+        assert!(output.is_unlocked(100, 1_700_000_100));
+        assert!(output.is_unlocked(100, 1_700_000_200));
     }
 }
 
