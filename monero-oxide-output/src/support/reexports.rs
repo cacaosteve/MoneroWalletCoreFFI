@@ -20,6 +20,8 @@ pub(crate) use crate::{
     bulk_fetch_mode_from_env,
     bulk_mode_str,
     // Error handling.
+    wallet_cache_binding,
+    cache_identity_matches,
     clear_last_error,
     // Transfer listing / export helpers (used by transfer FFI module).
     confirmations_for_height,

@@ -20,7 +20,7 @@ use std::ffi::CStr;
 // Cache compatibility version.
 // Bump this when the persisted cache format OR the semantics of persisted fields change
 // in a way that makes old caches unsafe to import (e.g. key image derivation changes).
-const WALLETCORE_CACHE_VERSION: u32 = 2;
+const WALLETCORE_CACHE_VERSION: u32 = 3;
 
 #[no_mangle]
 pub extern "C" fn wallet_import_cache(
@@ -71,6 +71,10 @@ pub extern "C" fn wallet_import_cache(
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get_mut(id) {
             Some(state) => {
+                if let Err(message) = cache_identity_matches(&persisted, state) {
+                    return record_error(-16, message);
+                }
+
                 // Apply persisted snapshot onto in-memory state.
                 persisted.apply_to_state(state);
 
@@ -206,4 +210,122 @@ pub extern "C" fn wallet_export_cache(
 
     clear_last_error();
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::WALLET_STORE;
+    use crate::PersistedNetwork;
+    use std::ffi::CString;
+
+    const TEST_MNEMONIC: &str =
+        "ability pockets lordship tomorrow gypsy match neutral uncle avatar \
+        betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring \
+        paradise psychic betting";
+
+    fn open_wallet(id: &str) {
+        let id = CString::new(id).unwrap();
+        let mnemonic = CString::new(TEST_MNEMONIC).unwrap();
+        assert_eq!(
+            crate::wallet_open_from_mnemonic(id.as_ptr(), mnemonic.as_ptr(), 100, 1),
+            0
+        );
+    }
+
+    fn export_bytes(id: &str) -> Vec<u8> {
+        let id = CString::new(id).unwrap();
+        let mut written = 0usize;
+        // Size probe returns -12 with the required length in `written`.
+        let probe = wallet_export_cache(id.as_ptr(), std::ptr::null_mut(), 0, &mut written);
+        assert_eq!(probe, -12);
+        assert!(written > 0);
+        let mut buf = vec![0u8; written];
+        written = 0;
+        assert_eq!(
+            wallet_export_cache(id.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written),
+            0
+        );
+        buf.truncate(written);
+        buf
+    }
+
+    #[test]
+    fn export_binds_primary_address_and_same_wallet_import_succeeds() {
+        let id = "cache-bind-same";
+        open_wallet(id);
+        let bytes = export_bytes(id);
+        let persisted: PersistedWallet = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(persisted.cache_version, WALLETCORE_CACHE_VERSION);
+        assert!(!persisted.bound_primary_address.is_empty());
+        {
+            let map = WALLET_STORE.lock().unwrap();
+            let state = map.get(id).unwrap();
+            assert_eq!(
+                persisted.bound_primary_address,
+                crate::wallet_cache_binding(state)
+            );
+        }
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(
+            wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()),
+            0
+        );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    fn import_rejects_foreign_wallet_cache() {
+        let id = "cache-bind-foreign";
+        open_wallet(id);
+        let bytes = export_bytes(id);
+        let mut persisted: PersistedWallet = bincode::deserialize(&bytes).unwrap();
+        persisted.bound_primary_address =
+            "4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                .into();
+        let tampered = bincode::serialize(&persisted).unwrap();
+        let id_c = CString::new(id).unwrap();
+        assert_ne!(
+            wallet_import_cache(id_c.as_ptr(), tampered.as_ptr(), tampered.len()),
+            0
+        );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    fn import_rejects_network_mismatch() {
+        let id = "cache-bind-network";
+        open_wallet(id);
+        let bytes = export_bytes(id);
+        let mut persisted: PersistedWallet = bincode::deserialize(&bytes).unwrap();
+        // Keep address (would still fail address check if we changed network-derived address),
+        // force enum mismatch to exercise the network gate independently.
+        persisted.network = match persisted.network {
+            PersistedNetwork::Mainnet => PersistedNetwork::Stagenet,
+            PersistedNetwork::Stagenet => PersistedNetwork::Mainnet,
+        };
+        let tampered = bincode::serialize(&persisted).unwrap();
+        let id_c = CString::new(id).unwrap();
+        assert_ne!(
+            wallet_import_cache(id_c.as_ptr(), tampered.as_ptr(), tampered.len()),
+            0
+        );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    fn import_rejects_missing_binding_even_at_current_version() {
+        let id = "cache-bind-missing";
+        open_wallet(id);
+        let bytes = export_bytes(id);
+        let mut persisted: PersistedWallet = bincode::deserialize(&bytes).unwrap();
+        persisted.bound_primary_address.clear();
+        let tampered = bincode::serialize(&persisted).unwrap();
+        let id_c = CString::new(id).unwrap();
+        assert_ne!(
+            wallet_import_cache(id_c.as_ptr(), tampered.as_ptr(), tampered.len()),
+            0
+        );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
 }

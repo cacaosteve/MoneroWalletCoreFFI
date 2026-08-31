@@ -58,8 +58,9 @@ const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 /// Persisted cache schema / compatibility version.
 ///
 /// Bump this when the persisted cache format or the semantics of persisted fields change
-/// in a way that makes old caches unsafe to import (e.g. key image derivation changes).
-const WALLETCORE_CACHE_VERSION: u32 = 2;
+/// in a way that makes old caches unsafe to import (e.g. key image derivation changes,
+/// or identity-binding fields becoming required).
+const WALLETCORE_CACHE_VERSION: u32 = 3;
 
 fn walletcore_disable_decoys() -> bool {
     matches!(
@@ -2988,7 +2989,7 @@ pub(crate) struct PersistedOutput {
     spending_height: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PersistedNetwork {
     Mainnet,
     Stagenet,
@@ -3002,6 +3003,13 @@ pub(crate) struct PersistedWallet {
     /// will deserialize with version 0 and be rejected by import logic.
     #[serde(default)]
     cache_version: u32,
+
+    /// Primary address of the wallet that produced this cache.
+    ///
+    /// Import must match the open wallet's primary address (and therefore network).
+    /// Empty on legacy blobs; version gate rejects those before binding is checked.
+    #[serde(default)]
+    bound_primary_address: String,
 
     network: PersistedNetwork,
     restore_height: u64,
@@ -3117,6 +3125,7 @@ impl From<&StoredWallet> for PersistedWallet {
     fn from(wallet: &StoredWallet) -> Self {
         Self {
             cache_version: WALLETCORE_CACHE_VERSION,
+            bound_primary_address: wallet_cache_binding(wallet),
 
             network: wallet.network.into(),
             restore_height: wallet.restore_height,
@@ -3141,6 +3150,38 @@ impl From<&StoredWallet> for PersistedWallet {
             block_timestamps: wallet.block_timestamps.clone(),
         }
     }
+}
+
+/// Stable public identity for cache binding: primary address (encodes network).
+pub(crate) fn wallet_cache_binding(wallet: &StoredWallet) -> String {
+    derive_address_string(&wallet.keys, 0, 0, wallet.network)
+}
+
+/// Reject caches that do not belong to the open wallet / network.
+pub(crate) fn cache_identity_matches(
+    persisted: &PersistedWallet,
+    open_wallet: &StoredWallet,
+) -> Result<(), String> {
+    let expected_address = wallet_cache_binding(open_wallet);
+    if persisted.bound_primary_address.is_empty() {
+        return Err(
+            "wallet_import_cache: cache is missing bound_primary_address".to_string(),
+        );
+    }
+    if persisted.bound_primary_address != expected_address {
+        return Err(format!(
+            "wallet_import_cache: cache identity mismatch (cache bound to {}, open wallet is {})",
+            persisted.bound_primary_address, expected_address
+        ));
+    }
+    let expected_network = PersistedNetwork::from(open_wallet.network);
+    if persisted.network != expected_network {
+        return Err(format!(
+            "wallet_import_cache: cache network mismatch (cache {:?}, open wallet {:?})",
+            persisted.network, expected_network
+        ));
+    }
+    Ok(())
 }
 
 impl PersistedWallet {
@@ -3957,6 +3998,7 @@ mod ledger_rebuild_tests {
         );
         let persisted = PersistedWallet {
             cache_version: WALLETCORE_CACHE_VERSION,
+            bound_primary_address: String::new(), // filled below after open wallet in dedicated tests
             network: PersistedNetwork::Mainnet,
             restore_height: 1,
             last_scanned: 10,
