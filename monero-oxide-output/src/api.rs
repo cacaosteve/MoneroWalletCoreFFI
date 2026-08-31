@@ -96,7 +96,7 @@ struct FeeOnly {
     fee: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Transfer {
     pub txid: String,
     pub direction: String,
@@ -108,6 +108,104 @@ pub struct Transfer {
     pub confirmations: u64,
     #[serde(default)]
     pub is_pending: bool,
+    #[serde(default)]
+    pub subaddress_major: Option<u32>,
+    #[serde(default)]
+    pub subaddress_minor: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferHistory {
+    /// Zero identifies the legacy bare-array payload accepted during migration.
+    pub schema_version: u32,
+    pub wallet_id: Option<String>,
+    pub last_scanned_height: Option<u64>,
+    pub chain_height: Option<u64>,
+    pub chain_time: Option<u64>,
+    pub transfers: Vec<Transfer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionedTransferHistory {
+    schema_version: u32,
+    wallet_id: String,
+    last_scanned_height: u64,
+    chain_height: u64,
+    chain_time: u64,
+    transfers: Vec<Transfer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TransferHistoryWire {
+    Legacy(Vec<Transfer>),
+    Versioned(VersionedTransferHistory),
+}
+
+fn decode_transfer_history(json: &str, expected_wallet_id: &str) -> Result<TransferHistory> {
+    let wire: TransferHistoryWire = serde_json::from_str(json).map_err(|err| Error {
+        code: -16,
+        message: format!("transfer JSON: {err}"),
+    })?;
+
+    let history = match wire {
+        TransferHistoryWire::Legacy(transfers) => TransferHistory {
+            schema_version: 0,
+            wallet_id: None,
+            last_scanned_height: None,
+            chain_height: None,
+            chain_time: None,
+            transfers,
+        },
+        TransferHistoryWire::Versioned(envelope) => {
+            if envelope.schema_version != 1 {
+                return Err(Error {
+                    code: -16,
+                    message: format!(
+                        "transfer JSON: unsupported schema_version {} (supported: 1)",
+                        envelope.schema_version
+                    ),
+                });
+            }
+            if envelope.wallet_id != expected_wallet_id {
+                return Err(Error {
+                    code: -16,
+                    message: format!(
+                        "transfer JSON: wallet_id '{}' did not match requested wallet '{}'",
+                        envelope.wallet_id, expected_wallet_id
+                    ),
+                });
+            }
+            TransferHistory {
+                schema_version: envelope.schema_version,
+                wallet_id: Some(envelope.wallet_id),
+                last_scanned_height: Some(envelope.last_scanned_height),
+                chain_height: Some(envelope.chain_height),
+                chain_time: Some(envelope.chain_time),
+                transfers: envelope.transfers,
+            }
+        }
+    };
+
+    for transfer in &history.transfers {
+        if transfer.txid.trim().is_empty() {
+            return Err(Error {
+                code: -16,
+                message: "transfer JSON: transaction id was empty".into(),
+            });
+        }
+        if !matches!(transfer.direction.as_str(), "in" | "out" | "self") {
+            return Err(Error {
+                code: -16,
+                message: format!(
+                    "transfer JSON: unsupported direction '{}' for {}",
+                    transfer.direction, transfer.txid
+                ),
+            });
+        }
+    }
+
+    Ok(history)
 }
 
 fn fail(code: i32) -> Error {
@@ -294,12 +392,77 @@ pub fn get_balance_for_subaddress(wallet_id: &str, subaddress_minor: u32) -> Res
 }
 
 pub fn list_transfers(wallet_id: &str) -> Result<Vec<Transfer>> {
+    Ok(list_transfer_history(wallet_id)?.transfers)
+}
+
+pub fn list_transfer_history(wallet_id: &str) -> Result<TransferHistory> {
     let id = cstr(wallet_id.trim())?;
     let json = take_string(wallet_list_transfers_json(id.as_ptr())).ok_or_else(|| fail(-13))?;
-    serde_json::from_str(&json).map_err(|err| Error {
-        code: -16,
-        message: format!("transfer JSON: {err}"),
-    })
+    decode_transfer_history(&json, wallet_id.trim())
+}
+
+#[cfg(test)]
+mod transfer_history_tests {
+    use super::*;
+
+    const ROW: &str = r#"{
+        "txid":"abababababababababababababababababababababababababababababababab",
+        "direction":"in",
+        "amount":42,
+        "fee":7,
+        "height":3600000,
+        "timestamp":1786000000,
+        "confirmations":10,
+        "is_pending":false,
+        "subaddress_major":0,
+        "subaddress_minor":1
+    }"#;
+
+    #[test]
+    fn accepts_legacy_transfer_array() {
+        let history = decode_transfer_history(&format!("[{ROW}]"), "main_wallet").unwrap();
+        assert_eq!(history.schema_version, 0);
+        assert_eq!(history.wallet_id, None);
+        assert_eq!(history.transfers[0].fee, Some(7));
+        assert_eq!(history.transfers[0].subaddress_minor, Some(1));
+    }
+
+    #[test]
+    fn accepts_v1_and_ignores_additive_fields() {
+        let json = format!(
+            r#"{{"schema_version":1,"wallet_id":"main_wallet","last_scanned_height":3600010,"chain_height":3600020,"chain_time":1787000000,"future_metadata":true,"transfers":[{ROW}]}}"#
+        );
+        let history = decode_transfer_history(&json, "main_wallet").unwrap();
+        assert_eq!(history.schema_version, 1);
+        assert_eq!(history.last_scanned_height, Some(3_600_010));
+        assert_eq!(history.transfers.len(), 1);
+    }
+
+    #[test]
+    fn rejects_future_schema_versions() {
+        let json = format!(
+            r#"{{"schema_version":2,"wallet_id":"main_wallet","last_scanned_height":0,"chain_height":0,"chain_time":0,"transfers":[{ROW}]}}"#
+        );
+        let error = decode_transfer_history(&json, "main_wallet").unwrap_err();
+        assert!(error.message.contains("unsupported schema_version 2"));
+    }
+
+    #[test]
+    fn rejects_wrong_wallet_and_unknown_directions() {
+        let wrong_wallet = format!(
+            r#"{{"schema_version":1,"wallet_id":"other","last_scanned_height":0,"chain_height":0,"chain_time":0,"transfers":[{ROW}]}}"#
+        );
+        assert!(decode_transfer_history(&wrong_wallet, "main_wallet")
+            .unwrap_err()
+            .message
+            .contains("did not match"));
+
+        let unknown = format!("[{}]", ROW.replace("\"in\"", "\"sideways\""));
+        assert!(decode_transfer_history(&unknown, "main_wallet")
+            .unwrap_err()
+            .message
+            .contains("unsupported direction"));
+    }
 }
 
 pub fn import_cache(wallet_id: &str, cache: &[u8]) -> Result<()> {

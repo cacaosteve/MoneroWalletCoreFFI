@@ -235,22 +235,31 @@ char* wallet_export_outputs_json(
  * List transfers (transaction-level history) as a JSON string.
  * Returns a newly-allocated char*; caller must free with walletcore_free_cstr.
  *
- * Intended schema (subject to evolution):
- * [
- *   {
+ * Versioned schema (v1):
+ * {
+ *   "schema_version": 1,
+ *   "wallet_id": "<wallet id>",
+ *   "last_scanned_height": <uint64>,
+ *   "chain_height": <uint64>,
+ *   "chain_time": <uint64>,
+ *   "transfers": [
+ *     {
  *     "txid": "<hex>",
  *     "direction": "in" | "out" | "self",
  *     "amount": <uint64>,          // piconero (net for out may be represented as positive with direction)
- *     "fee": <uint64|null>,        // piconero, present for outgoing
+ *     "fee": <uint64|null>,        // piconero; informational for incoming
  *     "height": <uint64|null>,     // confirmed height
  *     "timestamp": <uint64|null>,  // seconds since epoch if known
  *     "confirmations": <uint64>,   // 0 if pending
  *     "is_pending": <bool>,
  *     "subaddress_major": <uint32|null>,
  *     "subaddress_minor": <uint32|null>
- *   },
- *   ...
- * ]
+ *     }
+ *   ]
+ * }
+ *
+ * Consumers should reject unknown schema versions, ignore additive fields in a
+ * supported version, and may accept the historical bare transfer array as v0.
  */
 char* wallet_list_transfers_json(
     const char* wallet_id

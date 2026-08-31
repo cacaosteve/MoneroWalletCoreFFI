@@ -101,7 +101,7 @@ pub extern "C" fn wallet_list_transfers_json(wallet_id: *const c_char) -> *mut c
         }
     };
 
-    let transfers: Vec<ObservedTransfer> = {
+    let envelope = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         let Some(state) = map.get(id) else {
             record_error(
@@ -148,10 +148,17 @@ pub extern "C" fn wallet_list_transfers_json(wallet_id: *const c_char) -> *mut c
             }
         });
 
-        rows
+        ObservedTransfersEnvelope {
+            schema_version: TRANSFER_HISTORY_SCHEMA_VERSION,
+            wallet_id: id.to_string(),
+            last_scanned_height: state.last_scanned,
+            chain_height: state.chain_height,
+            chain_time: state.chain_time,
+            transfers: rows,
+        }
     };
 
-    let json = match serde_json::to_string(&transfers) {
+    let json = match serde_json::to_string(&envelope) {
         Ok(s) => s,
         Err(err) => {
             record_error(
@@ -174,5 +181,39 @@ pub extern "C" fn wallet_list_transfers_json(wallet_id: *const c_char) -> *mut c
             );
             ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_history_envelope_has_stable_version_and_metadata() {
+        let envelope = ObservedTransfersEnvelope {
+            schema_version: TRANSFER_HISTORY_SCHEMA_VERSION,
+            wallet_id: "main_wallet".into(),
+            last_scanned_height: 3_519_450,
+            chain_height: 3_746_235,
+            chain_time: 1_787_000_000,
+            transfers: vec![ObservedTransfer {
+                txid: "ab".repeat(32),
+                direction: "in".into(),
+                amount: 42,
+                fee: Some(7),
+                height: Some(3_600_000),
+                timestamp: Some(1_786_000_000),
+                confirmations: 146_236,
+                is_pending: false,
+                subaddress_major: None,
+                subaddress_minor: None,
+            }],
+        };
+
+        let value = serde_json::to_value(envelope).expect("serialize transfer history");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["wallet_id"], "main_wallet");
+        assert_eq!(value["last_scanned_height"], 3_519_450);
+        assert_eq!(value["transfers"][0]["fee"], 7);
     }
 }

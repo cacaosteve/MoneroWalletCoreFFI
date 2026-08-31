@@ -65,6 +65,20 @@ public extension WalletCoreFFIClient {
         }
     }
 
+    /// A transaction-history snapshot returned by WalletCore.
+    ///
+    /// `schemaVersion == 0` identifies the legacy bare-array payload. Versioned
+    /// snapshots include scan metadata so callers can associate rows with the
+    /// exact WalletCore checkpoint that produced them.
+    struct TransferHistory: Equatable {
+        public let schemaVersion: UInt32
+        public let walletId: String?
+        public let lastScannedHeight: UInt64?
+        public let chainHeight: UInt64?
+        public let chainTime: UInt64?
+        public let transfers: [Transfer]
+    }
+
     struct SweepPreviewResult: Decodable {
         public let amount: UInt64
         public let fee: UInt64

@@ -56,6 +56,11 @@ let package = Package(
             dependencies: ["MoneroWalletCoreFFI"],
             path: "Utilities/Smoke",
             sources: ["main.swift"]
+        ),
+        .testTarget(
+            name: "MoneroWalletCoreFFITests",
+            dependencies: ["MoneroWalletCoreFFI"],
+            path: "Tests/MoneroWalletCoreFFITests"
         )
     ]
 )

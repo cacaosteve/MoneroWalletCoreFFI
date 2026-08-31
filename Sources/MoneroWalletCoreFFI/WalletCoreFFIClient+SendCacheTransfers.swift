@@ -574,15 +574,108 @@ public extension WalletCoreFFIClient {
         return try WalletCoreFFISupport.takeCString(raw, context: "wallet_list_transfers_json")
     }
 
-    static func listTransfers(walletId: String) throws -> [Transfer] {
-        let json = try exportTransfersJSON(walletId: walletId)
+    private struct VersionedTransferHistory: Decodable {
+        let schemaVersion: UInt32
+        let walletId: String
+        let lastScannedHeight: UInt64
+        let chainHeight: UInt64
+        let chainTime: UInt64
+        let transfers: [Transfer]
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case walletId = "wallet_id"
+            case lastScannedHeight = "last_scanned_height"
+            case chainHeight = "chain_height"
+            case chainTime = "chain_time"
+            case transfers
+        }
+    }
+
+    private enum TransferHistoryWire: Decodable {
+        case legacy([Transfer])
+        case versioned(VersionedTransferHistory)
+
+        init(from decoder: Decoder) throws {
+            if var container = try? decoder.unkeyedContainer() {
+                var transfers: [Transfer] = []
+                while !container.isAtEnd {
+                    transfers.append(try container.decode(Transfer.self))
+                }
+                self = .legacy(transfers)
+                return
+            }
+            self = .versioned(try VersionedTransferHistory(from: decoder))
+        }
+    }
+
+    static func decodeTransferHistoryJSON(
+        _ json: String,
+        expectedWalletId: String
+    ) throws -> TransferHistory {
         guard let data = json.data(using: .utf8) else {
             throw WalletCoreFFIError.decode("wallet_list_transfers_json returned non-UTF8")
         }
+
+        let history: TransferHistory
         do {
-            return try WalletCoreFFISupport.jsonDecoder.decode([Transfer].self, from: data)
+            switch try WalletCoreFFISupport.jsonDecoder.decode(TransferHistoryWire.self, from: data) {
+            case .legacy(let transfers):
+                history = TransferHistory(
+                    schemaVersion: 0,
+                    walletId: nil,
+                    lastScannedHeight: nil,
+                    chainHeight: nil,
+                    chainTime: nil,
+                    transfers: transfers
+                )
+            case .versioned(let envelope):
+                guard envelope.schemaVersion == 1 else {
+                    throw WalletCoreFFIError.decode(
+                        "Unsupported transfer history schema version \(envelope.schemaVersion) (supported: 1)"
+                    )
+                }
+                guard envelope.walletId == expectedWalletId else {
+                    throw WalletCoreFFIError.decode(
+                        "Transfer history wallet '\(envelope.walletId)' did not match requested wallet '\(expectedWalletId)'"
+                    )
+                }
+                history = TransferHistory(
+                    schemaVersion: envelope.schemaVersion,
+                    walletId: envelope.walletId,
+                    lastScannedHeight: envelope.lastScannedHeight,
+                    chainHeight: envelope.chainHeight,
+                    chainTime: envelope.chainTime,
+                    transfers: envelope.transfers
+                )
+            }
+        } catch let error as WalletCoreFFIError {
+            throw error
         } catch {
             throw WalletCoreFFIError.decode("Failed to decode transfers: \(error.localizedDescription)")
         }
+
+        for transfer in history.transfers {
+            guard !transfer.txid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw WalletCoreFFIError.decode("Transfer history contained an empty transaction id")
+            }
+            guard ["in", "out", "self"].contains(transfer.direction) else {
+                throw WalletCoreFFIError.decode(
+                    "Unsupported transfer direction '\(transfer.direction)' for \(transfer.txid)"
+                )
+            }
+        }
+        return history
+    }
+
+    static func transferHistory(walletId: String) throws -> TransferHistory {
+        try decodeTransferHistoryJSON(
+            exportTransfersJSON(walletId: walletId),
+            expectedWalletId: walletId
+        )
+    }
+
+    static func listTransfers(walletId: String) throws -> [Transfer] {
+        try transferHistory(walletId: walletId).transfers
     }
 }

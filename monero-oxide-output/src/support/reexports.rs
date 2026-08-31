@@ -84,6 +84,7 @@ pub(crate) use crate::{
     ObservedOutput,
     ObservedOutputsEnvelope,
     ObservedTransfer,
+    ObservedTransfersEnvelope,
     PendingOutgoingTx,
     // Cache persistence types.
     PersistedWallet,
@@ -97,6 +98,7 @@ pub(crate) use crate::{
     PANIC_HOOK_INSTALLED,
     // Runtime + state.
     TOKIO_RUNTIME,
+    TRANSFER_HISTORY_SCHEMA_VERSION,
     WALLETCORE_LOG_VERSION,
     WALLET_STORE,
 };

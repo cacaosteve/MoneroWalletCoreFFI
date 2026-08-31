@@ -2537,6 +2537,22 @@ pub(crate) struct ObservedTransfer {
     subaddress_minor: Option<u32>,
 }
 
+/// Version of the JSON contract returned by `wallet_list_transfers_json`.
+///
+/// Version 0 was the historical bare array. Version 1 wraps the rows with the
+/// wallet/scan metadata needed to tell which snapshot a consumer decoded.
+pub(crate) const TRANSFER_HISTORY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ObservedTransfersEnvelope {
+    schema_version: u32,
+    wallet_id: String,
+    last_scanned_height: u64,
+    chain_height: u64,
+    chain_time: u64,
+    transfers: Vec<ObservedTransfer>,
+}
+
 /// Persisted ledger entry used to build stable transfer history.
 ///
 /// - Incoming ("in"): `amount` is the total received in that tx to this wallet (sum of outputs).
