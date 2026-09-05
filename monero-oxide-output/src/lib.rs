@@ -2347,7 +2347,9 @@ fn derive_address_string(
 
 #[no_mangle]
 pub extern "C" fn walletcore_version() -> *mut c_char {
-    CString::new("walletcore 0.1.0").unwrap().into_raw()
+    CString::new(concat!("walletcore ", env!("CARGO_PKG_VERSION")))
+        .unwrap()
+        .into_raw()
 }
 
 #[no_mangle]
