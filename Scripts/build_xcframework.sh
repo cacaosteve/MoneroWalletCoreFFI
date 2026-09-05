@@ -74,8 +74,10 @@ if [[ "${INCLUDE_MACCATALYST:-1}" == "1" ]]; then
     "x86_64-apple-ios-macabi"
   )
 fi
-# Optionally include Intel simulator (x86_64) slice
-if [[ "${INCLUDE_INTEL_SIM:-0}" == "1" ]]; then
+# Include the Intel simulator slice by default so generic simulator builds are
+# linkable on both Apple silicon and Intel hosts. Set INCLUDE_INTEL_SIM=0 only
+# for a deliberately arm64-only development artifact.
+if [[ "${INCLUDE_INTEL_SIM:-1}" == "1" ]]; then
   APPLE_TARGETS+=( "x86_64-apple-ios" )  # iOS simulator (x86_64)
 fi
 
@@ -237,6 +239,7 @@ SIM_UNIV="${TMPDIR}/libmonerowalletcore_ios_sim_universal.a"
 if [[ -f "${LIB_IOS_SIM_ARM64}" && -f "${LIB_IOS_SIM_X86_64}" ]]; then
   echo "• Creating iOS simulator universal lib via lipo"
   lipo -create -output "${SIM_UNIV}" "${LIB_IOS_SIM_ARM64}" "${LIB_IOS_SIM_X86_64}"
+  lipo "${SIM_UNIV}" -verify_arch arm64 x86_64
   UNIVERSAL_LIBS+=( "${SIM_UNIV}" )
 else
   if [[ -f "${LIB_IOS_SIM_ARM64}" ]]; then

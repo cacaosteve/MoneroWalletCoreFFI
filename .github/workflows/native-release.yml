@@ -19,11 +19,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
       - name: Build Apple XCFramework
         env:
           OUT_DIR: ${{ github.workspace }}/.build/artifacts
           CARGO_FEATURES: compile-time-generators
+          INCLUDE_INTEL_SIM: 1
         run: ./Scripts/build_xcframework.sh
       - name: Package Apple artifact
         env:
