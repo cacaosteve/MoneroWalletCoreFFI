@@ -13,7 +13,7 @@ jobs:
   apple:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
           ANDROID_NDK_VERSION: not-applicable
           CARGO_FEATURES: compile-time-generators
         run: ./Scripts/package_release_artifacts.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: walletcore-apple
           path: |
@@ -47,12 +47,12 @@ jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           targets: aarch64-linux-android,x86_64-linux-android
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: Install Android SDK and NDK
         run: sdkmanager "platform-tools" "platforms;android-35" "ndk;27.1.12297006"
       - name: Build Android libraries
@@ -72,7 +72,7 @@ jobs:
           ANDROID_NDK_VERSION: 27.1.12297006
           CARGO_FEATURES: compile-time-generators
         run: ./Scripts/package_release_artifacts.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: walletcore-android
           path: |
@@ -85,11 +85,11 @@ jobs:
     needs: [apple, android]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: walletcore-apple
           path: dist/apple
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: walletcore-android
           path: dist/android
