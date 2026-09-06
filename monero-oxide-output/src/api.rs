@@ -9,7 +9,18 @@ use std::{
     ptr,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+pub use crate::ffi::history::{HistoryFilter, HistoryPage, HistoryQuery};
+
+/// Read only a bounded local history page; never contacts a node.
+pub fn query_transfers(wallet_id: &str, query: &HistoryQuery) -> Result<HistoryPage> {
+    crate::ffi::history::query_history(wallet_id, query).map_err(|message| Error { code: -16, message })
+}
+
+pub fn transfer_by_id(wallet_id: &str, txid: &str) -> Result<Option<Transfer>> {
+    Ok(query_transfers(wallet_id, &HistoryQuery { txid: Some(txid.into()), limit: 1, ..Default::default() })?.transfers.into_iter().next())
+}
 
 use crate::{
     wallet_derive_subaddress_from_mnemonic, wallet_export_cache, wallet_force_rescan_from_height,
@@ -96,7 +107,7 @@ struct FeeOnly {
     fee: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transfer {
     pub txid: String,
     pub direction: String,

@@ -10,3 +10,4 @@ pub(crate) mod refresh;
 pub(crate) mod send;
 pub(crate) mod sweep;
 pub(crate) mod transfers;
+pub(crate) mod history;

@@ -3028,6 +3028,7 @@ impl ObservedOutput {
 
 #[derive(Clone)]
 struct StoredWallet {
+    history_index: Option<Arc<ffi::history::HistoryIndex>>,
     keys: MasterKeys,
     restore_height: u64,
     network: MoneroNetwork,
@@ -3472,6 +3473,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
             }
             Entry::Vacant(slot) => {
                 slot.insert(StoredWallet {
+                    history_index: None,
                     keys,
                     restore_height,
                     network,
@@ -3778,6 +3780,7 @@ pub use crate::ffi::sweep::wallet_sweep;
 pub use crate::ffi::sweep::wallet_sweep_with_filter;
 pub use crate::ffi::transfers::wallet_export_outputs_json;
 pub use crate::ffi::transfers::wallet_list_transfers_json;
+pub use crate::ffi::history::wallet_query_transfers_json;
 
 #[no_mangle]
 pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_int {
