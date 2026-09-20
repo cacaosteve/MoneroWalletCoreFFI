@@ -107,8 +107,13 @@ does not republish WalletCore or change consumer pins.
 
 ## Dependency gate
 
+September 20 follow-up: the refreshed RustSec database reported `RUSTSEC-2026-0285` in
+`rustls 0.23.42`. The lockfile now resolves `rustls 0.23.45` and `rustls-webpki 0.103.15`, the
+compatible patched releases. WalletCore library tests pass with that resolution. Consumers must use
+the next WalletCore source/artifact release for this lockfile fix to be present in distributed builds.
+
 `cargo deny check advisories` fetched the advisory database and exited nonzero. It reported
-maintenance advisories, not vulnerability-class advisories, for these resolved Rust dependencies:
+the following remaining maintenance advisories, not vulnerability-class advisories:
 
 | Package | Used by | Advisory |
 | --- | --- | --- |
