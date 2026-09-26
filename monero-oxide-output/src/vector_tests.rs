@@ -2,6 +2,7 @@
 //! Cake mnemonic→address is the only Cake fixture we keep.
 
 use super::*;
+use std::ffi::CString;
 
 const CAKE_MNEMONIC: &str = "ability pockets lordship tomorrow gypsy match neutral uncle avatar \
     betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring \
@@ -64,4 +65,142 @@ fn parse_flipped_character_fails_oxide_checksum() {
     let flipped: String = chars.into_iter().collect();
     assert_ne!(flipped, STANDARD);
     assert!(MoneroAddress::from_str(MoneroNetwork::Mainnet, &flipped).is_err());
+}
+
+#[test]
+fn sealed_lifecycle_keeps_view_state_rewinds_new_outputs_and_closes() {
+    let wallet_id = CString::new("sealed-lifecycle-test").unwrap();
+    let mnemonic = CString::new(CAKE_MNEMONIC).unwrap();
+    assert_eq!(
+        wallet_open_from_mnemonic(wallet_id.as_ptr(), mnemonic.as_ptr(), 100, 1),
+        0
+    );
+
+    {
+        let mut wallets = WALLET_STORE.lock().unwrap();
+        let wallet = wallets.get_mut("sealed-lifecycle-test").unwrap();
+        wallet.last_scanned = 140;
+        wallet.chain_height = 150;
+        wallet.chain_time = 1_700_000_000;
+        wallet.tracked_outputs = vec![
+            TrackedOutput {
+                tx_hash: [1; 32],
+                index_in_tx: 0,
+                key_image: [2; 32],
+                amount: 7,
+                block_height: 110,
+                additional_timelock: Timelock::None,
+                is_coinbase: false,
+                subaddress_major: 0,
+                subaddress_minor: 0,
+                spent: true,
+                spending_txid: Some([3; 32]),
+                spending_height: Some(125),
+            },
+            TrackedOutput {
+                tx_hash: [4; 32],
+                index_in_tx: 0,
+                key_image: [0; 32],
+                amount: 11,
+                block_height: 120,
+                additional_timelock: Timelock::None,
+                is_coinbase: false,
+                subaddress_major: 0,
+                subaddress_minor: 1,
+                spent: false,
+                spending_txid: None,
+                spending_height: None,
+            },
+        ];
+        wallet.seen_outpoints = HashSet::from([([1; 32], 0), ([4; 32], 0)]);
+        wallet.total = 11;
+        wallet.unlocked = 11;
+        wallet.spend_rescan_from = Some(120);
+
+        let persisted = PersistedWallet::from(&*wallet);
+        let encoded = bincode::serialize(&persisted).unwrap();
+        let decoded: PersistedWallet = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.spend_rescan_from, Some(120));
+    }
+
+    assert_eq!(wallet_seal(wallet_id.as_ptr(), 1_000), 0);
+    let mut sealed = 0;
+    assert_eq!(wallet_is_sealed(wallet_id.as_ptr(), &mut sealed), 0);
+    assert_eq!(sealed, 1);
+
+    // Read-only wallet state remains available while private spend authority is absent.
+    let (mut total, mut unlocked) = (0, 0);
+    assert_eq!(
+        wallet_get_balance(wallet_id.as_ptr(), &mut total, &mut unlocked),
+        0
+    );
+    assert_eq!((total, unlocked), (11, 11));
+
+    // A different valid seed must not be allowed to rebind an already-open wallet.
+    let mut generated = [0_i8; 512];
+    let mut generated_len = 0;
+    assert_eq!(
+        wallet_generate_mnemonic_english(
+            generated.as_mut_ptr(),
+            generated.len(),
+            &mut generated_len,
+        ),
+        0
+    );
+    assert_eq!(
+        wallet_unseal_from_mnemonic(wallet_id.as_ptr(), generated.as_ptr(), 1_000),
+        -16
+    );
+    assert_eq!(wallet_is_sealed(wallet_id.as_ptr(), &mut sealed), 0);
+    assert_eq!(sealed, 1);
+
+    assert_eq!(
+        wallet_unseal_from_mnemonic(wallet_id.as_ptr(), mnemonic.as_ptr(), 1_000),
+        0
+    );
+    assert_eq!(wallet_is_sealed(wallet_id.as_ptr(), &mut sealed), 0);
+    assert_eq!(sealed, 0);
+
+    {
+        let wallets = WALLET_STORE.lock().unwrap();
+        let wallet = &wallets["sealed-lifecycle-test"];
+        assert_eq!(wallet.last_scanned, 120);
+        assert_eq!(wallet.spend_rescan_from, None);
+        assert_eq!(wallet.tracked_outputs.len(), 1);
+        assert_eq!(wallet.tracked_outputs[0].block_height, 110);
+        assert!(!wallet.tracked_outputs[0].spent);
+        assert_eq!((wallet.total, wallet.unlocked), (7, 7));
+    }
+
+    assert_eq!(wallet_close(wallet_id.as_ptr(), 1_000), 0);
+    assert_eq!(wallet_is_sealed(wallet_id.as_ptr(), &mut sealed), -13);
+}
+
+#[test]
+fn sealed_spend_rescan_marker_never_advances_a_reorged_cursor() {
+    let wallet_id = CString::new("sealed-reorg-marker-test").unwrap();
+    let mnemonic = CString::new(CAKE_MNEMONIC).unwrap();
+    assert_eq!(
+        wallet_open_from_mnemonic(wallet_id.as_ptr(), mnemonic.as_ptr(), 100, 1),
+        0
+    );
+    {
+        let mut wallets = WALLET_STORE.lock().unwrap();
+        let wallet = wallets.get_mut("sealed-reorg-marker-test").unwrap();
+        wallet.last_scanned = 115;
+        wallet.spend_rescan_from = Some(120);
+    }
+
+    assert_eq!(wallet_seal(wallet_id.as_ptr(), 1_000), 0);
+    assert_eq!(
+        wallet_unseal_from_mnemonic(wallet_id.as_ptr(), mnemonic.as_ptr(), 1_000),
+        0
+    );
+    {
+        let wallets = WALLET_STORE.lock().unwrap();
+        let wallet = &wallets["sealed-reorg-marker-test"];
+        assert_eq!(wallet.last_scanned, 115);
+        assert_eq!(wallet.spend_rescan_from, None);
+    }
+    assert_eq!(wallet_close(wallet_id.as_ptr(), 1_000), 0);
 }

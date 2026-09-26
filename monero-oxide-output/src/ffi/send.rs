@@ -325,15 +325,19 @@ fn wallet_relay_prepared_impl(
     };
     // This runs before blob decoding or ANY RPC. The refresh registry lock also excludes
     // wallet replacement for the entire relay, so validation and local application agree.
-    let binding_result = {
+    let binding_result: Result<(), (i32, &str)> = {
         let store = WALLET_STORE.lock().expect("wallet store poisoned");
-        store
-            .get(id)
-            .ok_or("wallet not opened")
-            .and_then(|wallet| validate_prepared_binding(&prepared, wallet))
+        match store.get(id) {
+            None => Err((-13, "wallet not opened")),
+            Some(wallet) if wallet.keys.is_sealed() => {
+                Err((-40, "wallet is sealed; authenticate before relaying a prepared send"))
+            }
+            Some(wallet) => validate_prepared_binding(&prepared, wallet)
+                .map_err(|message| (-10, message)),
+        }
     };
-    if let Err(error) = binding_result {
-        record_error(-10, format!("wallet_relay_prepared: {error}"));
+    if let Err((code, error)) = binding_result {
+        record_error(code, format!("wallet_relay_prepared: {error}"));
         return ptr::null_mut();
     }
     let tx_bytes = match decode_hex(&prepared.signed_tx_hex) {
@@ -612,7 +616,13 @@ fn wallet_send_impl(
     };
 
     // Construct master keys and view pair
-    let master = snapshot.keys.clone();
+    let master = match snapshot.keys.master().cloned() {
+        Some(keys) => keys,
+        None => {
+            record_error(-40, "wallet_send: wallet is sealed; authenticate before sending");
+            return ptr::null_mut();
+        }
+    };
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
@@ -2373,7 +2383,16 @@ fn wallet_send_with_filter_impl(
         top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
-    let master = snapshot.keys.clone();
+    let master = match snapshot.keys.master().cloned() {
+        Some(keys) => keys,
+        None => {
+            record_error(
+                -40,
+                "wallet_send_with_filter: wallet is sealed; authenticate before sending",
+            );
+            return ptr::null_mut();
+        }
+    };
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
@@ -3217,6 +3236,43 @@ mod tests {
             .lock()
             .unwrap()
             .remove("prepared-binding-native-fixture");
+    }
+
+    #[test]
+    fn native_relay_requires_unsealed_spend_authority() {
+        use super::*;
+        let id = CString::new("prepared-sealed-native-fixture").unwrap();
+        let seed = CString::new("ability pockets lordship tomorrow gypsy match neutral uncle avatar betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring paradise psychic betting").unwrap();
+        assert_eq!(
+            crate::wallet_open_from_mnemonic(id.as_ptr(), seed.as_ptr(), 100, 1),
+            0
+        );
+        let binding = {
+            let store = WALLET_STORE.lock().unwrap();
+            wallet_cache_binding(&store["prepared-sealed-native-fixture"])
+        };
+        assert_eq!(crate::wallet_seal(id.as_ptr(), 1_000), 0);
+
+        let payload = CString::new(
+            serde_json::json!({
+                "txid": "fixture",
+                "amount": 1,
+                "fee": 1,
+                "signed_tx_hex": "not-hex",
+                "wallet_binding": binding,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let node = CString::new("not-a-node-url").unwrap();
+        assert!(wallet_relay_prepared(id.as_ptr(), node.as_ptr(), payload.as_ptr()).is_null());
+        assert!(crate::last_error_clone()
+            .unwrap()
+            .contains("authenticate before relaying"));
+        WALLET_STORE
+            .lock()
+            .unwrap()
+            .remove("prepared-sealed-native-fixture");
     }
 
     #[test]

@@ -296,7 +296,16 @@ fn wallet_preview_sweep_with_filter_impl(
         top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
-    let master = snapshot.keys.clone();
+    let master = match snapshot.keys.master().cloned() {
+        Some(keys) => keys,
+        None => {
+            record_error(
+                -40,
+                "wallet_preview_sweep_with_filter: wallet is sealed; authenticate before spending",
+            );
+            return ptr::null_mut();
+        }
+    };
 
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,
@@ -976,7 +985,16 @@ fn wallet_sweep_with_filter_impl(
         top_block_timestamp: resolve_daemon_tip_timestamp(&base_url),
     };
 
-    let master = snapshot.keys.clone();
+    let master = match snapshot.keys.master().cloned() {
+        Some(keys) => keys,
+        None => {
+            record_error(
+                -40,
+                "wallet_sweep_with_filter: wallet is sealed; authenticate before spending",
+            );
+            return ptr::null_mut();
+        }
+    };
 
     let view_pair = match master.to_view_pair() {
         Ok(pair) => pair,

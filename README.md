@@ -29,6 +29,10 @@ This README explains how to consume the package on Apple platforms, how Linux li
 - Balance, transfers, subaddress derivation, fee preview
 - Send / sweep via **prepare → durable local persist → relay** (apps recover pending prepares across relaunch)
 - Secret hygiene: in-memory keys (not a long-lived mnemonic string); KI/amount diagnostic dumps are env-gated
+- Explicit sealed-wallet lifecycle: `wallet_seal` zeroizes spend authority while retaining the
+  private view key for receive/background scanning; fee preparation, send, sweep, and prepared-tx
+  relay fail closed until authenticated `wallet_unseal_from_mnemonic`. `wallet_close` drops both
+  view and spend material after a bounded refresh cancellation wait.
 
 ### Security defaults
 
@@ -41,6 +45,12 @@ diagnostics require **both** the `diagnostic-logging` Cargo feature and
 `WALLETCORE_DIAGNOSTICS=1`. Do not enable this feature in distributed artifacts or
 share diagnostic logs from real wallets. Explicit benchmark RPC timing telemetry
 remains separate and opt-in.
+
+The sealed state is intentionally view-only, not keyless: compromise of a live process may expose
+the private view key and therefore wallet activity. It cannot authorize a spend. Hosts should use
+sealed mode only for bounded background sync and call `wallet_close` at their protected idle/session
+boundary. Outputs first discovered while sealed cause a bounded rewind on unseal so key images and
+spend detection are rebuilt with the authenticated spend key.
 
 
 ## Supported platforms

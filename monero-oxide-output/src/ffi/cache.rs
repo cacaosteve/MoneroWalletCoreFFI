@@ -21,7 +21,7 @@ use std::ffi::CStr;
 // Cache compatibility version.
 // Bump this when the persisted cache format OR the semantics of persisted fields change
 // in a way that makes old caches unsafe to import (e.g. key image derivation changes).
-const WALLETCORE_CACHE_VERSION: u32 = 3;
+const WALLETCORE_CACHE_VERSION: u32 = 4;
 // Shared with host file readers. Bound both wire bytes and decoder work before allocating.
 pub const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -91,6 +91,14 @@ pub extern "C" fn wallet_import_cache(
 
                 // Apply persisted snapshot onto in-memory state.
                 persisted.apply_to_state(state);
+
+                // A view-only scan may have been persisted immediately before the OS killed
+                // the process. This import occurs after the mnemonic opened an unsealed wallet,
+                // so honor the persisted marker here instead of waiting for an unseal call that
+                // will never occur in this launch sequence.
+                if state.keys.master().is_some() {
+                    crate::apply_pending_spend_rescan(state);
+                }
 
                 // Rebuild from tracked outputs on every import. Previous incoming-only rebuild
                 // overwrote spend rows with change-as-receive and ignored outgoing net amounts.
@@ -372,6 +380,74 @@ mod tests {
             wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()),
             0
         );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    fn import_into_unsealed_wallet_applies_view_only_spend_rescan_marker() {
+        let id = "cache-view-only-restart";
+        open_wallet(id);
+        {
+            let mut store = WALLET_STORE.lock().unwrap();
+            let wallet = store.get_mut(id).unwrap();
+            wallet.last_scanned = 140;
+            wallet.chain_height = 150;
+            wallet.chain_time = 1_700_000_000;
+            wallet.tracked_outputs = vec![
+                crate::TrackedOutput {
+                    tx_hash: [1; 32],
+                    index_in_tx: 0,
+                    key_image: [2; 32],
+                    amount: 7,
+                    block_height: 110,
+                    additional_timelock: crate::Timelock::None,
+                    is_coinbase: false,
+                    subaddress_major: 0,
+                    subaddress_minor: 0,
+                    spent: true,
+                    spending_txid: Some([3; 32]),
+                    spending_height: Some(125),
+                },
+                crate::TrackedOutput {
+                    tx_hash: [4; 32],
+                    index_in_tx: 0,
+                    key_image: [0; 32],
+                    amount: 11,
+                    block_height: 120,
+                    additional_timelock: crate::Timelock::None,
+                    is_coinbase: false,
+                    subaddress_major: 0,
+                    subaddress_minor: 1,
+                    spent: false,
+                    spending_txid: None,
+                    spending_height: None,
+                },
+            ];
+            wallet.seen_outpoints =
+                std::collections::HashSet::from([([1; 32], 0), ([4; 32], 0)]);
+            wallet.spend_rescan_from = Some(120);
+        }
+        let bytes = export_bytes(id);
+
+        // Model process death: the replacement wallet is opened from authenticated storage,
+        // then the view-only cache is imported before refresh begins.
+        WALLET_STORE.lock().unwrap().remove(id);
+        open_wallet(id);
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(
+            wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()),
+            0
+        );
+
+        let store = WALLET_STORE.lock().unwrap();
+        let wallet = &store[id];
+        assert_eq!(wallet.last_scanned, 120);
+        assert_eq!(wallet.spend_rescan_from, None);
+        assert_eq!(wallet.tracked_outputs.len(), 1);
+        assert_eq!(wallet.tracked_outputs[0].block_height, 110);
+        assert!(!wallet.tracked_outputs[0].spent);
+        assert_eq!((wallet.total, wallet.unlocked), (7, 7));
+        drop(store);
         WALLET_STORE.lock().unwrap().remove(id);
     }
 

@@ -87,7 +87,7 @@ const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 /// Bump this when the persisted cache format or the semantics of persisted fields change
 /// in a way that makes old caches unsafe to import (e.g. key image derivation changes,
 /// or identity-binding fields becoming required).
-const WALLETCORE_CACHE_VERSION: u32 = 3;
+const WALLETCORE_CACHE_VERSION: u32 = 4;
 
 fn walletcore_disable_decoys() -> bool {
     matches!(
@@ -1576,6 +1576,105 @@ impl Drop for MasterKeys {
     }
 }
 
+/// Key material retained while a protected wallet is sealed. The public spend
+/// key plus private view key are sufficient to recognize incoming outputs and
+/// derive subaddresses, but cannot authorize a spend.
+#[derive(Clone)]
+struct ViewKeys {
+    spend_public: curve25519_dalek::EdwardsPoint,
+    view_scalar_dalek: curve25519_dalek::Scalar,
+    view_scalar_ed: EdScalar,
+}
+
+impl Drop for ViewKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.view_scalar_dalek.zeroize();
+        self.view_scalar_ed.zeroize();
+    }
+}
+
+#[derive(Clone)]
+enum WalletKeys {
+    Unsealed(MasterKeys),
+    Sealed(ViewKeys),
+}
+
+impl WalletKeys {
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed(_))
+    }
+
+    fn master(&self) -> Option<&MasterKeys> {
+        match self {
+            Self::Unsealed(keys) => Some(keys),
+            Self::Sealed(_) => None,
+        }
+    }
+
+    fn to_view_pair(&self) -> Result<ViewPair, c_int> {
+        let spend_public = match self {
+            Self::Unsealed(keys) => EdPoint::from(ED25519_BASEPOINT_POINT * keys.spend_scalar),
+            Self::Sealed(keys) => EdPoint::from(keys.spend_public),
+        };
+        let view_scalar = match self {
+            Self::Unsealed(keys) => Zeroizing::new(keys.view_scalar_ed.clone()),
+            Self::Sealed(keys) => Zeroizing::new(keys.view_scalar_ed.clone()),
+        };
+        ViewPair::new(spend_public, view_scalar).map_err(|_| -16)
+    }
+
+    fn seal(&self) -> Self {
+        match self {
+            Self::Unsealed(keys) => Self::Sealed(keys.view_keys()),
+            Self::Sealed(keys) => Self::Sealed(keys.clone()),
+        }
+    }
+}
+
+trait ViewKeyMaterial {
+    fn spend_public_dalek(&self) -> curve25519_dalek::EdwardsPoint;
+    fn view_scalar_dalek(&self) -> curve25519_dalek::Scalar;
+    fn view_scalar_ed(&self) -> EdScalar;
+}
+
+impl ViewKeyMaterial for MasterKeys {
+    fn spend_public_dalek(&self) -> curve25519_dalek::EdwardsPoint {
+        ED25519_BASEPOINT_POINT * self.spend_scalar
+    }
+
+    fn view_scalar_dalek(&self) -> curve25519_dalek::Scalar {
+        self.view_scalar_dalek
+    }
+
+    fn view_scalar_ed(&self) -> EdScalar {
+        self.view_scalar_ed.clone()
+    }
+}
+
+impl ViewKeyMaterial for WalletKeys {
+    fn spend_public_dalek(&self) -> curve25519_dalek::EdwardsPoint {
+        match self {
+            Self::Unsealed(keys) => keys.spend_public_dalek(),
+            Self::Sealed(keys) => keys.spend_public,
+        }
+    }
+
+    fn view_scalar_dalek(&self) -> curve25519_dalek::Scalar {
+        match self {
+            Self::Unsealed(keys) => keys.view_scalar_dalek,
+            Self::Sealed(keys) => keys.view_scalar_dalek,
+        }
+    }
+
+    fn view_scalar_ed(&self) -> EdScalar {
+        match self {
+            Self::Unsealed(keys) => keys.view_scalar_ed.clone(),
+            Self::Sealed(keys) => keys.view_scalar_ed.clone(),
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 struct ZmqRuntime {
     endpoint: String,
@@ -1737,6 +1836,14 @@ impl MasterKeys {
         let spend_point = EdPoint::from(ED25519_BASEPOINT_POINT * self.spend_scalar);
         let view_scalar = Zeroizing::new(self.view_scalar_ed.clone());
         ViewPair::new(spend_point, view_scalar).map_err(|_| -16)
+    }
+
+    fn view_keys(&self) -> ViewKeys {
+        ViewKeys {
+            spend_public: ED25519_BASEPOINT_POINT * self.spend_scalar,
+            view_scalar_dalek: self.view_scalar_dalek,
+            view_scalar_ed: self.view_scalar_ed.clone(),
+        }
     }
 }
 
@@ -2326,15 +2433,15 @@ fn map_rpc_error(err: RpcError) -> c_int {
     }
 }
 
-fn derive_address_string(
-    keys: &MasterKeys,
+fn derive_address_string<K: ViewKeyMaterial>(
+    keys: &K,
     account_index: u32,
     subaddress_index: u32,
     network: MoneroNetwork,
 ) -> String {
     if account_index == 0 && subaddress_index == 0 {
-        let spend_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.spend_scalar);
-        let view_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.view_scalar_dalek);
+        let spend_pub = EdPoint::from(keys.spend_public_dalek());
+        let view_pub = EdPoint::from(ED25519_BASEPOINT_POINT * keys.view_scalar_dalek());
         MoneroAddress::new(network, MoneroAddressType::Legacy, spend_pub, view_pub).to_string()
     } else {
         // Monero wallet2 subaddress derivation:
@@ -2344,14 +2451,14 @@ fn derive_address_string(
         // C = a*D                                                where a = private view key scalar
         //
         // Address = (D, C) encoded as a subaddress for the given network.
-        let spend_pub = ED25519_BASEPOINT_POINT * keys.spend_scalar;
-        let view_scalar = keys.view_scalar_dalek;
+        let spend_pub = keys.spend_public_dalek();
+        let view_scalar = keys.view_scalar_dalek();
 
         let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
         data.extend_from_slice(b"SubAddr\0");
 
         // Use the Monero ed25519 Scalar bytes directly to match wallet2 behavior.
-        let view_key_bytes: [u8; 32] = <[u8; 32]>::from(keys.view_scalar_ed);
+        let view_key_bytes: [u8; 32] = <[u8; 32]>::from(keys.view_scalar_ed());
         data.extend_from_slice(&view_key_bytes);
 
         data.extend_from_slice(&account_index.to_le_bytes());
@@ -3055,7 +3162,7 @@ impl ObservedOutput {
 #[derive(Clone)]
 struct StoredWallet {
     history_index: Option<Arc<ffi::history::HistoryIndex>>,
-    keys: MasterKeys,
+    keys: WalletKeys,
     restore_height: u64,
     network: MoneroNetwork,
     last_scanned: u64,
@@ -3090,6 +3197,11 @@ struct StoredWallet {
     /// Used so ledger history can show per-transaction block times instead of stamping
     /// every row with the current tip time. Additive; older caches deserialize empty.
     block_timestamps: HashMap<u64, u64>,
+
+    /// Earliest height whose spend state must be rebuilt after an authenticated
+    /// unseal. A view-only scan can recognize a new output but cannot derive its
+    /// key image without the private spend key.
+    spend_rescan_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3168,6 +3280,9 @@ pub(crate) struct PersistedWallet {
     /// Height → block header timestamp for accurate transfer history.
     #[serde(default)]
     block_timestamps: HashMap<u64, u64>,
+
+    #[serde(default)]
+    spend_rescan_from: Option<u64>,
 }
 
 impl From<&Timelock> for PersistedTimelock {
@@ -3276,6 +3391,7 @@ impl From<&StoredWallet> for PersistedWallet {
             recent_block_hashes_start_height: wallet.recent_block_hashes_start_height,
             recent_block_hashes: wallet.recent_block_hashes.clone(),
             block_timestamps: wallet.block_timestamps.clone(),
+            spend_rescan_from: wallet.spend_rescan_from,
         }
     }
 }
@@ -3347,6 +3463,7 @@ impl PersistedWallet {
         state.recent_block_hashes_start_height = self.recent_block_hashes_start_height;
         state.recent_block_hashes = self.recent_block_hashes;
         state.block_timestamps = self.block_timestamps;
+        state.spend_rescan_from = self.spend_rescan_from;
         state.network = (&self.network).into();
         state.restore_height = self.restore_height;
     }
@@ -3354,6 +3471,231 @@ impl PersistedWallet {
 
 static WALLET_STORE: Lazy<Mutex<HashMap<String, StoredWallet>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Apply the authoritative rewind requested by a prior view-only scan. This is
+/// deliberately separate from unsealing: after process death the marker is
+/// restored by cache import into a newly opened (already unsealed) wallet.
+pub(crate) fn apply_pending_spend_rescan(state: &mut StoredWallet) -> bool {
+    if let Some(rewind_from) = state.spend_rescan_from.take() {
+        // A reorg may already have moved the cursor below the original marker and
+        // removed the view-only output. A cleanup rewind must never advance the
+        // cursor past blocks which have not been scanned on the replacement chain.
+        let rewind_from = rewind_from.min(state.last_scanned);
+        state.last_scanned = rewind_working_state_to_height(
+            state.restore_height,
+            rewind_from,
+            &mut state.tracked_outputs,
+            &mut state.seen_outpoints,
+            &mut state.recent_block_hashes_start_height,
+            &mut state.recent_block_hashes,
+            &mut state.block_timestamps,
+        );
+        state.history_index = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn restore_spend_authority(state: &mut StoredWallet, keys: MasterKeys) -> Result<(), String> {
+    let current_address = derive_address_string(&state.keys, 0, 0, state.network);
+    let supplied_address = derive_address_string(&keys, 0, 0, state.network);
+    if current_address != supplied_address {
+        return Err("wallet_unseal_from_mnemonic: mnemonic does not match the sealed wallet".into());
+    }
+
+    state.keys = WalletKeys::Unsealed(keys);
+
+    if apply_pending_spend_rescan(state) {
+        let known_fees = known_transaction_fees(&state.tx_ledger);
+        state.tx_ledger = rebuild_transfer_ledger(
+            &state.tracked_outputs,
+            &state.pending_outgoing,
+            &known_fees,
+            state.chain_time,
+            &state.block_timestamps,
+        );
+        state.total = 0;
+        state.unlocked = 0;
+        for output in &state.tracked_outputs {
+            if output.spent {
+                continue;
+            }
+            state.total = state.total.saturating_add(output.amount);
+            if output.is_unlocked(state.chain_height, state.chain_time) {
+                state.unlocked = state.unlocked.saturating_add(output.amount);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_wait_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(if timeout_ms == 0 {
+        30_000
+    } else {
+        timeout_ms.min(120_000)
+    })
+}
+
+fn lifecycle_wallet_id(wallet_id: *const c_char, operation: &str) -> Result<String, c_int> {
+    if wallet_id.is_null() {
+        return Err(record_error(
+            -11,
+            format!("{operation}: wallet_id pointer was null"),
+        ));
+    }
+    let id = unsafe { CStr::from_ptr(wallet_id) }
+        .to_str()
+        .map_err(|_| record_error(-10, format!("{operation}: wallet_id contained invalid UTF-8")))?
+        .trim();
+    if id.is_empty() {
+        return Err(record_error(-14, format!("{operation}: wallet_id was empty")));
+    }
+    Ok(id.to_owned())
+}
+
+/// Remove private spend material while retaining only the private view key and
+/// public spend key. Refresh remains available in this state; send/preview APIs
+/// fail closed until `wallet_unseal_from_mnemonic` succeeds.
+#[no_mangle]
+pub extern "C" fn wallet_seal(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
+    clear_last_error();
+    let id = match lifecycle_wallet_id(wallet_id, "wallet_seal") {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+
+    set_refresh_cancel_for_wallet(&id, true);
+    match crate::ffi::refresh::with_wallet_lifecycle_exclusion(
+        &id,
+        lifecycle_wait_timeout(timeout_ms),
+        || {
+            let mut wallets = WALLET_STORE.lock().expect("wallet store poisoned");
+            let Some(wallet) = wallets.get_mut(&id) else {
+                return record_error(-13, format!("wallet_seal: wallet '{id}' not opened"));
+            };
+            wallet.keys = wallet.keys.seal();
+            clear_last_error();
+            0
+        },
+    ) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_seal: timed out waiting for wallet '{id}' operations to stop"),
+        ),
+    }
+}
+
+/// Restore spend authority after platform authentication. If view-only refresh
+/// discovered outputs while sealed, rewind only the affected interval so key
+/// images and spend history are rebuilt authoritatively on the next refresh.
+#[no_mangle]
+pub extern "C" fn wallet_unseal_from_mnemonic(
+    wallet_id: *const c_char,
+    mnemonic_ptr: *const c_char,
+    timeout_ms: u64,
+) -> c_int {
+    clear_last_error();
+    let id = match lifecycle_wallet_id(wallet_id, "wallet_unseal_from_mnemonic") {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+    let keys = match master_keys_from_mnemonic_ptr(mnemonic_ptr) {
+        Ok(keys) => keys,
+        Err(code) => {
+            return record_error(code, "wallet_unseal_from_mnemonic: invalid mnemonic")
+        }
+    };
+
+    set_refresh_cancel_for_wallet(&id, true);
+    let result = match crate::ffi::refresh::with_wallet_lifecycle_exclusion(
+        &id,
+        lifecycle_wait_timeout(timeout_ms),
+        || {
+            let mut wallets = WALLET_STORE.lock().expect("wallet store poisoned");
+            let Some(wallet) = wallets.get_mut(&id) else {
+                return record_error(
+                    -13,
+                    format!("wallet_unseal_from_mnemonic: wallet '{id}' not opened"),
+                );
+            };
+            match restore_spend_authority(wallet, keys) {
+                Ok(()) => {
+                    clear_last_error();
+                    0
+                }
+                Err(message) => record_error(-16, message),
+            }
+        },
+    ) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!(
+                "wallet_unseal_from_mnemonic: timed out waiting for wallet '{id}' operations to stop"
+            ),
+        ),
+    };
+    if result == 0 {
+        set_refresh_cancel_for_wallet(&id, false);
+    }
+    result
+}
+
+/// Fully remove a wallet from process memory. This drops both spend and view
+/// material after a bounded refresh cancellation wait.
+#[no_mangle]
+pub extern "C" fn wallet_close(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
+    clear_last_error();
+    let id = match lifecycle_wallet_id(wallet_id, "wallet_close") {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+    set_refresh_cancel_for_wallet(&id, true);
+    match crate::ffi::refresh::with_wallet_lifecycle_exclusion(
+        &id,
+        lifecycle_wait_timeout(timeout_ms),
+        || {
+            let removed = WALLET_STORE
+                .lock()
+                .expect("wallet store poisoned")
+                .remove(&id);
+            match removed {
+                Some(_) => {
+                    clear_last_error();
+                    0
+                }
+                None => record_error(-13, format!("wallet_close: wallet '{id}' not opened")),
+            }
+        },
+    ) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_close: timed out waiting for wallet '{id}' operations to stop"),
+        ),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_is_sealed(wallet_id: *const c_char, out_sealed: *mut u8) -> c_int {
+    clear_last_error();
+    if out_sealed.is_null() {
+        return record_error(-11, "wallet_is_sealed: out_sealed pointer was null");
+    }
+    let id = match lifecycle_wallet_id(wallet_id, "wallet_is_sealed") {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+    let wallets = WALLET_STORE.lock().expect("wallet store poisoned");
+    let Some(wallet) = wallets.get(&id) else {
+        return record_error(-13, format!("wallet_is_sealed: wallet '{id}' not opened"));
+    };
+    unsafe { *out_sealed = u8::from(wallet.keys.is_sealed()) };
+    0
+}
 
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
@@ -3485,8 +3827,15 @@ pub extern "C" fn wallet_open_from_mnemonic(
         match map.entry(id.to_string()) {
             Entry::Occupied(mut slot) => {
                 let state = slot.get_mut();
-                state.keys = keys;
-                state.network = network;
+                if state.network != network {
+                    return record_error(
+                        -16,
+                        "wallet_open_from_mnemonic: network does not match the open wallet",
+                    );
+                }
+                if let Err(message) = restore_spend_authority(state, keys) {
+                    return record_error(-16, message);
+                }
                 if restore_height < state.restore_height {
                     state.restore_height = restore_height;
                 }
@@ -3500,7 +3849,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
             Entry::Vacant(slot) => {
                 slot.insert(StoredWallet {
                     history_index: None,
-                    keys,
+                    keys: WalletKeys::Unsealed(keys),
                     restore_height,
                     network,
                     last_scanned: restore_height,
@@ -3520,6 +3869,7 @@ pub extern "C" fn wallet_open_from_mnemonic(
                     recent_block_hashes_start_height: restore_height,
                     recent_block_hashes: Vec::new(),
                     block_timestamps: HashMap::new(),
+                    spend_rescan_from: None,
                 });
             }
         }
@@ -3754,6 +4104,7 @@ pub extern "C" fn wallet_force_rescan_from_height(
                 state.recent_block_hashes_start_height = new_restore_height;
                 state.recent_block_hashes.clear();
                 state.block_timestamps.clear();
+                state.spend_rescan_from = None;
 
                 // IMPORTANT: a forced rescan resets our view of wallet state. Any "pending outgoing"
                 // records are now untrustworthy (they may refer to txs we won't rediscover until refresh,
@@ -3846,6 +4197,7 @@ pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_in
                 state.tx_ledger.clear();
                 // Drop height→timestamp map; it will be rebuilt on the next scan.
                 state.block_timestamps.clear();
+                state.spend_rescan_from = None;
 
                 // Balances will be recomputed on next refresh.
                 state.total = 0;
@@ -4145,6 +4497,7 @@ mod ledger_rebuild_tests {
             recent_block_hashes_start_height: 1,
             recent_block_hashes: vec![],
             block_timestamps: HashMap::from([(10u64, 1_700_000_000u64)]),
+            spend_rescan_from: None,
         };
 
         let bytes = bincode::serialize(&persisted).expect("serialize cache");
@@ -4456,6 +4809,7 @@ mod ledger_rebuild_tests {
             recent_block_hashes_start_height: recent_start,
             recent_block_hashes: recent.clone(),
             block_timestamps: times.clone(),
+            spend_rescan_from: None,
         };
         let bytes = bincode::serialize(&persisted).expect("serialize");
         let decoded: PersistedWallet = bincode::deserialize(&bytes).expect("deserialize");

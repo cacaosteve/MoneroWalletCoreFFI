@@ -239,7 +239,9 @@ SIM_UNIV="${TMPDIR}/libmonerowalletcore_ios_sim_universal.a"
 if [[ -f "${LIB_IOS_SIM_ARM64}" && -f "${LIB_IOS_SIM_X86_64}" ]]; then
   echo "• Creating iOS simulator universal lib via lipo"
   lipo -create -output "${SIM_UNIV}" "${LIB_IOS_SIM_ARM64}" "${LIB_IOS_SIM_X86_64}"
-  lipo "${SIM_UNIV}" -verify_arch arm64 x86_64
+  SIM_ARCHS="$(lipo -archs "${SIM_UNIV}")"
+  [[ " ${SIM_ARCHS} " == *" arm64 "* && " ${SIM_ARCHS} " == *" x86_64 "* ]] \
+    || die "iOS simulator universal library is missing an expected architecture (${SIM_ARCHS})"
   UNIVERSAL_LIBS+=( "${SIM_UNIV}" )
 else
   if [[ -f "${LIB_IOS_SIM_ARM64}" ]]; then

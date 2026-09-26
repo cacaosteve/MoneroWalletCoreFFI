@@ -14,7 +14,7 @@
 #![allow(clippy::let_and_return)]
 #![allow(clippy::type_complexity)]
 
-use crate::support::*;
+use crate::{support::*, ViewKeyMaterial as _};
 
 use core::ffi::{c_char, c_int};
 use once_cell::sync::Lazy;
@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{CStr, CString},
-    sync::Mutex,
+    sync::{Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -55,10 +55,12 @@ pub enum RefreshJob {
 
 static REFRESH_JOBS: Lazy<Mutex<HashMap<String, RefreshJob>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static REFRESH_JOB_CHANGED: Lazy<Condvar> = Lazy::new(Condvar::new);
 
 fn set_refresh_job(id: &str, job: RefreshJob) {
     if let Ok(mut map) = REFRESH_JOBS.lock() {
         map.insert(id.to_string(), job);
+        REFRESH_JOB_CHANGED.notify_all();
     }
 }
 
@@ -91,6 +93,45 @@ fn finish_refresh_job(id: &str, rc: c_int) {
         let message = last_error_clone().unwrap_or_else(|| format!("refresh stopped ({rc})"));
         set_refresh_job(id, RefreshJob::Failed(message));
     }
+}
+
+/// Acquire the refresh/send exclusion and run a lifecycle mutation after any
+/// in-flight refresh has stopped. Callers must set the per-wallet cancellation
+/// flag first. Acquisition itself is timed because send/preview RPCs also hold
+/// this registry lock; backgrounding must never hang indefinitely behind a
+/// stalled transport operation.
+pub(crate) fn with_wallet_lifecycle_exclusion<T>(
+    id: &str,
+    timeout: Duration,
+    operation: impl FnOnce() -> T,
+) -> Result<T, ()> {
+    let deadline = Instant::now() + timeout;
+    let mut jobs = loop {
+        match REFRESH_JOBS.try_lock() {
+            Ok(jobs) => break jobs,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
+        }
+    };
+    while matches!(jobs.get(id), Some(RefreshJob::Running)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(());
+        }
+        let Ok((next, result)) = REFRESH_JOB_CHANGED.wait_timeout(jobs, remaining) else {
+            return Err(());
+        };
+        jobs = next;
+        if result.timed_out() && matches!(jobs.get(id), Some(RefreshJob::Running)) {
+            return Err(());
+        }
+    }
+    Ok(operation())
 }
 
 pub fn refresh_job(id: &str) -> RefreshJob {
@@ -127,6 +168,7 @@ fn commit_refresh_checkpoint(
     recent_block_hashes_start_height: u64,
     recent_block_hashes: &[[u8; 32]],
     block_timestamps: &HashMap<u64, u64>,
+    spend_rescan_from: Option<u64>,
 ) -> Result<(), c_int> {
     let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
     let Some(state) = map.get_mut(id) else {
@@ -178,6 +220,7 @@ fn commit_refresh_checkpoint(
     state.recent_block_hashes_start_height = recent_block_hashes_start_height;
     state.recent_block_hashes = recent_block_hashes.to_vec();
     state.block_timestamps = block_timestamps.clone();
+    state.spend_rescan_from = spend_rescan_from;
     Ok(())
 }
 
@@ -1732,9 +1775,11 @@ fn wallet_refresh_impl(
         ),
     );
 
-    // Keys + scanner
-    let master = snapshot.keys.clone();
-    let view_pair = match master.to_view_pair() {
+    // Keys + scanner. A sealed wallet deliberately retains only the private
+    // view key and public spend key, which are sufficient for ownership scans.
+    let wallet_keys = snapshot.keys.clone();
+    let master = wallet_keys.master().cloned();
+    let view_pair = match wallet_keys.to_view_pair() {
         Ok(pair) => pair,
         Err(code) => {
             return record_error(
@@ -1754,23 +1799,30 @@ fn wallet_refresh_impl(
         .unwrap_or(1);
 
     // Fingerprints + derived address logs
-    let spend_scalar_bytes = master.spend_scalar.to_bytes();
-    let view_scalar_bytes = master.view_scalar_dalek.to_bytes();
+    let view_scalar_bytes = wallet_keys.view_scalar_dalek().to_bytes();
     if walletcore_debug_input_dump_enabled() {
+        let spend_scalar_fpr = master
+            .as_ref()
+            .map(|keys| fingerprint32("spend_scalar", &keys.spend_scalar.to_bytes()))
+            .unwrap_or_else(|| "sealed".to_string());
+        let entropy_fpr = master
+            .as_ref()
+            .map(|keys| fingerprint32("entropy", keys.entropy.as_ref()))
+            .unwrap_or_else(|| "sealed".to_string());
         walletcore_log_line(
             id,
             snapshot.network,
             &format!(
                 "🔐 wallet_fingerprint wallet_id={} spend_scalar_fpr={} view_scalar_fpr={} entropy_fpr={}",
                 id,
-                fingerprint32("spend_scalar", &spend_scalar_bytes),
+                spend_scalar_fpr,
                 fingerprint32("view_scalar", &view_scalar_bytes),
-                fingerprint32("entropy", master.entropy.as_ref()),
+                entropy_fpr,
             ),
         );
     }
 
-    let derived_primary_address = derive_address_string(&master, 0, 0, snapshot.network);
+    let derived_primary_address = derive_address_string(&wallet_keys, 0, 0, snapshot.network);
     walletcore_log_line(
         id,
         snapshot.network,
@@ -1828,6 +1880,7 @@ fn wallet_refresh_impl(
     let mut working_recent_block_hashes_start_height = snapshot.recent_block_hashes_start_height;
     let mut working_recent_block_hashes = snapshot.recent_block_hashes.clone();
     let mut working_block_timestamps = snapshot.block_timestamps.clone();
+    let mut working_spend_rescan_from = snapshot.spend_rescan_from;
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
 
     update_scan_progress(
@@ -2029,6 +2082,7 @@ fn wallet_refresh_impl(
                                     working_recent_block_hashes_start_height,
                                     &working_recent_block_hashes,
                                     &working_block_timestamps,
+                                    working_spend_rescan_from,
                                 ) {
                                     return code;
                                 }
@@ -2782,6 +2836,7 @@ fn wallet_refresh_impl(
                         working_recent_block_hashes_start_height,
                         &working_recent_block_hashes,
                         &working_block_timestamps,
+                        working_spend_rescan_from,
                     ) {
                         return code;
                     }
@@ -3487,13 +3542,26 @@ fn wallet_refresh_impl(
                     // and sends can fail with confusing double_spend/invalid_input behavior.
                     //
                     // Use the shared helper (also used by send) to keep this consistent.
-                    let key_image_bytes: [u8; 32] = derive_key_image_bytes(
-                        &output,
-                        master.spend_scalar,
-                        master.view_scalar_ed,
-                        major,
-                        minor,
-                    );
+                    let key_image_bytes: [u8; 32] = if let Some(master) = master.as_ref() {
+                        derive_key_image_bytes(
+                            &output,
+                            master.spend_scalar,
+                            master.view_scalar_ed.clone(),
+                            major,
+                            minor,
+                        )
+                    } else {
+                        // View-only mode can account for this incoming output, but it cannot
+                        // derive the key image needed to notice a later spend. Record the
+                        // earliest affected height so authenticated unseal can rewind and
+                        // rebuild this bounded interval with the private spend key.
+                        working_spend_rescan_from = Some(
+                            working_spend_rescan_from
+                                .map(|height| height.min(th))
+                                .unwrap_or(th),
+                        );
+                        [0u8; 32]
+                    };
 
                     working_outputs.push(TrackedOutput {
                         tx_hash: output.transaction(),
@@ -3756,6 +3824,7 @@ fn wallet_refresh_impl(
                 working_recent_block_hashes_start_height,
                 &working_recent_block_hashes,
                 &working_block_timestamps,
+                working_spend_rescan_from,
             ) {
                 return code;
             }
@@ -3946,6 +4015,7 @@ fn wallet_refresh_impl(
         working_recent_block_hashes_start_height,
         &working_recent_block_hashes,
         &working_block_timestamps,
+        working_spend_rescan_from,
     ) {
         return code;
     }
@@ -4291,6 +4361,7 @@ mod tests {
             149,
             &hashes,
             &HashMap::from([(125u64, 1_700_000_000u64)]),
+            None,
         )
         .expect("checkpoint");
 
@@ -4338,6 +4409,7 @@ mod tests {
             149,
             &[[1; 32], [2; 32]],
             &HashMap::new(),
+            None,
         )
         .expect("first checkpoint");
 

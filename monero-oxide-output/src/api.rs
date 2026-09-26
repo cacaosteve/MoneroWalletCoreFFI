@@ -26,6 +26,7 @@ use crate::{
     wallet_derive_subaddress_from_mnemonic, wallet_export_cache, wallet_force_rescan_from_height,
     wallet_generate_mnemonic_english, wallet_get_balance, wallet_get_balance_with_filter,
     wallet_import_cache, wallet_list_transfers_json, wallet_open_from_mnemonic,
+    wallet_close, wallet_is_sealed, wallet_seal, wallet_unseal_from_mnemonic,
     wallet_prepare_send, wallet_prepare_send_with_filter, wallet_prepare_sweep,
     wallet_prepare_sweep_with_filter, wallet_preview_fee, wallet_preview_fee_with_filter,
     wallet_preview_sweep, wallet_preview_sweep_with_filter, wallet_primary_address_from_mnemonic,
@@ -305,6 +306,33 @@ pub fn open_from_mnemonic(
         restore_height,
         u8::from(mainnet),
     ))
+}
+
+pub fn seal(wallet_id: &str, timeout_ms: u64) -> Result<()> {
+    let id = cstr(wallet_id.trim())?;
+    check(wallet_seal(id.as_ptr(), timeout_ms))
+}
+
+pub fn unseal_from_mnemonic(wallet_id: &str, mnemonic: &str, timeout_ms: u64) -> Result<()> {
+    let id = cstr(wallet_id.trim())?;
+    let seed = cstr(mnemonic.trim())?;
+    check(wallet_unseal_from_mnemonic(
+        id.as_ptr(),
+        seed.as_ptr(),
+        timeout_ms,
+    ))
+}
+
+pub fn close(wallet_id: &str, timeout_ms: u64) -> Result<()> {
+    let id = cstr(wallet_id.trim())?;
+    check(wallet_close(id.as_ptr(), timeout_ms))
+}
+
+pub fn is_sealed(wallet_id: &str) -> Result<bool> {
+    let id = cstr(wallet_id.trim())?;
+    let mut sealed = 0_u8;
+    check(wallet_is_sealed(id.as_ptr(), &mut sealed))?;
+    Ok(sealed != 0)
 }
 
 pub fn set_gap_limit(wallet_id: &str, gap_limit: u32) -> Result<()> {

@@ -146,6 +146,31 @@ int32_t wallet_open_from_mnemonic(
     uint8_t is_mainnet
 );
 
+/*
+ * Cancel and wait for any active refresh, then discard private spend material
+ * while retaining the private view key and public spend key. A sealed wallet
+ * may refresh but every spend/fee-preparation API fails closed.
+ * timeout_ms = 0 selects the core default (30 seconds).
+ */
+int32_t wallet_seal(const char* wallet_id, uint64_t timeout_ms);
+
+/*
+ * Restore spend authority after the host has authenticated the user. The
+ * mnemonic must identify the same wallet. Any outputs discovered while sealed
+ * trigger a bounded rewind so their key images are rebuilt on the next refresh.
+ */
+int32_t wallet_unseal_from_mnemonic(
+    const char* wallet_id,
+    const char* mnemonic,
+    uint64_t timeout_ms
+);
+
+/* Cancel and wait for refresh, then remove all wallet/view/spend keys from memory. */
+int32_t wallet_close(const char* wallet_id, uint64_t timeout_ms);
+
+/* Write 1 when the wallet is view-only sealed, otherwise 0. */
+int32_t wallet_is_sealed(const char* wallet_id, uint8_t* out_sealed);
+
 /* Update the registered subaddress gap limit for scanning (minimum 1). */
 int32_t wallet_set_gap_limit(
     const char* wallet_id,

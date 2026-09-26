@@ -46,6 +46,47 @@ public extension WalletCoreFFIClient {
         try WalletCoreFFISupport.checkRC(rc, context: "wallet_open_from_mnemonic")
     }
 
+    /// Remove spend authority while retaining view-only refresh capability.
+    /// The core cancels and waits for an in-flight refresh before sealing.
+    static func sealWallet(walletId: String, timeoutMilliseconds: UInt64 = 30_000) throws {
+        let rc = walletId.withCString { cId in
+            wallet_seal(cId, timeoutMilliseconds)
+        }
+        try WalletCoreFFISupport.checkRC(rc, context: "wallet_seal")
+    }
+
+    /// Restore spend authority after platform authentication. If view-only
+    /// scanning found outputs, the next refresh completes a bounded rescan.
+    static func unsealWallet(
+        walletId: String,
+        mnemonic: String,
+        timeoutMilliseconds: UInt64 = 30_000
+    ) throws {
+        let rc = walletId.withCString { cId in
+            mnemonic.withCString { cMnemonic in
+                wallet_unseal_from_mnemonic(cId, cMnemonic, timeoutMilliseconds)
+            }
+        }
+        try WalletCoreFFISupport.checkRC(rc, context: "wallet_unseal_from_mnemonic")
+    }
+
+    /// Cancel refresh and remove all wallet key material from process memory.
+    static func closeWallet(walletId: String, timeoutMilliseconds: UInt64 = 30_000) throws {
+        let rc = walletId.withCString { cId in
+            wallet_close(cId, timeoutMilliseconds)
+        }
+        try WalletCoreFFISupport.checkRC(rc, context: "wallet_close")
+    }
+
+    static func isWalletSealed(walletId: String) throws -> Bool {
+        var sealed: UInt8 = 0
+        let rc = walletId.withCString { cId in
+            wallet_is_sealed(cId, &sealed)
+        }
+        try WalletCoreFFISupport.checkRC(rc, context: "wallet_is_sealed")
+        return sealed != 0
+    }
+
     static func setGapLimit(
         walletId: String,
         gapLimit: UInt32
