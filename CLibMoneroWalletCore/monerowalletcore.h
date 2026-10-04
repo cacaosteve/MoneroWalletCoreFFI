@@ -491,6 +491,12 @@ char* wallet_preview_fee_with_filter(
     uint8_t ring_len
 );
 
+/* Rewind a stopped scan, preserving outputs/history before target_height. */
+int32_t wallet_rewind_scan_cursor_to_height(
+    const char* wallet_id,
+    uint64_t target_height
+);
+
 /* Force rescan from a given restore height (resets cache/state). */
 int32_t wallet_force_rescan_from_height(
     const char* wallet_id,

@@ -3425,6 +3425,12 @@ pub(crate) fn cache_identity_matches(
             persisted.network, expected_network
         ));
     }
+    if persisted.restore_height > open_wallet.restore_height {
+        return Err(format!(
+            "wallet_import_cache: cache restore height {} is later than requested restore height {}",
+            persisted.restore_height, open_wallet.restore_height
+        ));
+    }
     Ok(())
 }
 
@@ -4057,6 +4063,79 @@ pub extern "C" fn wallet_get_balance_with_filter(
 
     clear_last_error();
     0
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_rewind_scan_cursor_to_height(
+    wallet_id: *const c_char,
+    target_height: u64,
+) -> c_int {
+    clear_last_error();
+    if wallet_id.is_null() {
+        return record_error(
+            -11,
+            "wallet_rewind_scan_cursor_to_height: wallet_id pointer was null",
+        );
+    }
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(-10, "wallet_rewind_scan_cursor_to_height: invalid wallet_id utf8")
+        }
+    };
+    match crate::ffi::refresh::with_refresh_stopped(id, || {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        let Some(state) = map.get_mut(id) else {
+            return record_error(
+                -13,
+                format!("wallet_rewind_scan_cursor_to_height: wallet '{id}' not opened"),
+            );
+        };
+        if target_height > state.last_scanned {
+            return record_error(
+                -11,
+                "wallet_rewind_scan_cursor_to_height: target would advance the scan cursor",
+            );
+        }
+
+        let known_fees = known_transaction_fees(&state.tx_ledger);
+        state.last_scanned = rewind_working_state_to_height(
+            state.restore_height,
+            target_height,
+            &mut state.tracked_outputs,
+            &mut state.seen_outpoints,
+            &mut state.recent_block_hashes_start_height,
+            &mut state.recent_block_hashes,
+            &mut state.block_timestamps,
+        );
+        state.history_index = None;
+        state.invalid_input_quarantine.clear();
+        state.tx_ledger = rebuild_transfer_ledger(
+            &state.tracked_outputs,
+            &state.pending_outgoing,
+            &known_fees,
+            state.chain_time,
+            &state.block_timestamps,
+        );
+        state.total = 0;
+        state.unlocked = 0;
+        for output in &state.tracked_outputs {
+            if !output.spent {
+                state.total = state.total.saturating_add(output.amount);
+                if output.is_unlocked(state.chain_height, state.chain_time) {
+                    state.unlocked = state.unlocked.saturating_add(output.amount);
+                }
+            }
+        }
+        clear_last_error();
+        0
+    }) {
+        Ok(code) => code,
+        Err(()) => record_error(
+            -31,
+            format!("wallet_rewind_scan_cursor_to_height: refresh still running for wallet '{id}'"),
+        ),
+    }
 }
 
 #[no_mangle]

@@ -256,6 +256,102 @@ mod tests {
     }
 
     #[test]
+    fn cache_import_rejects_a_restore_height_later_than_the_wallets_choice() {
+        let id = "cache-raised-restore-height";
+        open_wallet(id);
+        let mut cache = decode_cache(&export_bytes(id)).unwrap();
+        cache.restore_height = 150; // Open wallet requested 100.
+        let bytes = bincode::serialize(&cache).unwrap();
+        let id_c = CString::new(id).unwrap();
+        assert_ne!(wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()), 0);
+        let store = WALLET_STORE.lock().unwrap();
+        assert_eq!(store[id].restore_height, 100);
+        drop(store);
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    fn interrupted_scan_rewind_preserves_older_history_and_restore_height() {
+        let id = "cache-preserving-rewind";
+        open_wallet(id);
+        {
+            let mut store = WALLET_STORE.lock().unwrap();
+            let wallet = store.get_mut(id).unwrap();
+            let old_hash = [1u8; 32];
+            let new_hash = [2u8; 32];
+            wallet.last_scanned = 201;
+            wallet.chain_height = 201;
+            wallet.tracked_outputs = vec![
+                crate::TrackedOutput {
+                    tx_hash: old_hash,
+                    index_in_tx: 0,
+                    key_image: [3u8; 32],
+                    amount: 7,
+                    block_height: 120,
+                    additional_timelock: crate::Timelock::None,
+                    is_coinbase: false,
+                    subaddress_major: 0,
+                    subaddress_minor: 0,
+                    spent: true,
+                    spending_txid: Some([4u8; 32]),
+                    spending_height: Some(190),
+                },
+                crate::TrackedOutput {
+                    tx_hash: new_hash,
+                    index_in_tx: 0,
+                    key_image: [5u8; 32],
+                    amount: 9,
+                    block_height: 190,
+                    additional_timelock: crate::Timelock::None,
+                    is_coinbase: false,
+                    subaddress_major: 0,
+                    subaddress_minor: 0,
+                    spent: false,
+                    spending_txid: None,
+                    spending_height: None,
+                },
+            ];
+            wallet.seen_outpoints = [(old_hash, 0), (new_hash, 0)].into();
+            let fees = std::collections::HashMap::from([(crate::hex_lowercase(&old_hash), 5u64)]);
+            wallet.tx_ledger = crate::rebuild_transfer_ledger(
+                &wallet.tracked_outputs,
+                &[],
+                &fees,
+                0,
+                &Default::default(),
+            );
+        }
+
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(
+            crate::wallet_rewind_scan_cursor_to_height(id_c.as_ptr(), 150),
+            0
+        );
+        {
+            let store = WALLET_STORE.lock().unwrap();
+            let wallet = &store[id];
+            assert_eq!(wallet.restore_height, 100);
+            assert_eq!(wallet.last_scanned, 150);
+            assert_eq!(wallet.tracked_outputs.len(), 1);
+            assert_eq!(wallet.tracked_outputs[0].tx_hash, [1u8; 32]);
+            assert!(!wallet.tracked_outputs[0].spent);
+            assert_eq!(wallet.seen_outpoints.len(), 1);
+            assert_eq!(wallet.tx_ledger.len(), 1);
+            assert_eq!(wallet.tx_ledger[&crate::hex_lowercase(&[1u8; 32])].fee, Some(5));
+            assert_eq!(wallet.total, 7);
+        }
+        assert_ne!(crate::wallet_rewind_scan_cursor_to_height(id_c.as_ptr(), 200), 0);
+        let bytes = export_bytes(id);
+        assert_eq!(wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()), 0);
+        let store = WALLET_STORE.lock().unwrap();
+        assert_eq!(store[id].restore_height, 100);
+        assert_eq!(store[id].tx_ledger.len(), 1);
+        assert_eq!(store[id].tx_ledger[&crate::hex_lowercase(&[1u8; 32])].fee, Some(5));
+        drop(store);
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
     #[ignore = "synthetic 100k-output memory/scale diagnostic; no wallet or RPC required"]
     fn synthetic_large_wallet_cache_and_paging() {
         use crate::TrackedOutput;

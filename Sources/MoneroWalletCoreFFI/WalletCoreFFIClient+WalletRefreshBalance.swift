@@ -107,6 +107,16 @@ public extension WalletCoreFFIClient {
         try WalletCoreFFISupport.checkRC(rc, context: "wallet_force_rescan_from_height")
     }
 
+    static func rewindScanCursorToHeight(
+        walletId: String,
+        targetHeight: UInt64
+    ) throws {
+        let rc = walletId.withCString { cId in
+            wallet_rewind_scan_cursor_to_height(cId, targetHeight)
+        }
+        try WalletCoreFFISupport.checkRC(rc, context: "wallet_rewind_scan_cursor_to_height")
+    }
+
     static func resetTrackedOutputs(walletId: String) throws {
         let rc = walletId.withCString { cId in
             wallet_reset_tracked_outputs(cId)

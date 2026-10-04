@@ -24,6 +24,7 @@ pub fn transfer_by_id(wallet_id: &str, txid: &str) -> Result<Option<Transfer>> {
 
 use crate::{
     wallet_derive_subaddress_from_mnemonic, wallet_export_cache, wallet_force_rescan_from_height,
+    wallet_rewind_scan_cursor_to_height,
     wallet_generate_mnemonic_english, wallet_get_balance, wallet_get_balance_with_filter,
     wallet_import_cache, wallet_list_transfers_json, wallet_open_from_mnemonic,
     wallet_close, wallet_is_sealed, wallet_seal, wallet_unseal_from_mnemonic,
@@ -553,6 +554,12 @@ pub fn force_rescan_from_height(wallet_id: &str, new_restore_height: u64) -> Res
         id.as_ptr(),
         new_restore_height,
     ))
+}
+
+/// Rewind a stopped scan while keeping outputs/history before the target height.
+pub fn rewind_scan_cursor_to_height(wallet_id: &str, target_height: u64) -> Result<()> {
+    let id = cstr(wallet_id.trim())?;
+    check(wallet_rewind_scan_cursor_to_height(id.as_ptr(), target_height))
 }
 
 fn take_required(ptr: *mut c_char) -> Result<String> {
