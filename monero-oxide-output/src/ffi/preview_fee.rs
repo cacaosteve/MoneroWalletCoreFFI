@@ -260,6 +260,10 @@ fn wallet_preview_fee_impl(
         match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
+                // Keep the public FFI error stable and non-verbose, but make the underlying
+                // daemon/fee validation failure available in opt-in developer diagnostics.
+                // Do not include wallet, destination, amount, or balance data here.
+                walletcore_diagnostic!("🧾 wallet_preview_fee fee_rate request failed: {e:?}");
                 let code = match e {
                     FeeError::InterfaceError(inner) => map_rpc_error(inner),
                     _ => -16,
@@ -901,6 +905,11 @@ fn wallet_preview_fee_with_filter_impl(
         match TOKIO_RUNTIME.block_on(rpc_client.fee_rate(fee_priority, max_per_weight)) {
             Ok(fr) => fr,
             Err(e) => {
+                // See the unfiltered preview path above. This is emitted only when WalletCore
+                // was built with diagnostic-logging and WALLETCORE_DIAGNOSTICS=1 is set.
+                walletcore_diagnostic!(
+                    "🧾 wallet_preview_fee_with_filter fee_rate request failed: {e:?}"
+                );
                 let code = match e {
                     FeeError::InterfaceError(inner) => map_rpc_error(inner),
                     _ => -16,

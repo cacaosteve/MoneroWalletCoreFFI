@@ -8,6 +8,7 @@
 
 use crate::support::*;
 use crate::StoredWallet;
+use crate::ffi::signing::sign_transaction_on_large_stack;
 
 use core::ffi::c_char;
 use rand::{rngs::OsRng, RngCore};
@@ -1317,8 +1318,7 @@ fn wallet_send_impl(
 
         // Sign
         let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-        let mut signer_rng = OsRng;
-        let tx = match intent.sign(&mut signer_rng, &spend_key) {
+        let tx = match sign_transaction_on_large_stack(intent, spend_key) {
             Ok(tx) => tx,
             Err(e) => {
                 record_error(-16, format!("wallet_send: signing failed ({e})"));
@@ -1764,10 +1764,8 @@ fn wallet_send_impl(
 
                 let spend_key =
                     Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-                let mut signer_rng = OsRng;
-                let tx = intent
-                    .sign(&mut signer_rng, &spend_key)
-                    .map_err(|e| format!("sign failed ({e})"))?;
+                let tx = sign_transaction_on_large_stack(intent, spend_key)
+                    .map_err(|error| format!("sign failed ({error})"))?;
 
                 let tx_blob = tx.serialize();
                 match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {
@@ -2923,8 +2921,7 @@ fn wallet_send_with_filter_impl(
     let fee_piconero = intent.necessary_fee();
 
     let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-    let mut signer_rng = OsRng;
-    let tx = match intent.sign(&mut signer_rng, &spend_key) {
+    let tx = match sign_transaction_on_large_stack(intent, spend_key) {
         Ok(tx) => tx,
         Err(e) => {
             record_error(
@@ -3059,10 +3056,8 @@ fn wallet_send_with_filter_impl(
 
                 let spend_key =
                     Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-                let mut signer_rng = OsRng;
-                let tx = intent
-                    .sign(&mut signer_rng, &spend_key)
-                    .map_err(|e| format!("sign failed ({e})"))?;
+                let tx = sign_transaction_on_large_stack(intent, spend_key)
+                    .map_err(|error| format!("sign failed ({error})"))?;
 
                 let tx_blob = tx.serialize();
                 match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {

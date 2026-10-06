@@ -13,6 +13,7 @@
 #![allow(clippy::needless_return)]
 
 use crate::support::*;
+use crate::ffi::signing::sign_transaction_on_large_stack;
 
 use core::ffi::c_char;
 use rand::{rngs::OsRng, RngCore};
@@ -1334,8 +1335,7 @@ fn wallet_sweep_with_filter_impl(
 
     // Sign and broadcast.
     let spend_key = Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-    let mut signer_rng = OsRng;
-    let tx = match intent.sign(&mut signer_rng, &spend_key) {
+    let tx = match sign_transaction_on_large_stack(intent, spend_key) {
         Ok(tx) => tx,
         Err(e) => {
             record_error(
@@ -1497,10 +1497,8 @@ fn wallet_sweep_with_filter_impl(
                 let intent = final_intent.ok_or_else(|| "fee convergence failed".to_string())?;
                 let spend_key =
                     Zeroizing::new(monero_wallet::ed25519::Scalar::from(master.spend_scalar));
-                let mut srng = OsRng;
-                let tx = intent
-                    .sign(&mut srng, &spend_key)
-                    .map_err(|e| format!("sign failed: {e}"))?;
+                let tx = sign_transaction_on_large_stack(intent, spend_key)
+                    .map_err(|error| format!("sign failed: {error}"))?;
                 let tx_blob = tx.serialize();
 
                 match TOKIO_RUNTIME.block_on(broadcast_send_raw_transaction(&base_url, &tx_blob)) {

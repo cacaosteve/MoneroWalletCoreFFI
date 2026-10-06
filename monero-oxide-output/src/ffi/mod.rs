@@ -8,6 +8,7 @@ pub(crate) mod mnemonic;
 pub(crate) mod preview_fee;
 pub(crate) mod refresh;
 pub(crate) mod send;
+pub(crate) mod signing;
 pub(crate) mod sweep;
 pub(crate) mod transfers;
 pub(crate) mod history;
