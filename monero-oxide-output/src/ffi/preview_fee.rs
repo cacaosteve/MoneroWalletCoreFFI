@@ -453,8 +453,7 @@ fn wallet_preview_fee_impl(
                     &mut rng,
                     &daemon_iface,
                     ring_len_eff,
-                    usize::try_from(daemon.height.saturating_sub(1))
-                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
+                    daemon.latest_block_index(),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -478,8 +477,7 @@ fn wallet_preview_fee_impl(
                     &mut rng,
                     &rpc_client,
                     ring_len_eff,
-                    usize::try_from(daemon.height.saturating_sub(1))
-                        .unwrap_or(daemon.height.saturating_sub(1) as usize),
+                    daemon.latest_block_index(),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -1101,7 +1099,7 @@ fn wallet_preview_fee_with_filter_impl(
                     &mut rng,
                     &daemon_iface,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    daemon.latest_block_index(),
                     wallet_out,
                 )) {
                     Ok(i) => i,
@@ -1127,7 +1125,7 @@ fn wallet_preview_fee_with_filter_impl(
                     &mut rng,
                     &rpc_client,
                     ring_len_eff,
-                    usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                    daemon.latest_block_index(),
                     wallet_out,
                 )) {
                     Ok(i) => i,

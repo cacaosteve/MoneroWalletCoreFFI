@@ -2344,6 +2344,33 @@ struct DaemonStatus {
     top_block_timestamp: u64,
 }
 
+impl DaemonStatus {
+    /// Return the daemon's latest 0-based block index.
+    ///
+    /// `height` is a block count (one greater than the latest block index), while
+    /// `OutputWithDecoys::new` expects an index. Keep that conversion centralized so
+    /// preview and prepare/send paths cannot disagree at the chain tip.
+    fn latest_block_index(&self) -> usize {
+        usize::try_from(self.height.saturating_sub(1)).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod daemon_status_tests {
+    use super::DaemonStatus;
+
+    #[test]
+    fn latest_block_index_converts_height_count_to_zero_based_index() {
+        for (height, expected) in [(0, 0), (1, 0), (2, 1), (3_777_632, 3_777_631)] {
+            let status = DaemonStatus {
+                height,
+                top_block_timestamp: 0,
+            };
+            assert_eq!(status.latest_block_index(), expected);
+        }
+    }
+}
+
 fn fetch_daemon_status(client: &BlockingRpcTransport) -> Result<DaemonStatus, (c_int, String)> {
     let info_err = match client.json_rpc_call("get_info", serde_json::json!({})) {
         Ok(info) => {
