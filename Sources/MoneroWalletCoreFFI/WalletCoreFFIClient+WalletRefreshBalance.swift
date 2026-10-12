@@ -52,7 +52,9 @@ public extension WalletCoreFFIClient {
         let rc = walletId.withCString { cId in
             wallet_seal(cId, timeoutMilliseconds)
         }
-        try WalletCoreFFISupport.checkRC(rc, context: "wallet_seal")
+        if rc != 0 {
+            throw WalletCoreLifecycleError(code: rc, message: lastErrorMessage() ?? "wallet_seal (rc=\(rc))")
+        }
     }
 
     /// Restore spend authority after platform authentication. If view-only
@@ -75,7 +77,9 @@ public extension WalletCoreFFIClient {
         let rc = walletId.withCString { cId in
             wallet_close(cId, timeoutMilliseconds)
         }
-        try WalletCoreFFISupport.checkRC(rc, context: "wallet_close")
+        if rc != 0 {
+            throw WalletCoreLifecycleError(code: rc, message: lastErrorMessage() ?? "wallet_close (rc=\(rc))")
+        }
     }
 
     static func isWalletSealed(walletId: String) throws -> Bool {

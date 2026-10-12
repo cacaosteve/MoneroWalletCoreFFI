@@ -87,7 +87,7 @@ const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 /// Bump this when the persisted cache format or the semantics of persisted fields change
 /// in a way that makes old caches unsafe to import (e.g. key image derivation changes,
 /// or identity-binding fields becoming required).
-const WALLETCORE_CACHE_VERSION: u32 = 4;
+const WALLETCORE_CACHE_VERSION: u32 = 5;
 
 fn walletcore_disable_decoys() -> bool {
     matches!(
@@ -2636,6 +2636,8 @@ pub extern "C" fn wallet_derive_subaddress_from_mnemonic(
 struct TrackedOutput {
     tx_hash: [u8; 32],
     index_in_tx: u64,
+    /// One-time output key, retained even while sealed to reject burning-bug replays.
+    public_key: [u8; 32],
     /// Key image for this output (I = x * Hp(P)), used to detect on-chain spends.
     key_image: [u8; 32],
     amount: u64,
@@ -3242,6 +3244,7 @@ pub(crate) enum PersistedTimelock {
 pub(crate) struct PersistedOutput {
     tx_hash: [u8; 32],
     index_in_tx: u64,
+    public_key: [u8; 32],
     /// Key image for this output, persisted so we can detect spends on refresh.
     key_image: [u8; 32],
     amount: u64,
@@ -3340,6 +3343,7 @@ impl From<&TrackedOutput> for PersistedOutput {
         Self {
             tx_hash: output.tx_hash,
             index_in_tx: output.index_in_tx,
+            public_key: output.public_key,
             key_image: output.key_image,
             amount: output.amount,
             block_height: output.block_height,
@@ -3359,6 +3363,7 @@ impl From<PersistedOutput> for TrackedOutput {
         Self {
             tx_hash: output.tx_hash,
             index_in_tx: output.index_in_tx,
+            public_key: output.public_key,
             key_image: output.key_image,
             amount: output.amount,
             block_height: output.block_height,
@@ -4375,6 +4380,7 @@ mod ledger_rebuild_tests {
         TrackedOutput {
             tx_hash,
             index_in_tx: 0,
+            public_key: tx_hash,
             key_image: [0u8; 32],
             amount,
             block_height: 10,

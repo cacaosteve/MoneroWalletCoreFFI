@@ -20,6 +20,36 @@ const SUBADDRESS: &str =
     "8C5zHM5ud8nGC4hC2ULiBLSWx9infi8JUUmWEat4fcTf8J4H38iWYVdFmPCA9UmfLTZxD43RsyKnGEdZkoGij6csDeUnbEB";
 
 #[test]
+fn cleanup_timeout_requires_retry_before_keys_are_sealed_or_closed() {
+    use std::{io::{Read, Write}, net::TcpListener, sync::mpsc, thread, time::Duration};
+    let id = "cleanup-retry-local-fixture";
+    crate::api::open_from_mnemonic(id, CAKE_MNEMONIC, 0, true).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut request = [0; 8192];
+        stream.read(&mut request).unwrap();
+        entered_tx.send(()).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    });
+    let preview = thread::spawn(move || crate::api::preview_fee(id, &endpoint, "invalid-unused-destination", 1));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(crate::api::seal(id, 1).unwrap_err().code, -31);
+    assert!(!crate::api::is_sealed(id).unwrap());
+    server.join().unwrap();
+    assert!(preview.join().unwrap().is_err());
+    assert!(!crate::api::is_sealed(id).unwrap(), "completion alone is not cleanup");
+    crate::api::seal(id, 1000).unwrap();
+    assert!(crate::api::is_sealed(id).unwrap());
+    crate::api::close(id, 1000).unwrap();
+    assert!(crate::api::is_sealed(id).is_err(), "closed wallet must be removed");
+}
+
+#[test]
 fn cake_english_25_word_mnemonic_to_primary_address() {
     let keys = master_keys_from_mnemonic_str(CAKE_MNEMONIC).expect("valid mnemonic");
     let addr = derive_address_string(&keys, 0, 0, MoneroNetwork::Mainnet);
@@ -86,6 +116,7 @@ fn sealed_lifecycle_keeps_view_state_rewinds_new_outputs_and_closes() {
             TrackedOutput {
                 tx_hash: [1; 32],
                 index_in_tx: 0,
+                public_key: [1; 32],
                 key_image: [2; 32],
                 amount: 7,
                 block_height: 110,
@@ -100,6 +131,7 @@ fn sealed_lifecycle_keeps_view_state_rewinds_new_outputs_and_closes() {
             TrackedOutput {
                 tx_hash: [4; 32],
                 index_in_tx: 0,
+                public_key: [4; 32],
                 key_image: [0; 32],
                 amount: 11,
                 block_height: 120,

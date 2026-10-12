@@ -413,6 +413,7 @@ mod tests {
                     TrackedOutput {
                         tx_hash,
                         index_in_tx: 0,
+                        public_key: tx_hash,
                         key_image: [0; 32],
                         amount: i + 1,
                         block_height: 100 + i / 3,

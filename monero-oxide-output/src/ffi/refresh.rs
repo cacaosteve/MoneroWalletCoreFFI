@@ -897,6 +897,38 @@ struct DecodedRangeBlock {
     transactions: Vec<Transaction<Pruned>>,
 }
 
+/// Restore oxide's contiguous-block sanity checks for the custom range decoder, including
+/// legal short responses, before any wallet state is scanned or committed.
+fn validate_range_blocks(start: usize, blocks: &[DecodedRangeBlock]) -> Result<(), RangeFetchError> {
+    let mut parent = (start == 0).then_some([0; 32]);
+    for (offset, decoded) in blocks.iter().enumerate() {
+        let expected = start.checked_add(offset).ok_or_else(||
+            RpcError::InvalidInterface("range block height overflow".into()))?;
+        if decoded.block.number() != expected {
+            return Err(RpcError::InvalidInterface(format!(
+                "range get_blocks.bin requested block #{expected}, received #{}", decoded.block.number()
+            )).into());
+        }
+        if parent.is_some_and(|hash| hash != decoded.block.header.previous) {
+            return Err(RpcError::InvalidInterface(format!(
+                "range get_blocks.bin block #{expected} does not build on its predecessor"
+            )).into());
+        }
+        parent = Some(decoded.block.hash());
+    }
+    Ok(())
+}
+
+fn accept_owned_output(
+    outpoint: ([u8; 32], u64), public_key: [u8; 32],
+    seen_outpoints: &mut HashSet<([u8; 32], u64)>,
+    owned_keys: &mut HashSet<[u8; 32]>,
+) -> bool {
+    if seen_outpoints.contains(&outpoint) || !owned_keys.insert(public_key) { return false; }
+    seen_outpoints.insert(outpoint);
+    true
+}
+
 /// Decode one block entry without touching shared wallet state or making fallback RPC calls.
 /// Keeping this phase pure allows a response's blocks to be decoded concurrently while the
 /// indexed parallel iterator preserves daemon order for the sequential finalization phase.
@@ -1051,6 +1083,7 @@ fn fetch_scannable_blocks_range_bin_with_prune(
     for result in decoded_results {
         decoded_blocks.push(result?);
     }
+    validate_range_blocks(start_bn, &decoded_blocks)?;
     let decode_ms = decode_started.elapsed().as_millis();
     let transaction_count = decoded_blocks
         .iter()
@@ -3090,6 +3123,10 @@ fn wallet_refresh_impl(
             let watch_ki = watch_key_image_from_env();
             let watch_txid = watch_txid_from_env();
 
+            // Rebuild after each rewind/batch from retained outputs, including spent outputs.
+            // View-only scans need no key image to reject a replayed public output key.
+            let mut owned_output_keys: HashSet<[u8; 32]> =
+                working_outputs.iter().map(|output| output.public_key).collect();
             for scannable in scannables {
                 if refresh_cancelled_for_wallet(id) {
                     return record_error(-30, "wallet_refresh: cancelled");
@@ -3504,7 +3541,8 @@ fn wallet_refresh_impl(
 
                 for output in outputs {
                     let key = (output.transaction(), output.index_in_transaction());
-                    if !seen_outpoints.insert(key) {
+                    let public_key = output.key().compress().to_bytes();
+                    if !accept_owned_output(key, public_key, &mut seen_outpoints, &mut owned_output_keys) {
                         continue;
                     }
 
@@ -3566,6 +3604,7 @@ fn wallet_refresh_impl(
                     working_outputs.push(TrackedOutput {
                         tx_hash: output.transaction(),
                         index_in_tx: output.index_in_transaction(),
+                        public_key,
                         key_image: key_image_bytes,
                         amount: output.commitment().amount,
                         block_height: th,
@@ -4076,6 +4115,7 @@ mod tests {
         TrackedOutput {
             tx_hash: [tag; 32],
             index_in_tx: 0,
+            public_key: [tag; 32],
             key_image: [tag.wrapping_add(1); 32],
             amount,
             block_height: height,
@@ -4116,6 +4156,123 @@ mod tests {
             transactions: vec![],
             output_index_for_first_ringct_output: Some(0),
         }
+    }
+
+    fn linked_range(start: usize, count: usize) -> Vec<super::DecodedRangeBlock> {
+        let mut parent = [0; 32];
+        (start..start + count).map(|height| {
+            let mut block = unsupported_scannable_block(16, height).block;
+            block.header.previous = parent;
+            parent = block.hash();
+            super::DecodedRangeBlock { block, transactions: vec![] }
+        }).collect()
+    }
+
+    #[test]
+    fn range_validation_accepts_contiguous_partial_responses() {
+        assert!(super::validate_range_blocks(100, &linked_range(100, 2)).is_ok());
+        assert!(super::validate_range_blocks(0, &linked_range(0, 1)).is_ok());
+        assert!(super::validate_range_blocks(100, &[]).is_ok());
+    }
+
+    #[test]
+    fn range_validation_rejects_wrong_missing_reordered_and_repeated_heights() {
+        assert!(super::validate_range_blocks(100, &linked_range(101, 2)).is_err());
+        let mut missing = linked_range(100, 3);
+        missing.remove(1);
+        assert!(super::validate_range_blocks(100, &missing).is_err());
+        let mut reordered = linked_range(100, 3);
+        reordered.swap(1, 2);
+        assert!(super::validate_range_blocks(100, &reordered).is_err());
+        let mut repeated = linked_range(100, 2);
+        repeated[1].block = repeated[0].block.clone();
+        assert!(super::validate_range_blocks(100, &repeated).is_err());
+    }
+
+    #[test]
+    fn range_validation_rejects_internal_parent_and_genesis_mismatch() {
+        let mut blocks = linked_range(100, 3);
+        blocks[2].block.header.previous = [42; 32];
+        assert!(super::validate_range_blocks(100, &blocks).is_err());
+        let mut genesis = linked_range(0, 1);
+        genesis[0].block.header.previous = [42; 32];
+        assert!(super::validate_range_blocks(0, &genesis).is_err());
+    }
+
+    #[test]
+    fn owned_output_keys_are_unique_across_transactions_and_output_indices() {
+        let mut outpoints = HashSet::new();
+        let mut keys = HashSet::new();
+        assert!(super::accept_owned_output(([1; 32], 0), [9; 32], &mut outpoints, &mut keys));
+        assert!(!super::accept_owned_output(([2; 32], 0), [9; 32], &mut outpoints, &mut keys));
+        assert!(!super::accept_owned_output(([1; 32], 1), [9; 32], &mut outpoints, &mut keys));
+        assert!(!super::accept_owned_output(([1; 32], 0), [10; 32], &mut outpoints, &mut keys));
+        // Rejecting an existing outpoint must not poison a legitimate different output key.
+        assert!(super::accept_owned_output(([3; 32], 0), [10; 32], &mut outpoints, &mut keys));
+        assert_eq!(outpoints.len(), 2);
+    }
+
+    #[test]
+    fn actual_scanner_duplicate_owned_key_is_counted_only_once() {
+        use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, Scalar as DalekScalar};
+        use monero_wallet::{ed25519::{CompressedPoint, Point, Scalar}, transaction::Output, ViewPair};
+        use zeroize::Zeroizing;
+        // Public synthetic keys; no real wallet, network requests, or funds.
+        let spend = DalekScalar::from(7u64);
+        let view = DalekScalar::from(11u64);
+        let public_r = DalekScalar::from(13u64) * ED25519_BASEPOINT_POINT;
+        let mut shared_input = Zeroizing::new((view * public_r).mul_by_cofactor().compress().to_bytes().to_vec());
+        shared_input.push(0);
+        let shared: DalekScalar = Scalar::hash(&shared_input).into();
+        let key = ((spend + shared) * ED25519_BASEPOINT_POINT).compress().to_bytes();
+        let mut extra = vec![1];
+        extra.extend_from_slice(&public_r.compress().to_bytes());
+        let pair = ViewPair::new(Point::from(spend * ED25519_BASEPOINT_POINT), Zeroizing::new(Scalar::from(view))).unwrap();
+        let mut scanner = Scanner::new(pair);
+        let mut outpoints = HashSet::new();
+        let mut keys = HashSet::new();
+        let mut accepted_amount = 0;
+        let mut txids = HashSet::new();
+        for height in 100..102 {
+            let miner = Transaction::V2 {
+                prefix: TransactionPrefix {
+                    additional_timelock: Timelock::None, inputs: vec![Input::Gen(height)],
+                    outputs: vec![Output { amount: Some(1000), key: CompressedPoint::from(key), view_tag: None }],
+                    extra: extra.clone(),
+                }, proofs: None,
+            };
+            let block = MoneroBlock::new(BlockHeader { hardfork_version: 16, hardfork_signal: 16,
+                timestamp: height as u64, previous: [0; 32], nonce: 0 }, miner, vec![]).unwrap();
+            let outputs = scanner.scan(ScannableBlock { block, transactions: vec![],
+                output_index_for_first_ringct_output: Some(height as u64) }).unwrap().not_additionally_locked();
+            assert_eq!(outputs.len(), 1);
+            for output in outputs {
+                txids.insert(output.transaction());
+                if super::accept_owned_output((output.transaction(), output.index_in_transaction()),
+                    output.key().compress().to_bytes(), &mut outpoints, &mut keys) {
+                    accepted_amount += output.commitment().amount;
+                }
+            }
+        }
+        assert_eq!(txids.len(), 2, "different TXIDs used to evade outpoint-only deduplication");
+        assert_eq!(accepted_amount, 1000);
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_key_protection_survives_sealing_and_releases_removed_fork_keys() {
+        let mut retained = tracked_output(1, 10, 110);
+        retained.spent = true;
+        retained.key_image = [0; 32]; // A sealed scan cannot rely on key images.
+        let removed = tracked_output(2, 20, 160);
+        let mut outputs = vec![retained, removed];
+        let mut outpoints = HashSet::new();
+        let mut recent_start = 100;
+        crate::rewind_working_state_to_height(100, 150, &mut outputs, &mut outpoints,
+            &mut recent_start, &mut vec![], &mut HashMap::new());
+        let mut keys = outputs.iter().map(|output| output.public_key).collect();
+        assert!(!super::accept_owned_output(([3; 32], 0), [1; 32], &mut outpoints, &mut keys));
+        assert!(super::accept_owned_output(([4; 32], 0), [2; 32], &mut outpoints, &mut keys));
     }
 
     #[test]

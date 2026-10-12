@@ -12,6 +12,7 @@ Exposes:
 #![allow(clippy::too_many_arguments)]
 
 use crate::support::*;
+use crate::WALLETCORE_CACHE_VERSION;
 
 use bincode::Options;
 use core::ffi::{c_char, c_int};
@@ -21,7 +22,6 @@ use std::ffi::CStr;
 // Cache compatibility version.
 // Bump this when the persisted cache format OR the semantics of persisted fields change
 // in a way that makes old caches unsafe to import (e.g. key image derivation changes).
-const WALLETCORE_CACHE_VERSION: u32 = 4;
 // Shared with host file readers. Bound both wire bytes and decoder work before allocating.
 pub const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -55,6 +55,16 @@ pub extern "C" fn wallet_import_cache(
 
     let data = unsafe { slice::from_raw_parts(cache_ptr, cache_len) };
 
+    // Check before decoding the changed output layout. Old caches lack the output keys needed
+    // for burning-bug protection; hosts quarantine them and rescan the original restore range.
+    let version = data.get(..4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+    if version != Some(WALLETCORE_CACHE_VERSION) {
+        return record_error(-16, format!(
+            "wallet_import_cache: incompatible cache version (have {:?}, want {}); rescan required",
+            version, WALLETCORE_CACHE_VERSION
+        ));
+    }
+
     let persisted: PersistedWallet = match decode_cache(data) {
         Ok(p) => p,
         Err(err) => {
@@ -79,6 +89,11 @@ pub extern "C" fn wallet_import_cache(
                 persisted.cache_version, WALLETCORE_CACHE_VERSION
             ),
         );
+    }
+
+    let mut output_keys = std::collections::HashSet::new();
+    if persisted.tracked_outputs.iter().any(|output| !output_keys.insert(output.public_key)) {
+        return record_error(-16, "wallet_import_cache: duplicate owned output key; rescan required");
     }
 
     match crate::ffi::refresh::with_refresh_stopped(id, || {
@@ -285,6 +300,7 @@ mod tests {
                 crate::TrackedOutput {
                     tx_hash: old_hash,
                     index_in_tx: 0,
+                    public_key: old_hash,
                     key_image: [3u8; 32],
                     amount: 7,
                     block_height: 120,
@@ -299,6 +315,7 @@ mod tests {
                 crate::TrackedOutput {
                     tx_hash: new_hash,
                     index_in_tx: 0,
+                    public_key: new_hash,
                     key_image: [5u8; 32],
                     amount: 9,
                     block_height: 190,
@@ -370,6 +387,7 @@ mod tests {
                     TrackedOutput {
                         tx_hash: hash,
                         index_in_tx: 0,
+                        public_key: hash,
                         key_image: hash,
                         amount: 1,
                         block_height: i as u64 + 1,
@@ -480,6 +498,43 @@ mod tests {
     }
 
     #[test]
+    fn old_cache_layout_is_rejected_before_decoding() {
+        let id = CString::new("cache-version-reject").unwrap();
+        let old_header = 4u32.to_le_bytes();
+        assert_eq!(wallet_import_cache(id.as_ptr(), old_header.as_ptr(), old_header.len()), -16);
+    }
+
+    #[test]
+    fn cache_preserves_output_keys_and_rejects_duplicate_keys_without_mutation() {
+        let id = "cache-output-key-binding";
+        open_wallet(id);
+        {
+            let mut store = WALLET_STORE.lock().unwrap();
+            let wallet = store.get_mut(id).unwrap();
+            wallet.tracked_outputs.push(crate::TrackedOutput {
+                tx_hash: [1; 32], index_in_tx: 0, public_key: [9; 32], key_image: [0; 32],
+                amount: 7, block_height: 101, additional_timelock: crate::Timelock::None,
+                is_coinbase: false, subaddress_major: 0, subaddress_minor: 0, spent: false,
+                spending_txid: None, spending_height: None,
+            });
+        }
+        let bytes = export_bytes(id);
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()), 0);
+        let mut persisted: PersistedWallet = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(persisted.tracked_outputs[0].public_key, [9; 32]);
+        let mut duplicate = persisted.tracked_outputs[0].clone();
+        duplicate.tx_hash = [2; 32];
+        persisted.tracked_outputs.push(duplicate);
+        let forged = bincode::serialize(&persisted).unwrap();
+        assert_eq!(wallet_import_cache(id_c.as_ptr(), forged.as_ptr(), forged.len()), -16);
+        let mut store = WALLET_STORE.lock().unwrap();
+        assert_eq!(store[id].tracked_outputs.len(), 1);
+        assert_eq!(store[id].tracked_outputs[0].public_key, [9; 32]);
+        store.remove(id);
+    }
+
+    #[test]
     fn import_into_unsealed_wallet_applies_view_only_spend_rescan_marker() {
         let id = "cache-view-only-restart";
         open_wallet(id);
@@ -493,6 +548,7 @@ mod tests {
                 crate::TrackedOutput {
                     tx_hash: [1; 32],
                     index_in_tx: 0,
+                    public_key: [1; 32],
                     key_image: [2; 32],
                     amount: 7,
                     block_height: 110,
@@ -507,6 +563,7 @@ mod tests {
                 crate::TrackedOutput {
                     tx_hash: [4; 32],
                     index_in_tx: 0,
+                    public_key: [4; 32],
                     key_image: [0; 32],
                     amount: 11,
                     block_height: 120,

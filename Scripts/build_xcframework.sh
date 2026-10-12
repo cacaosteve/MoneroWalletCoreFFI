@@ -123,9 +123,9 @@ build_target() {
       ;;
   esac
   if [[ "${#extra_env[@]}" -gt 0 ]]; then
-    (cd "${CRATE_DIR}" && env "${extra_env[@]}" "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+    (cd "${CRATE_DIR}" && env "${extra_env[@]}" "${CARGO_BIN}" build --locked ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
   else
-    (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
+    (cd "${CRATE_DIR}" && "${CARGO_BIN}" build --locked ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${triple}")
   fi
 }
 

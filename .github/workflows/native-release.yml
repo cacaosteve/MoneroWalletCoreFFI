@@ -10,7 +10,28 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - id: decide
+        name: Preserve already published native assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          build=true
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            assets=$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' 2>/dev/null || true)
+            if [[ "${assets}" == *MoneroWalletCore.xcframework.zip* && "${assets}" == *MoneroWalletCore-android.zip* ]]; then
+              build=false
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
   apple:
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
@@ -45,6 +66,8 @@ jobs:
             dist/SHA256SUMS.txt
 
   android:
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -81,8 +104,8 @@ jobs:
             dist/SHA256SUMS.txt
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [apple, android]
+    if: startsWith(github.ref, 'refs/tags/') && needs.preflight.outputs.build == 'true'
+    needs: [preflight, apple, android]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8

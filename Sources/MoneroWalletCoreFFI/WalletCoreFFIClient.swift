@@ -25,6 +25,16 @@ public enum WalletCoreFFIError: Error, LocalizedError {
     }
 }
 
+/// A timeout means cleanup has NOT completed. Keep the code separate from diagnostic text.
+/// A separate type preserves the existing WalletCoreFFIError enum's cases for consumers.
+public struct WalletCoreLifecycleError: Error, LocalizedError {
+    public let code: Int32
+    public let message: String
+    public init(code: Int32, message: String) { self.code = code; self.message = message }
+    public var isTimeout: Bool { code == -31 }
+    public var errorDescription: String? { message }
+}
+
 /// Minimal Swift wrapper for the WalletCore C FFI.
 /// This exposes a small, safe surface area for opening, refreshing, balance querying,
 /// fee preview, and sending transactions.

@@ -184,7 +184,7 @@ build_one() {
   # Keep artifacts in-tree (avoid sandbox/redirected target dirs copying stale .so files).
   export CARGO_TARGET_DIR="${CRATE_DIR}/target"
 
-  (cd "${CRATE_DIR}" && "${CARGO_BIN}" build ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${rust_target}")
+  (cd "${CRATE_DIR}" && "${CARGO_BIN}" build --locked ${CARGO_PROFILE_FLAG} ${CARGO_FEATURES_FLAG} --target "${rust_target}")
 
   local built_so="${CARGO_TARGET_DIR}/${rust_target}/${PROFILE}/libmonerowalletcore.so"
   [[ -f "${built_so}" ]] || die "expected .so not found: ${built_so}"
