@@ -1,0 +1,19 @@
+name: Dependency advisories
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install pinned advisory checker
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check dependency advisories
+        run: bash Scripts/check-advisories.sh

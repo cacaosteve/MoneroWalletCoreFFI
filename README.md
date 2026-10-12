@@ -46,6 +46,21 @@ diagnostics require **both** the `diagnostic-logging` Cargo feature and
 share diagnostic logs from real wallets. Explicit benchmark RPC timing telemetry
 remains separate and opt-in.
 
+Dependency advisories: install `cargo-deny` 0.20.2 and run
+`bash Scripts/check-advisories.sh` before a release. The two existing unmaintained
+notices (bincode cache encoding and paste's compile-time macros) have explicitly
+documented, time-bounded maintenance exceptions in `deny.toml`. The script/CI fails
+on 2027-01-12 unless that decision is reviewed again; new vulnerability advisories
+are not exempted. Changing the cache codec requires a compatible migration and
+cross-platform cache regression tests, not a blind dependency replacement.
+
+Apple release finalization: build native assets from the source revision, publish
+the immutable assets, then commit their URL/checksum into `Package.swift` and
+finalize the matching package tag at that metadata-only revision. Verify the
+native source tree is unchanged between the artifact build and the finalized tag.
+Consumers pin that finalized commit. Do not replace already-published binaries
+just to repair a package manifest or follow-up maintenance documentation.
+
 The sealed state is intentionally view-only, not keyless: compromise of a live process may expose
 the private view key and therefore wallet activity. It cannot authorize a spend. Hosts should use
 sealed mode only for bounded background sync and call `wallet_close` at their protected idle/session
