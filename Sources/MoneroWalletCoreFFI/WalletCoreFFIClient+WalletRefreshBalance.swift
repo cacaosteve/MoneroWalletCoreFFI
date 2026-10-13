@@ -39,7 +39,7 @@ public extension WalletCoreFFIClient {
         mainnet: Bool = true
     ) throws {
         let rc = walletId.withCString { cId in
-            mnemonic.withCString { cMn in
+            WalletCoreFFISupport.withSecretCString(mnemonic) { cMn in
                 wallet_open_from_mnemonic(cId, cMn, restoreHeight, mainnet ? 1 : 0)
             }
         }
@@ -65,7 +65,7 @@ public extension WalletCoreFFIClient {
         timeoutMilliseconds: UInt64 = 30_000
     ) throws {
         let rc = walletId.withCString { cId in
-            mnemonic.withCString { cMnemonic in
+            WalletCoreFFISupport.withSecretCString(mnemonic) { cMnemonic in
                 wallet_unseal_from_mnemonic(cId, cMnemonic, timeoutMilliseconds)
             }
         }

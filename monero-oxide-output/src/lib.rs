@@ -2479,25 +2479,25 @@ fn derive_address_string<K: ViewKeyMaterial>(
         //
         // Address = (D, C) encoded as a subaddress for the given network.
         let spend_pub = keys.spend_public_dalek();
-        let view_scalar = keys.view_scalar_dalek();
+        let view_scalar = Zeroizing::new(keys.view_scalar_dalek());
 
-        let mut data = Vec::with_capacity(8 + 32 + 4 + 4);
+        let mut data = Zeroizing::new(Vec::with_capacity(8 + 32 + 4 + 4));
         data.extend_from_slice(b"SubAddr\0");
 
         // Use the Monero ed25519 Scalar bytes directly to match wallet2 behavior.
-        let view_key_bytes: [u8; 32] = <[u8; 32]>::from(keys.view_scalar_ed());
-        data.extend_from_slice(&view_key_bytes);
+        let view_key_bytes = Zeroizing::new(<[u8; 32]>::from(keys.view_scalar_ed()));
+        data.extend_from_slice(view_key_bytes.as_ref());
 
         data.extend_from_slice(&account_index.to_le_bytes());
         data.extend_from_slice(&subaddress_index.to_le_bytes());
 
-        let m_scalar: curve25519_dalek::Scalar = EdScalar::hash(&data).into();
+        let m_scalar: Zeroizing<curve25519_dalek::Scalar> = Zeroizing::new(EdScalar::hash(&data).into());
 
         // D = B + m*G
-        let d_dalek = spend_pub + (ED25519_BASEPOINT_POINT * m_scalar);
+        let d_dalek = spend_pub + (ED25519_BASEPOINT_POINT * *m_scalar);
 
         // C = a*D
-        let c_dalek = d_dalek * view_scalar;
+        let c_dalek = d_dalek * *view_scalar;
 
         let d_point = EdPoint::from(d_dalek);
         let c_point = EdPoint::from(c_dalek);

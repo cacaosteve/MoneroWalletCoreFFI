@@ -19,8 +19,13 @@ const INTEGRATED: &str =
 const SUBADDRESS: &str =
     "8C5zHM5ud8nGC4hC2ULiBLSWx9infi8JUUmWEat4fcTf8J4H38iWYVdFmPCA9UmfLTZxD43RsyKnGEdZkoGij6csDeUnbEB";
 
+// These fixtures deliberately hold the process-wide refresh/send registry while a local
+// transport is stalled. They must not make another fixture's short lifecycle wait flaky.
+static LIFECYCLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn cleanup_timeout_requires_retry_before_keys_are_sealed_or_closed() {
+    let _guard = LIFECYCLE_FIXTURE.lock().unwrap();
     use std::{io::{Read, Write}, net::TcpListener, sync::mpsc, thread, time::Duration};
     let id = "cleanup-retry-local-fixture";
     crate::api::open_from_mnemonic(id, CAKE_MNEMONIC, 0, true).unwrap();
@@ -99,6 +104,7 @@ fn parse_flipped_character_fails_oxide_checksum() {
 
 #[test]
 fn sealed_lifecycle_keeps_view_state_rewinds_new_outputs_and_closes() {
+    let _guard = LIFECYCLE_FIXTURE.lock().unwrap();
     let wallet_id = CString::new("sealed-lifecycle-test").unwrap();
     let mnemonic = CString::new(CAKE_MNEMONIC).unwrap();
     assert_eq!(
@@ -210,6 +216,7 @@ fn sealed_lifecycle_keeps_view_state_rewinds_new_outputs_and_closes() {
 
 #[test]
 fn sealed_spend_rescan_marker_never_advances_a_reorged_cursor() {
+    let _guard = LIFECYCLE_FIXTURE.lock().unwrap();
     let wallet_id = CString::new("sealed-reorg-marker-test").unwrap();
     let mnemonic = CString::new(CAKE_MNEMONIC).unwrap();
     assert_eq!(

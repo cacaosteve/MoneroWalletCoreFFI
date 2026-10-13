@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 #if canImport(MoneroWalletCore)
 import MoneroWalletCore
@@ -9,6 +14,29 @@ import CLibMoneroWalletCore
 #endif
 
 enum WalletCoreFFISupport {
+    /// Wipe owned buffers through a C volatile-write routine, including exceptional returns.
+    static func wipe<T>(_ buffer: inout [T]) {
+        buffer.withUnsafeMutableBytes { bytes in
+            if let base = bytes.baseAddress {
+                #if canImport(Darwin)
+                _ = memset_s(base, bytes.count, 0, bytes.count)
+                #else
+                explicit_bzero(base, bytes.count)
+                #endif
+            }
+        }
+    }
+
+    static func withSecretCString<T>(_ value: String, _ operation: (UnsafePointer<CChar>) throws -> T) rethrows -> T {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(value.utf8.count + 1)
+        bytes.append(contentsOf: value.utf8)
+        bytes.append(0)
+        defer { wipe(&bytes) }
+        return try bytes.withUnsafeBytes { raw in
+            try operation(raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+    }
     static func lastErrorMessage() -> String? {
         guard let cstr = walletcore_last_error_message() else { return nil }
         let s = String(cString: cstr)

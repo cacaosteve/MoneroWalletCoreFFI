@@ -39,7 +39,7 @@ public extension WalletCoreFFIClient {
     static func derivePrimaryAddressFromMnemonic(_ phrase: String, mainnet: Bool = true) throws -> String {
         var buffer = Array<CChar>(repeating: 0, count: 192)
         var written: Int = 0
-        let rc: Int32 = phrase.withCString { cstr in
+        let rc: Int32 = WalletCoreFFISupport.withSecretCString(phrase) { cstr in
             wallet_primary_address_from_mnemonic(
                 cstr,
                 mainnet ? 1 : 0,
@@ -56,6 +56,7 @@ public extension WalletCoreFFIClient {
 
     static func generateMnemonicEnglish() throws -> String {
         var buffer = Array<CChar>(repeating: 0, count: 512)
+        defer { WalletCoreFFISupport.wipe(&buffer) }
         var written: Int = 0
         let rc: Int32 = wallet_generate_mnemonic_english(
             &buffer,
@@ -64,7 +65,8 @@ public extension WalletCoreFFIClient {
         )
         try WalletCoreFFISupport.checkRC(rc, context: "wallet_generate_mnemonic_english")
         buffer[min(written, buffer.count - 1)] = 0
-        let bytes = buffer.prefix(min(written, buffer.count - 1)).map { UInt8(bitPattern: $0) }
+        var bytes = buffer.prefix(min(written, buffer.count - 1)).map { UInt8(bitPattern: $0) }
+        defer { WalletCoreFFISupport.wipe(&bytes) }
         return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -76,7 +78,7 @@ public extension WalletCoreFFIClient {
     ) throws -> String {
         var buffer = Array<CChar>(repeating: 0, count: 192)
         var written: Int = 0
-        let rc: Int32 = phrase.withCString { cstr in
+        let rc: Int32 = WalletCoreFFISupport.withSecretCString(phrase) { cstr in
             wallet_derive_subaddress_from_mnemonic(
                 cstr,
                 accountIndex,

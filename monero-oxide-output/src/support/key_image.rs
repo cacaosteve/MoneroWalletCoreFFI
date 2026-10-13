@@ -31,6 +31,7 @@
 //! this stage.
 
 use monero_wallet::{ed25519, WalletOutput};
+use zeroize::Zeroizing;
 
 /// Derive the key image bytes for a `WalletOutput` using signer-aligned semantics.
 ///
@@ -53,14 +54,18 @@ pub(crate) fn derive_key_image_bytes(
     _subaddress_major: u32,
     _subaddress_minor: u32,
 ) -> [u8; 32] {
+    let spend_scalar_dalek = Zeroizing::new(spend_scalar_dalek);
+    let _view_scalar_ed = Zeroizing::new(_view_scalar_ed);
     // key_offset: monero_wallet::ed25519::Scalar -> [u8; 32] -> dalek scalar
-    let ko_bytes: [u8; 32] = <[u8; 32]>::from(wallet_out.key_offset());
-    let ko_dalek = curve25519_dalek::Scalar::from_canonical_bytes(ko_bytes)
-        .into_option()
-        .unwrap_or(curve25519_dalek::Scalar::ZERO);
+    let ko_bytes = Zeroizing::new(<[u8; 32]>::from(wallet_out.key_offset()));
+    let ko_dalek = Zeroizing::new(
+        curve25519_dalek::Scalar::from_canonical_bytes(*ko_bytes)
+            .into_option()
+            .unwrap_or(curve25519_dalek::Scalar::ZERO),
+    );
 
     // Signer semantics: x = a + key_offset
-    let x = spend_scalar_dalek + ko_dalek;
+    let x = Zeroizing::new(*spend_scalar_dalek + *ko_dalek);
 
     // Hp(P): biased_hash(compressed P) (monero-oxide ed25519 point hashing), then convert to dalek point.
     let p = wallet_out.key();
@@ -74,5 +79,5 @@ pub(crate) fn derive_key_image_bytes(
         .unwrap_or(curve25519_dalek::EdwardsPoint::identity());
 
     // I = x * Hp(P)
-    (hp_p_dalek * x).compress().to_bytes()
+    (hp_p_dalek * *x).compress().to_bytes()
 }

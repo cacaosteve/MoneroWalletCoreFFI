@@ -262,8 +262,12 @@ fn take_string(ptr: *mut c_char) -> Option<String> {
     Some(value)
 }
 
+fn secret_cstr(value: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    Ok(zeroize::Zeroizing::new(cstr(value)?.into_bytes_with_nul()))
+}
+
 fn write_into_buf(mut call: impl FnMut(*mut c_char, usize, *mut usize) -> c_int) -> Result<String> {
-    let mut buf = vec![0u8; 1024];
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; 1024]);
     let mut written = 0usize;
     let rc = call(buf.as_mut_ptr() as *mut c_char, buf.len(), &mut written);
     if rc == -12 {
@@ -300,10 +304,10 @@ pub fn open_from_mnemonic(
     mainnet: bool,
 ) -> Result<()> {
     let id = cstr(wallet_id.trim())?;
-    let seed = cstr(mnemonic.trim())?;
+    let seed = secret_cstr(mnemonic.trim())?;
     check(wallet_open_from_mnemonic(
         id.as_ptr(),
-        seed.as_ptr(),
+        seed.as_ptr().cast(),
         restore_height,
         u8::from(mainnet),
     ))
@@ -316,10 +320,10 @@ pub fn seal(wallet_id: &str, timeout_ms: u64) -> Result<()> {
 
 pub fn unseal_from_mnemonic(wallet_id: &str, mnemonic: &str, timeout_ms: u64) -> Result<()> {
     let id = cstr(wallet_id.trim())?;
-    let seed = cstr(mnemonic.trim())?;
+    let seed = secret_cstr(mnemonic.trim())?;
     check(wallet_unseal_from_mnemonic(
         id.as_ptr(),
-        seed.as_ptr(),
+        seed.as_ptr().cast(),
         timeout_ms,
     ))
 }
@@ -342,9 +346,9 @@ pub fn set_gap_limit(wallet_id: &str, gap_limit: u32) -> Result<()> {
 }
 
 pub fn primary_address_from_mnemonic(mnemonic: &str, mainnet: bool) -> Result<String> {
-    let seed = cstr(mnemonic.trim())?;
+    let seed = secret_cstr(mnemonic.trim())?;
     write_into_buf(|buf, len, written| {
-        wallet_primary_address_from_mnemonic(seed.as_ptr(), u8::from(mainnet), buf, len, written)
+        wallet_primary_address_from_mnemonic(seed.as_ptr().cast(), u8::from(mainnet), buf, len, written)
     })
 }
 
@@ -354,10 +358,10 @@ pub fn derive_subaddress_from_mnemonic(
     subaddress_index: u32,
     mainnet: bool,
 ) -> Result<String> {
-    let seed = cstr(mnemonic.trim())?;
+    let seed = secret_cstr(mnemonic.trim())?;
     write_into_buf(|buf, len, written| {
         wallet_derive_subaddress_from_mnemonic(
-            seed.as_ptr(),
+            seed.as_ptr().cast(),
             account_index,
             subaddress_index,
             u8::from(mainnet),
