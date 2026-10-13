@@ -1831,6 +1831,10 @@ fn wallet_refresh_impl(
         .map(|v| v.max(1))
         .unwrap_or(1);
 
+    if u64::from(account_gap) * u64::from(gap_limit) > 100_000 {
+        return record_error(-10, "wallet_refresh: account/subaddress scan coverage exceeds 100000 registrations");
+    }
+
     // Fingerprints + derived address logs
     let view_scalar_bytes = wallet_keys.view_scalar_dalek().to_bytes();
     if walletcore_debug_input_dump_enabled() {
@@ -1874,32 +1878,11 @@ fn wallet_refresh_impl(
         ),
     );
 
-    let mut registered: u64 = 0;
-    let mut failed: u64 = 0;
-    let mut first_failed: Option<(u32, u32)> = None;
-    let mut last_failed: Option<(u32, u32)> = None;
-
-    for major in 0..account_gap {
-        for minor in 1..=gap_limit {
-            if let Some(idx) = SubaddressIndex::new(major, minor) {
-                scanner.register_subaddress(idx);
-                registered = registered.saturating_add(1);
-            } else {
-                failed = failed.saturating_add(1);
-                first_failed = first_failed.or(Some((major, minor)));
-                last_failed = Some((major, minor));
-            }
-        }
-    }
-
-    walletcore_log_line(
-        id,
-        snapshot.network,
-        &format!(
-            "🧭 scanner_subaddress_registered wallet_id={} registered_count={} failed_count={} first_failed={:?} last_failed={:?}",
-            id, registered, failed, first_failed, last_failed
-        ),
-    );
+    let registered = match register_scan_subaddresses(&mut scanner, gap_limit, account_gap) {
+        Ok(count) => count,
+        Err(message) => return record_error(-10, message),
+    };
+    walletcore_log_line(id, snapshot.network, &format!("🧭 scanner_subaddress_registered wallet_id={} registered_count={}", id, registered));
 
     // Debug controls
     let debug_txid = walletcore_debug_target_txid();
@@ -1932,6 +1915,13 @@ fn wallet_refresh_impl(
     let log_batch_events = log_perf;
     let overall_start: Option<Instant> = if log_perf { Some(Instant::now()) } else { None };
     let initial_outputs: usize = working_outputs.len();
+    // Coverage rescans retain known history for presentation. Reconcile only its
+    // relevant heights as those blocks are replayed, so a fork during the rescan
+    // cannot leave an old receive/spend behind. Ordinary incremental scans do no
+    // extra transaction work and make no additional RPC calls.
+    let replay_heights: HashSet<u64> = working_outputs.iter()
+        .flat_map(|output| [Some(output.block_height), output.spending_height])
+        .flatten().collect();
 
     let requested_scan_parallelism = scan_parallelism_from_env();
     let scan_pool = if requested_scan_parallelism > 1 {
@@ -2082,7 +2072,8 @@ fn wallet_refresh_impl(
                         &working_recent_block_hashes,
                         |height| transport.get_block_hash_by_height_json(height),
                     ) {
-                        Ok(opt) => match decide_resume_reorg_action(scan_cursor, Ok(opt))
+                        Ok(opt) => match decide_resume_reorg_action(
+                            scan_cursor.max(working_recent_block_hashes_start_height.saturating_add(working_recent_block_hashes.len() as u64)), Ok(opt))
                             .expect("Ok probe cannot fail decide_resume")
                         {
                             ResumeReorgAction::KeepCursor => {}
@@ -2095,7 +2086,7 @@ fn wallet_refresh_impl(
                                         id, scan_cursor, rewind_to
                                     ),
                                 );
-                                scan_cursor = rewind_working_state_to_height(
+                                scan_cursor = scan_cursor.min(rewind_working_state_to_height(
                                     snapshot.restore_height,
                                     rewind_to,
                                     &mut working_outputs,
@@ -2103,7 +2094,7 @@ fn wallet_refresh_impl(
                                     &mut working_recent_block_hashes_start_height,
                                     &mut working_recent_block_hashes,
                                     &mut working_block_timestamps,
-                                );
+                                ));
                                 if let Err(code) = commit_refresh_checkpoint(
                                     id,
                                     scan_cursor,
@@ -3171,6 +3162,19 @@ fn wallet_refresh_impl(
 
                 let miner_hash = scannable.block.miner_transaction().hash();
 
+                if replay_heights.contains(&th) {
+                    let transaction_ids = std::iter::once(miner_hash)
+                        .chain(scannable.block.transactions.iter().copied()).collect();
+                    let spent_images = scannable.transactions.iter()
+                        .flat_map(|tx| tx.prefix().inputs.iter())
+                        .filter_map(|input| match input {
+                            monero_wallet::transaction::Input::ToKey { key_image, .. } => Some(key_image.to_bytes()),
+                            _ => None,
+                        }).collect();
+                    reconcile_replayed_height(th, &transaction_ids, &spent_images,
+                        &mut working_outputs, &mut seen_outpoints, &mut owned_output_keys);
+                }
+
                 // Spend detection: build KI map from current working_outputs
                 let mut key_image_to_output_index: HashMap<[u8; 32], usize> = HashMap::new();
                 for (i, o) in working_outputs.iter().enumerate() {
@@ -4169,6 +4173,66 @@ mod tests {
     }
 
     #[test]
+    fn issued_address_boundaries_and_other_account_primary_are_scanned() {
+        use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, Scalar as DalekScalar};
+        use monero_wallet::{ed25519::{CompressedPoint, Point, Scalar}, transaction::Output, ViewPair};
+        use zeroize::Zeroizing;
+        // Entirely synthetic public fixture: no wallet, RPC, or funds.
+        for (major, minor) in [(0u32, 49u32), (0, 50), (0, 51), (0, 1234), (1, 0)] {
+        let spend = DalekScalar::from(7u64);
+        let view = DalekScalar::from(11u64);
+        let mut sub_input = b"SubAddr\0".to_vec();
+        sub_input.extend_from_slice(&view.to_bytes());
+        sub_input.extend_from_slice(&major.to_le_bytes());
+        sub_input.extend_from_slice(&minor.to_le_bytes());
+        let m: DalekScalar = Scalar::hash(&sub_input).into();
+        let d = (spend + m) * ED25519_BASEPOINT_POINT;
+        let public_r = DalekScalar::from(13u64) * d;
+        let mut shared_input = (view * public_r).mul_by_cofactor().compress().to_bytes().to_vec();
+        shared_input.push(0);
+        let shared: DalekScalar = Scalar::hash(&shared_input).into();
+        let key = ((spend + m + shared) * ED25519_BASEPOINT_POINT).compress().to_bytes();
+        let mut extra = vec![1];
+        extra.extend_from_slice(&public_r.compress().to_bytes());
+        let miner = Transaction::V2 {
+            prefix: TransactionPrefix { additional_timelock: Timelock::None,
+                inputs: vec![Input::Gen(100)], outputs: vec![Output {
+                    amount: Some(1000), key: CompressedPoint::from(key), view_tag: None }], extra },
+            proofs: None,
+        };
+        let block = MoneroBlock::new(BlockHeader { hardfork_version: 16, hardfork_signal: 16,
+            timestamp: 100, previous: [0; 32], nonce: 0 }, miner, vec![]).unwrap();
+        let scannable = ScannableBlock { block, transactions: vec![], output_index_for_first_ringct_output: Some(100) };
+        let pair = ViewPair::new(Point::from(spend * ED25519_BASEPOINT_POINT), Zeroizing::new(Scalar::from(view))).unwrap();
+        let mut scanner = Scanner::new(pair);
+        super::register_scan_subaddresses(&mut scanner, minor.max(50), major + 1).unwrap();
+        let found = scanner.scan(scannable).unwrap().not_additionally_locked();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].commitment().amount, 1000);
+        }
+    }
+
+    #[test]
+    fn coverage_replay_preserves_valid_history_and_removes_fork_receives_and_spends() {
+        let mut old = tracked_output(1, 10, 120);
+        old.spent = true; old.spending_height = Some(180); old.spending_txid = Some([3; 32]);
+        let fork = tracked_output(2, 20, 150);
+        let mut outputs = vec![old.clone(), fork.clone()];
+        let mut outpoints = outputs.iter().map(|o| (o.tx_hash, o.index_in_tx)).collect();
+        let mut keys = outputs.iter().map(|o| o.public_key).collect();
+        super::reconcile_replayed_height(120, &HashSet::from([old.tx_hash]), &HashSet::new(), &mut outputs, &mut outpoints, &mut keys);
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs[0].spent, "replaying a valid receive must not expose its already-spent balance");
+        super::reconcile_replayed_height(150, &HashSet::new(), &HashSet::new(), &mut outputs, &mut outpoints, &mut keys);
+        assert_eq!(outputs.len(), 1);
+        assert!(!keys.contains(&fork.public_key));
+        assert!(!outpoints.contains(&(fork.tx_hash, fork.index_in_tx)));
+        super::reconcile_replayed_height(180, &HashSet::new(), &HashSet::new(), &mut outputs, &mut outpoints, &mut keys);
+        assert!(!outputs[0].spent);
+        assert_eq!(outputs[0].spending_txid, None);
+    }
+
+    #[test]
     fn range_validation_accepts_contiguous_partial_responses() {
         assert!(super::validate_range_blocks(100, &linked_range(100, 2)).is_ok());
         assert!(super::validate_range_blocks(0, &linked_range(0, 1)).is_ok());
@@ -5073,6 +5137,35 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
     });
 
     0
+}
+
+/// Include other accounts' primary subaddresses (major > 0, minor == 0), too.
+fn register_scan_subaddresses(scanner: &mut Scanner, gap: u32, accounts: u32) -> Result<u64, &'static str> {
+    let gap = gap.max(1);
+    let accounts = accounts.max(1);
+    let count = u64::from(accounts) * (u64::from(gap) + 1) - 1;
+    if count > 100_000 { return Err("scan coverage exceeds 100000 registrations"); }
+    for major in 0..accounts {
+        for minor in 0..=gap {
+            if let Some(index) = SubaddressIndex::new(major, minor) { scanner.register_subaddress(index); }
+        }
+    }
+    Ok(count)
+}
+
+fn reconcile_replayed_height(height: u64, transactions: &HashSet<[u8; 32]>, spent_images: &HashSet<[u8; 32]>,
+    outputs: &mut Vec<TrackedOutput>, outpoints: &mut HashSet<([u8; 32], u64)>, keys: &mut HashSet<[u8; 32]>) {
+    outputs.retain_mut(|output| {
+        if output.block_height == height && !transactions.contains(&output.tx_hash) {
+            outpoints.remove(&(output.tx_hash, output.index_in_tx));
+            keys.remove(&output.public_key);
+            return false;
+        }
+        if output.spending_height == Some(height) && !spent_images.contains(&output.key_image) {
+            output.spent = false; output.spending_txid = None; output.spending_height = None;
+        }
+        true
+    });
 }
 
 /// Return the authoritative per-wallet async refresh state as JSON.

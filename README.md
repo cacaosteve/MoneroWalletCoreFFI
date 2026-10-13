@@ -61,6 +61,15 @@ native source tree is unchanged between the artifact build and the finalized tag
 Consumers pin that finalized commit. Do not replace already-published binaries
 just to repair a package manifest or follow-up maintenance documentation.
 
+Receive-address coverage: before issuing a subaddress, hosts must call
+`wallet_set_gap_limit` with at least its minor index and persist the cache. Coverage
+is monotonic, including across cache imports. Expanding it rewinds the scan cursor
+to the original restore height without deleting known history or pending sends;
+the refresh revalidates retained receives/spends against the scanned chain. Growth
+is refused during an active refresh, so the host should retry after it finishes.
+Other accounts' primary subaddresses (minor zero) are registered when their account
+lookahead is enabled. Total scanner registrations are capped at 100,000.
+
 The sealed state is intentionally view-only, not keyless: compromise of a live process may expose
 the private view key and therefore wallet activity. It cannot authorize a spend. Hosts should use
 sealed mode only for bounded background sync and call `wallet_close` at their protected idle/session

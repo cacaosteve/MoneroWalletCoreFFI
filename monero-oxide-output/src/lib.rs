@@ -3939,12 +3939,20 @@ pub extern "C" fn wallet_set_gap_limit(wallet_id: *const c_char, gap_limit: u32)
         }
     };
 
-    let normalized = gap_limit.clamp(1, 100_000);
+    if gap_limit > 100_000 {
+        return record_error(-10, "wallet_set_gap_limit: scan coverage exceeds 100000 subaddresses");
+    }
+    let normalized = gap_limit.max(1);
+    // A no-op may succeed during refresh: its snapshot already covers this index.
+    if WALLET_STORE.lock().expect("wallet store poisoned").get(id)
+        .is_some_and(|state| normalized <= state.gap_limit) {
+        return 0;
+    }
     match crate::ffi::refresh::with_refresh_stopped(id, || {
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get_mut(id) {
             Some(state) => {
-                state.gap_limit = normalized;
+                expand_scan_coverage(state, normalized);
                 clear_last_error();
                 0
             }
@@ -3960,6 +3968,20 @@ pub extern "C" fn wallet_set_gap_limit(wallet_id: *const c_char, gap_limit: u32)
             format!("wallet_set_gap_limit: refresh already running for wallet '{id}'"),
         ),
     }
+}
+
+/// Coverage is a wallet invariant, not a disposable tuning preference. Never stop
+/// watching an address previously included in a persisted wallet. Expanding the
+/// watch set must revisit old blocks (an address may already have received funds),
+/// but must not erase the existing outputs, spend state, history, or pending sends.
+fn expand_scan_coverage(state: &mut StoredWallet, requested: u32) {
+    if requested <= state.gap_limit { return; }
+    state.gap_limit = requested;
+    state.last_scanned = state.restore_height;
+    // Retain the old chain anchors: the resume probe must validate the history we
+    // kept even though the scan cursor now precedes it. Clearing these would hide
+    // a reorg which occurred while expanding coverage.
+    state.last_refresh_timestamp = 0;
 }
 
 // (moved to src/ffi/refresh.rs)

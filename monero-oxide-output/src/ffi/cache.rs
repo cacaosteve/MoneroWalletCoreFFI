@@ -100,12 +100,19 @@ pub extern "C" fn wallet_import_cache(
         let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get_mut(id) {
             Some(state) => {
+                if persisted.gap_limit > 100_000 || persisted.tracked_outputs.iter().any(|output| output.subaddress_minor > 100_000) {
+                    return record_error(-16, "wallet_import_cache: invalid scan coverage");
+                }
                 if let Err(message) = cache_identity_matches(&persisted, state) {
                     return record_error(-16, message);
                 }
 
                 // Apply persisted snapshot onto in-memory state.
+                let previous_coverage = state.gap_limit;
                 persisted.apply_to_state(state);
+                let coverage = state.tracked_outputs.iter().map(|output| output.subaddress_minor)
+                    .max().unwrap_or(0).max(previous_coverage);
+                crate::expand_scan_coverage(state, coverage);
 
                 // A view-only scan may have been persisted immediately before the OS killed
                 // the process. This import occurs after the mnemonic opened an unsealed wallet,
@@ -244,6 +251,36 @@ mod tests {
     use crate::support::WALLET_STORE;
     use crate::PersistedNetwork;
     use std::ffi::CString;
+
+    #[test]
+    fn coverage_expansion_rewinds_without_erasing_and_survives_cache() {
+        let id = "coverage-roundtrip";
+        open_wallet(id);
+        let id_c = CString::new(id).unwrap();
+        {
+            let mut store = WALLET_STORE.lock().unwrap();
+            let wallet = store.get_mut(id).unwrap();
+            wallet.last_scanned = 250;
+            wallet.total = 123;
+            wallet.recent_block_hashes = vec![[7; 32]];
+        }
+        assert_eq!(crate::wallet_set_gap_limit(id_c.as_ptr(), 51), 0);
+        let cache = decode_cache(&export_bytes(id)).unwrap();
+        assert_eq!(cache.gap_limit, 51);
+        assert_eq!(cache.last_scanned, 100);
+        assert_eq!(cache.restore_height, 100);
+        assert_eq!(cache.total, 123);
+        assert_eq!(cache.recent_block_hashes, vec![[7; 32]], "kept history must still have a reorg anchor");
+        assert_eq!(crate::wallet_set_gap_limit(id_c.as_ptr(), 50), 0);
+        assert_eq!(WALLET_STORE.lock().unwrap()[id].gap_limit, 51);
+        let bytes = export_bytes(id);
+        assert_eq!(crate::wallet_set_gap_limit(id_c.as_ptr(), 100), 0);
+        assert_eq!(wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()), 0);
+        assert_eq!(WALLET_STORE.lock().unwrap()[id].gap_limit, 100, "an older cache cannot reduce receive coverage");
+        assert_eq!(WALLET_STORE.lock().unwrap()[id].last_scanned, 100);
+        assert_ne!(crate::wallet_set_gap_limit(id_c.as_ptr(), 100_001), 0);
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
 
     #[test]
     fn cache_budget_rejects_oversized_input_and_forged_lengths() {
