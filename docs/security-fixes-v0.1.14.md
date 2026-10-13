@@ -5,12 +5,14 @@
 - Key-image spend scalars/offsets and subaddress view-key derivation buffers use wiping owners.
 - Rust API seed C strings and output buffers use wiping owners. Swift mnemonic/open/unseal
   wrappers wipe owned UTF-8/output arrays on success and error via non-elidable platform routines.
+- Secret C strings reserve their terminator before copying and reject interior NULs before
+  allocation, avoiding CString constructor/error buffers and growth reallocations.
 - No ABI/cache-schema/amount/fee change. A new XCFramework/native release and consumer pin bumps
   are needed to distribute these changes; the current v0.1.14 asset remains unchanged.
 - Ownership wiping is defense-in-depth, not a promise that managed strings, registers, stack
   moves or third-party framework copies leave no recoverable data. Never use live funds in fixtures.
 
-Local verification: 90 Rust tests pass (6 external/diagnostic fixtures ignored), 13 Swift wrapper
+Local verification: 92 Rust tests pass (6 external/diagnostic fixtures ignored), 13 Swift wrapper
 tests pass against the new native binary, all seven Apple library targets build into an XCFramework,
 and arm64-v8a/x86_64 Android release libraries build with 16 KB alignment. Advisory checks pass.
 

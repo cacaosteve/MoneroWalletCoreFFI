@@ -263,7 +263,41 @@ fn take_string(ptr: *mut c_char) -> Option<String> {
 }
 
 fn secret_cstr(value: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-    Ok(zeroize::Zeroizing::new(cstr(value)?.into_bytes_with_nul()))
+    // Reject before allocating: CString::new's NulError would own an unwiped copy.
+    // Reserve the terminator up front, avoiding an implicit reallocation of secret bytes.
+    if value.as_bytes().contains(&0) {
+        return Err(Error {
+            code: -10,
+            message: "argument contained an interior NUL".into(),
+        });
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(value.len() + 1));
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(0);
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod secret_string_tests {
+    use super::*;
+
+    #[test]
+    fn secret_c_string_has_exact_utf8_and_terminator_without_growth() {
+        for input in ["", "synthetic phrase", "synthetic café"] {
+            let bytes = secret_cstr(input).unwrap();
+            assert_eq!(&bytes[..input.len()], input.as_bytes());
+            assert_eq!(bytes.len(), input.len() + 1);
+            assert_eq!(bytes[input.len()], 0);
+            assert!(bytes.capacity() >= input.len() + 1);
+        }
+    }
+
+    #[test]
+    fn secret_c_string_rejects_nul_without_returning_secret_data() {
+        let error = secret_cstr("synthetic\0secret").unwrap_err();
+        assert_eq!(error.code, -10);
+        assert_eq!(error.message, "argument contained an interior NUL");
+    }
 }
 
 fn write_into_buf(mut call: impl FnMut(*mut c_char, usize, *mut usize) -> c_int) -> Result<String> {
