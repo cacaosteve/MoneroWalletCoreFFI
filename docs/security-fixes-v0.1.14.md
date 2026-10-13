@@ -1,20 +1,25 @@
 # WalletCore v0.1.14 security fixes
 
-## v0.1.15 follow-up, separate from the published v0.1.14 artifact
+## Published v0.1.15 follow-up
 
 - Key-image spend scalars/offsets and subaddress view-key derivation buffers use wiping owners.
 - Rust API seed C strings and output buffers use wiping owners. Swift mnemonic/open/unseal
   wrappers wipe owned UTF-8/output arrays on success and error via non-elidable platform routines.
 - Secret C strings reserve their terminator before copying and reject interior NULs before
   allocation, avoiding CString constructor/error buffers and growth reallocations.
-- No ABI/cache-schema/amount/fee change. A new XCFramework/native release and consumer pin bumps
-  are needed to distribute these changes; the current v0.1.14 asset remains unchanged.
+- No ABI/cache-schema/amount/fee change. The v0.1.15 XCFramework/native release distributes
+  these changes; the v0.1.14 asset remains unchanged.
 - Ownership wiping is defense-in-depth, not a promise that managed strings, registers, stack
   moves or third-party framework copies leave no recoverable data. Never use live funds in fixtures.
 
 Local verification: 92 Rust tests pass (6 external/diagnostic fixtures ignored), 13 Swift wrapper
 tests pass against the new native binary, all seven Apple library targets build into an XCFramework,
 and arm64-v8a/x86_64 Android release libraries build with 16 KB alignment. Advisory checks pass.
+
+Native artifacts were built from `3d0a97e87ae67d627099c9353104a239c1adeac3` in
+[release CI](https://github.com/cacaosteve/MoneroWalletCoreFFI/actions/runs/38350931561).
+The final release commit only updates this documentation and the matching SwiftPM URL/checksum;
+the native crate and Swift wrapper source trees are identical to the build commit.
 
 ## Published v0.1.14 fixes
 
