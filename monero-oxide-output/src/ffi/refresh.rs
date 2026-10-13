@@ -929,6 +929,23 @@ fn accept_owned_output(
     true
 }
 
+/// Coverage replay retains known outputs. The same transaction can be mined at
+/// a different height after a reorg; refresh its location before reconciling its
+/// old height, without resetting its key image or already-observed spend.
+fn relocate_replayed_output(
+    outputs: &mut [TrackedOutput], outpoint: ([u8; 32], u64),
+    public_key: [u8; 32], height: u64,
+) -> Result<(), &'static str> {
+    let output = outputs.iter_mut()
+        .find(|o| (o.tx_hash, o.index_in_tx) == outpoint)
+        .ok_or("known output is missing from tracked outputs")?;
+    if output.public_key != public_key {
+        return Err("replayed output key does not match its transaction outpoint");
+    }
+    output.block_height = height;
+    Ok(())
+}
+
 /// Decode one block entry without touching shared wallet state or making fallback RPC calls.
 /// Keeping this phase pure allows a response's blocks to be decoded concurrently while the
 /// indexed parallel iterator preserves daemon order for the sequential finalization phase.
@@ -3546,6 +3563,15 @@ fn wallet_refresh_impl(
                 for output in outputs {
                     let key = (output.transaction(), output.index_in_transaction());
                     let public_key = output.key().compress().to_bytes();
+                    if seen_outpoints.contains(&key) {
+                        if let Err(error) = relocate_replayed_output(&mut working_outputs, key, public_key, th) {
+                            return record_error(-16, format!("wallet_refresh: {error} at height {th}"));
+                        }
+                        if let Some(fee) = block_tx_fees.get(&output.transaction()) {
+                            known_tx_fees.entry(hex_lowercase(&output.transaction())).or_insert(*fee);
+                        }
+                        continue;
+                    }
                     if !accept_owned_output(key, public_key, &mut seen_outpoints, &mut owned_output_keys) {
                         continue;
                     }
@@ -4230,6 +4256,79 @@ mod tests {
         super::reconcile_replayed_height(180, &HashSet::new(), &HashSet::new(), &mut outputs, &mut outpoints, &mut keys);
         assert!(!outputs[0].spent);
         assert_eq!(outputs[0].spending_txid, None);
+    }
+
+    #[test]
+    fn coverage_replay_retains_receive_remined_before_its_old_height() {
+        let receive = tracked_output(1, 42, 150);
+        let mut outputs = vec![receive.clone()];
+        let mut outpoints = HashSet::from([(receive.tx_hash, receive.index_in_tx)]);
+        let mut keys = HashSet::from([receive.public_key]);
+        super::relocate_replayed_output(&mut outputs, (receive.tx_hash, receive.index_in_tx), receive.public_key, 149).unwrap();
+        super::reconcile_replayed_height(150, &HashSet::new(), &HashSet::new(), &mut outputs, &mut outpoints, &mut keys);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].block_height, 149);
+        assert_eq!(outputs[0].amount, 42);
+        assert!(outpoints.contains(&(receive.tx_hash, receive.index_in_tx)));
+        assert!(!super::accept_owned_output(([2; 32], 0), receive.public_key, &mut outpoints, &mut keys));
+    }
+
+    #[test]
+    fn coverage_relocation_preserves_spend_and_rejects_outpoint_key_change() {
+        let mut receive = tracked_output(1, 42, 150);
+        receive.spent = true;
+        receive.spending_txid = Some([3; 32]);
+        receive.spending_height = Some(180);
+        let mut outputs = vec![receive.clone()];
+        let outpoint = (receive.tx_hash, receive.index_in_tx);
+        assert!(super::relocate_replayed_output(&mut outputs, outpoint, [99; 32], 149).is_err());
+        assert_eq!(outputs[0].block_height, 150);
+        for height in [149, 149, 151] {
+            super::relocate_replayed_output(&mut outputs, outpoint, receive.public_key, height).unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].spent);
+            assert_eq!(outputs[0].key_image, receive.key_image);
+            assert_eq!(outputs[0].spending_txid, Some([3; 32]));
+            assert_eq!(outputs[0].spending_height, Some(180));
+            assert_eq!(outputs[0].additional_timelock, receive.additional_timelock);
+        }
+    }
+
+    #[test]
+    fn relocated_receive_checkpoint_cache_preserves_balance_fee_and_history_height() {
+        let id = "relocated-receive-cache";
+        open_test_wallet(id, 100);
+        let receive = tracked_output(21, 42_000, 150);
+        let mut outputs = vec![receive.clone()];
+        let mut seen = HashSet::from([(receive.tx_hash, receive.index_in_tx)]);
+        let mut keys = HashSet::from([receive.public_key]);
+        super::relocate_replayed_output(&mut outputs, (receive.tx_hash, receive.index_in_tx), receive.public_key, 149).unwrap();
+        super::reconcile_replayed_height(150, &HashSet::new(), &HashSet::new(), &mut outputs, &mut seen, &mut keys);
+        let txid = crate::hex_lowercase(&receive.tx_hash);
+        commit_refresh_checkpoint(id, 200, 200, 1_700_000_100, &outputs, &seen,
+            &HashMap::from([(txid.clone(), 9_000)]), 199, &[[3; 32], [4; 32]],
+            &HashMap::from([(149, 1_700_000_000)]), None).unwrap();
+        let bytes = {
+            let store = WALLET_STORE.lock().unwrap();
+            bincode::serialize(&PersistedWallet::from(store.get(id).unwrap())).unwrap()
+        };
+        // Reopen with the same synthetic identity and import through the production FFI.
+        WALLET_STORE.lock().unwrap().remove(id);
+        open_test_wallet(id, 100);
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(crate::ffi::cache::wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()), 0);
+        let mut store = WALLET_STORE.lock().unwrap();
+        let state = store.get(id).unwrap();
+        assert_eq!(state.total, 42_000);
+        assert_eq!(state.tracked_outputs.len(), 1);
+        assert_eq!(state.tracked_outputs[0].block_height, 149);
+        let row = state.tx_ledger.get(&txid).unwrap();
+        assert_eq!(row.height, Some(149));
+        assert_eq!(row.amount, 42_000);
+        assert_eq!(row.direction, "in");
+        assert_eq!(row.fee, Some(9_000));
+        assert_eq!(row.timestamp, Some(1_700_000_000));
+        store.remove(id);
     }
 
     #[test]

@@ -65,8 +65,11 @@ Receive-address coverage: before issuing a subaddress, hosts must call
 `wallet_set_gap_limit` with at least its minor index and persist the cache. Coverage
 is monotonic, including across cache imports. Expanding it rewinds the scan cursor
 to the original restore height without deleting known history or pending sends;
-the refresh revalidates retained receives/spends against the scanned chain. Growth
-is refused during an active refresh, so the host should retry after it finishes.
+the refresh revalidates retained receives/spends against the scanned chain. Replay
+also updates retained outputs when their transaction is re-mined at an
+earlier height, preserving its key image and observed spend state. Hosts must
+durably save their receive-address book before displaying a newly issued address.
+Growth is refused during an active refresh, so the host should retry after it finishes.
 Other accounts' primary subaddresses (minor zero) are registered when their account
 lookahead is enabled. Total scanner registrations are capped at 100,000.
 
