@@ -1,6 +1,6 @@
 # Production hardening follow-up — 2026-09-05
 
-## Pending October 13 quarantine and FFI corrections
+## October 13 quarantine and FFI corrections — WalletCore v0.1.18
 
 All exported C entry points now catch unwinding Rust panics and return a sanitized native-failure
 error (-19, or a null result). The release profile explicitly requires `panic=unwind`; an abort
@@ -20,9 +20,14 @@ Node spent-status reports remain untrusted hints, not cryptographic proof or aut
 
 Local library tests: 108 passed, six opt-in fixtures ignored. A local HTTP fixture also checks
 pool-spend exclusion and dropped-pool release through the actual spent-status RPC transport.
-No personal wallet, funded send or
-live-node benchmark was used. Native release/consumer-pin rollout and signed-device QA remain
-required; the currently published v0.1.17 artifacts do not contain these changes.
+The separate 100,000-output cache/paging fixture passes. All seven Apple native targets and both
+Android ABIs compile; local desktop and temporary Android packages were checked with this Core.
+No personal wallet, funded send or live-node benchmark was used. Signed-device QA remains required.
+
+The v0.1.18 native artifacts are built from `7afcbaa2843cdacc72be5019dfd9fa5c4627b396` by the
+native GitHub Actions workflow. The final release tag adds the published XCFramework checksum and
+this documentation only: the `monero-oxide-output` source tree is unchanged from the build commit.
+This keeps the tag's Package.swift valid without moving a published tag or rebuilding assets.
 
 ## Status
 
