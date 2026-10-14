@@ -72,6 +72,16 @@ pub extern "C" fn wallet_preview_sweep(
     to_address: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_preview_sweep", || wallet_preview_sweep_ffi_impl(wallet_id, node_url, to_address, ring_len))
+}
+
+
+fn wallet_preview_sweep_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() || to_address.is_null() {
@@ -85,6 +95,16 @@ pub extern "C" fn wallet_preview_sweep(
 
 #[no_mangle]
 pub extern "C" fn wallet_sweep(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_sweep", || wallet_sweep_ffi_impl(wallet_id, node_url, to_address, ring_len))
+}
+
+
+fn wallet_sweep_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     to_address: *const c_char,
@@ -118,6 +138,16 @@ pub extern "C" fn wallet_prepare_sweep(
     to_address: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_prepare_sweep", || wallet_prepare_sweep_ffi_impl(wallet_id, node_url, to_address, ring_len))
+}
+
+
+fn wallet_prepare_sweep_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() || to_address.is_null() {
@@ -132,6 +162,17 @@ pub extern "C" fn wallet_prepare_sweep(
 
 #[no_mangle]
 pub extern "C" fn wallet_preview_sweep_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_preview_sweep_with_filter", || wallet_preview_sweep_with_filter_ffi_impl(wallet_id, node_url, to_address, filter_json, ring_len))
+}
+
+
+fn wallet_preview_sweep_with_filter_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     to_address: *const c_char,
@@ -210,7 +251,7 @@ fn wallet_preview_sweep_with_filter_impl(
         _ => None,
     };
 
-    let snapshot = {
+    let mut snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get(id) {
             Some(state) => state.clone(),
@@ -365,11 +406,11 @@ fn wallet_preview_sweep_with_filter_impl(
         ),
     );
 
-    let mut spendable: Vec<TrackedOutput> = snapshot
-        .tracked_outputs
-        .iter()
-        .cloned()
-        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+    let mut spendable: Vec<TrackedOutput> = match super::input_policy::spendable(id, &mut snapshot,
+        &rpc_client, daemon.height, daemon.top_block_timestamp, true) {
+        Ok(outputs) => outputs,
+        Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+    }.into_iter()
         .filter(|o| {
             if pending_txids.is_empty() {
                 return true;
@@ -834,6 +875,17 @@ pub extern "C" fn wallet_sweep_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_sweep_with_filter", || wallet_sweep_with_filter_ffi_impl(wallet_id, node_url, to_address, filter_json, ring_len))
+}
+
+
+fn wallet_sweep_with_filter_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     run_while_refresh_stopped(wallet_id, "wallet_sweep_with_filter", || {
         wallet_sweep_with_filter_impl(
             wallet_id,
@@ -849,6 +901,17 @@ pub extern "C" fn wallet_sweep_with_filter(
 /// Build and sign a filtered sweep without broadcasting it.
 #[no_mangle]
 pub extern "C" fn wallet_prepare_sweep_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_prepare_sweep_with_filter", || wallet_prepare_sweep_with_filter_ffi_impl(wallet_id, node_url, to_address, filter_json, ring_len))
+}
+
+
+fn wallet_prepare_sweep_with_filter_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     to_address: *const c_char,
@@ -896,7 +959,7 @@ fn wallet_sweep_with_filter_impl(
         }
     };
 
-    let snapshot = {
+    let mut snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get(id) {
             Some(s) => s.clone(),
@@ -1039,11 +1102,11 @@ fn wallet_sweep_with_filter_impl(
         ),
     );
 
-    let mut spendable: Vec<TrackedOutput> = snapshot
-        .tracked_outputs
-        .iter()
-        .cloned()
-        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+    let mut spendable: Vec<TrackedOutput> = match super::input_policy::spendable(id, &mut snapshot,
+        &rpc_client, daemon.height, daemon.top_block_timestamp, true) {
+        Ok(outputs) => outputs,
+        Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+    }.into_iter()
         .filter(|o| {
             if pending_txids.is_empty() {
                 return true;

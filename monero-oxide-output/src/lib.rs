@@ -1512,6 +1512,11 @@ fn build_short_chain_history(state: &StoredWallet) -> Vec<[u8; 32]> {
 
 #[no_mangle]
 pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
+    crate::ffi::boundary::guard("walletcore_last_error_message", || walletcore_last_error_message_ffi_impl())
+}
+
+
+fn walletcore_last_error_message_ffi_impl() -> *mut c_char {
     let snapshot = LAST_ERROR_MESSAGE
         .lock()
         .map(|slot| slot.clone())
@@ -1532,6 +1537,11 @@ pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
 /// Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn wallet_refresh_cancel(wallet_id: *const c_char) -> c_int {
+    crate::ffi::boundary::guard("wallet_refresh_cancel", || wallet_refresh_cancel_ffi_impl(wallet_id))
+}
+
+
+fn wallet_refresh_cancel_ffi_impl(wallet_id: *const c_char) -> c_int {
     clear_last_error();
 
     if wallet_id.is_null() {
@@ -2507,6 +2517,11 @@ fn derive_address_string<K: ViewKeyMaterial>(
 
 #[no_mangle]
 pub extern "C" fn walletcore_version() -> *mut c_char {
+    crate::ffi::boundary::guard("walletcore_version", || walletcore_version_ffi_impl())
+}
+
+
+fn walletcore_version_ffi_impl() -> *mut c_char {
     CString::new(concat!("walletcore ", env!("CARGO_PKG_VERSION")))
         .unwrap()
         .into_raw()
@@ -2514,6 +2529,11 @@ pub extern "C" fn walletcore_version() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn walletcore_free_cstr(ptr: *mut c_char) -> c_int {
+    crate::ffi::boundary::guard("walletcore_free_cstr", || walletcore_free_cstr_ffi_impl(ptr))
+}
+
+
+fn walletcore_free_cstr_ffi_impl(ptr: *mut c_char) -> c_int {
     if ptr.is_null() {
         return -1;
     }
@@ -2535,6 +2555,20 @@ pub extern "C" fn walletcore_free_cstr(ptr: *mut c_char) -> c_int {
 /// - negative error codes for invalid pointers, lengths, or insufficient buffers.
 #[no_mangle]
 pub extern "C" fn wallet_derive_address_from_seed(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    is_mainnet: u8,
+    account_index: u32,
+    subaddress_index: u32,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_derive_address_from_seed", || wallet_derive_address_from_seed_ffi_impl(seed_ptr, seed_len, is_mainnet, account_index, subaddress_index, out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_derive_address_from_seed_ffi_impl(
     seed_ptr: *const u8,
     seed_len: usize,
     is_mainnet: u8,
@@ -2567,6 +2601,18 @@ pub extern "C" fn wallet_primary_address_from_seed(
     out_buf_len: usize,
     out_written: *mut usize,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_primary_address_from_seed", || wallet_primary_address_from_seed_ffi_impl(seed_ptr, seed_len, is_mainnet, out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_primary_address_from_seed_ffi_impl(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
     wallet_derive_address_from_seed(
         seed_ptr,
         seed_len,
@@ -2590,6 +2636,17 @@ pub extern "C" fn wallet_primary_address_from_mnemonic(
     out_buf_len: usize,
     out_written: *mut usize,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_primary_address_from_mnemonic", || wallet_primary_address_from_mnemonic_ffi_impl(mnemonic_ptr, is_mainnet, out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_primary_address_from_mnemonic_ffi_impl(
+    mnemonic_ptr: *const c_char,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
     let keys = match master_keys_from_mnemonic_ptr(mnemonic_ptr) {
         Ok(k) => k,
         Err(code) => {
@@ -2607,6 +2664,19 @@ pub extern "C" fn wallet_primary_address_from_mnemonic(
 /// Returns the derived base58 subaddress or a negative error code on validation failures.
 #[no_mangle]
 pub extern "C" fn wallet_derive_subaddress_from_mnemonic(
+    mnemonic_ptr: *const c_char,
+    account_index: u32,
+    subaddress_index: u32,
+    is_mainnet: u8,
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_derive_subaddress_from_mnemonic", || wallet_derive_subaddress_from_mnemonic_ffi_impl(mnemonic_ptr, account_index, subaddress_index, is_mainnet, out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_derive_subaddress_from_mnemonic_ffi_impl(
     mnemonic_ptr: *const c_char,
     account_index: u32,
     subaddress_index: u32,
@@ -3598,6 +3668,11 @@ fn lifecycle_wallet_id(wallet_id: *const c_char, operation: &str) -> Result<Stri
 /// fail closed until `wallet_unseal_from_mnemonic` succeeds.
 #[no_mangle]
 pub extern "C" fn wallet_seal(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
+    crate::ffi::boundary::guard("wallet_seal", || wallet_seal_ffi_impl(wallet_id, timeout_ms))
+}
+
+
+fn wallet_seal_ffi_impl(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
     clear_last_error();
     let id = match lifecycle_wallet_id(wallet_id, "wallet_seal") {
         Ok(id) => id,
@@ -3631,6 +3706,15 @@ pub extern "C" fn wallet_seal(wallet_id: *const c_char, timeout_ms: u64) -> c_in
 /// images and spend history are rebuilt authoritatively on the next refresh.
 #[no_mangle]
 pub extern "C" fn wallet_unseal_from_mnemonic(
+    wallet_id: *const c_char,
+    mnemonic_ptr: *const c_char,
+    timeout_ms: u64,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_unseal_from_mnemonic", || wallet_unseal_from_mnemonic_ffi_impl(wallet_id, mnemonic_ptr, timeout_ms))
+}
+
+
+fn wallet_unseal_from_mnemonic_ffi_impl(
     wallet_id: *const c_char,
     mnemonic_ptr: *const c_char,
     timeout_ms: u64,
@@ -3686,6 +3770,11 @@ pub extern "C" fn wallet_unseal_from_mnemonic(
 /// material after a bounded refresh cancellation wait.
 #[no_mangle]
 pub extern "C" fn wallet_close(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
+    crate::ffi::boundary::guard("wallet_close", || wallet_close_ffi_impl(wallet_id, timeout_ms))
+}
+
+
+fn wallet_close_ffi_impl(wallet_id: *const c_char, timeout_ms: u64) -> c_int {
     clear_last_error();
     let id = match lifecycle_wallet_id(wallet_id, "wallet_close") {
         Ok(id) => id,
@@ -3719,6 +3808,11 @@ pub extern "C" fn wallet_close(wallet_id: *const c_char, timeout_ms: u64) -> c_i
 
 #[no_mangle]
 pub extern "C" fn wallet_is_sealed(wallet_id: *const c_char, out_sealed: *mut u8) -> c_int {
+    crate::ffi::boundary::guard("wallet_is_sealed", || wallet_is_sealed_ffi_impl(wallet_id, out_sealed))
+}
+
+
+fn wallet_is_sealed_ffi_impl(wallet_id: *const c_char, out_sealed: *mut u8) -> c_int {
     clear_last_error();
     if out_sealed.is_null() {
         return record_error(-11, "wallet_is_sealed: out_sealed pointer was null");
@@ -3738,6 +3832,11 @@ pub extern "C" fn wallet_is_sealed(wallet_id: *const c_char, out_sealed: *mut u8
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_start_zmq_listener(endpoint: *const c_char) -> c_int {
+    crate::ffi::boundary::guard("wallet_start_zmq_listener", || wallet_start_zmq_listener_ffi_impl(endpoint))
+}
+
+# [cfg (not (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos")))]
+fn wallet_start_zmq_listener_ffi_impl(endpoint: *const c_char) -> c_int {
     clear_last_error();
     if endpoint.is_null() {
         return record_error(-11, "wallet_start_zmq_listener: endpoint pointer was null");
@@ -3763,6 +3862,11 @@ pub extern "C" fn wallet_start_zmq_listener(endpoint: *const c_char) -> c_int {
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
+    crate::ffi::boundary::guard("wallet_stop_zmq_listener", || wallet_stop_zmq_listener_ffi_impl())
+}
+
+# [cfg (not (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos")))]
+fn wallet_stop_zmq_listener_ffi_impl() -> c_int {
     clear_last_error();
     stop_zmq_runtime();
     0
@@ -3771,12 +3875,22 @@ pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
 #[no_mangle]
 pub extern "C" fn wallet_stop_zmq_listener() -> c_int {
+    crate::ffi::boundary::guard("wallet_stop_zmq_listener", || wallet_stop_zmq_listener_ffi_impl())
+}
+
+# [cfg (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos"))]
+fn wallet_stop_zmq_listener_ffi_impl() -> c_int {
     0
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 #[no_mangle]
 pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
+    crate::ffi::boundary::guard("wallet_zmq_sequence", || wallet_zmq_sequence_ffi_impl(out_sequence))
+}
+
+# [cfg (not (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos")))]
+fn wallet_zmq_sequence_ffi_impl(out_sequence: *mut u64) -> c_int {
     clear_last_error();
     if out_sequence.is_null() {
         return record_error(-11, "wallet_zmq_sequence: out_sequence pointer was null");
@@ -3803,6 +3917,11 @@ pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
 #[no_mangle]
 pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
+    crate::ffi::boundary::guard("wallet_zmq_sequence", || wallet_zmq_sequence_ffi_impl(out_sequence))
+}
+
+# [cfg (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos"))]
+fn wallet_zmq_sequence_ffi_impl(out_sequence: *mut u64) -> c_int {
     clear_last_error();
     if !out_sequence.is_null() {
         unsafe { *out_sequence = 0 };
@@ -3813,6 +3932,11 @@ pub extern "C" fn wallet_zmq_sequence(out_sequence: *mut u64) -> c_int {
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
 #[no_mangle]
 pub extern "C" fn wallet_start_zmq_listener(_endpoint: *const c_char) -> c_int {
+    crate::ffi::boundary::guard("wallet_start_zmq_listener", || wallet_start_zmq_listener_ffi_impl(_endpoint))
+}
+
+# [cfg (any (target_os = "ios" , target_os = "tvos" , target_os = "watchos"))]
+fn wallet_start_zmq_listener_ffi_impl(_endpoint: *const c_char) -> c_int {
     clear_last_error();
     0
 }
@@ -3825,6 +3949,16 @@ pub extern "C" fn wallet_start_zmq_listener(_endpoint: *const c_char) -> c_int {
 /// - -11 invalid argument (null pointers)
 #[no_mangle]
 pub extern "C" fn wallet_open_from_mnemonic(
+    wallet_id: *const c_char,
+    mnemonic_ptr: *const c_char,
+    restore_height: u64,
+    is_mainnet: u8,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_open_from_mnemonic", || wallet_open_from_mnemonic_ffi_impl(wallet_id, mnemonic_ptr, restore_height, is_mainnet))
+}
+
+
+fn wallet_open_from_mnemonic_ffi_impl(
     wallet_id: *const c_char,
     mnemonic_ptr: *const c_char,
     restore_height: u64,
@@ -3923,6 +4057,11 @@ pub extern "C" fn wallet_open_from_mnemonic(
 
 #[no_mangle]
 pub extern "C" fn wallet_set_gap_limit(wallet_id: *const c_char, gap_limit: u32) -> c_int {
+    crate::ffi::boundary::guard("wallet_set_gap_limit", || wallet_set_gap_limit_ffi_impl(wallet_id, gap_limit))
+}
+
+
+fn wallet_set_gap_limit_ffi_impl(wallet_id: *const c_char, gap_limit: u32) -> c_int {
     clear_last_error();
 
     if wallet_id.is_null() {
@@ -4002,6 +4141,15 @@ pub extern "C" fn wallet_get_balance(
     out_total_piconero: *mut u64,
     out_unlocked_piconero: *mut u64,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_get_balance", || wallet_get_balance_ffi_impl(wallet_id, out_total_piconero, out_unlocked_piconero))
+}
+
+
+fn wallet_get_balance_ffi_impl(
+    wallet_id: *const c_char,
+    out_total_piconero: *mut u64,
+    out_unlocked_piconero: *mut u64,
+) -> c_int {
     if wallet_id.is_null() || out_total_piconero.is_null() || out_unlocked_piconero.is_null() {
         return -11;
     }
@@ -4016,7 +4164,7 @@ pub extern "C" fn wallet_get_balance(
 
     unsafe {
         *out_total_piconero = state.total;
-        *out_unlocked_piconero = state.unlocked;
+        *out_unlocked_piconero = crate::ffi::input_policy::unlocked_balance(state, None);
     }
     0
 }
@@ -4032,6 +4180,16 @@ pub extern "C" fn wallet_get_balance(
 /// - -13 wallet not found
 #[no_mangle]
 pub extern "C" fn wallet_get_balance_with_filter(
+    wallet_id: *const c_char,
+    filter_json: *const c_char,
+    out_total_piconero: *mut u64,
+    out_unlocked_piconero: *mut u64,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_get_balance_with_filter", || wallet_get_balance_with_filter_ffi_impl(wallet_id, filter_json, out_total_piconero, out_unlocked_piconero))
+}
+
+
+fn wallet_get_balance_with_filter_ffi_impl(
     wallet_id: *const c_char,
     filter_json: *const c_char,
     out_total_piconero: *mut u64,
@@ -4105,7 +4263,8 @@ pub extern "C" fn wallet_get_balance_with_filter(
         }
 
         total = total.saturating_add(o.amount);
-        if o.is_unlocked(chain_height, chain_time) {
+        if o.is_unlocked(chain_height, chain_time)
+            && !state.invalid_input_quarantine.contains(&(o.tx_hash, o.index_in_tx)) {
             unlocked = unlocked.saturating_add(o.amount);
         }
     }
@@ -4121,6 +4280,14 @@ pub extern "C" fn wallet_get_balance_with_filter(
 
 #[no_mangle]
 pub extern "C" fn wallet_rewind_scan_cursor_to_height(
+    wallet_id: *const c_char,
+    target_height: u64,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_rewind_scan_cursor_to_height", || wallet_rewind_scan_cursor_to_height_ffi_impl(wallet_id, target_height))
+}
+
+
+fn wallet_rewind_scan_cursor_to_height_ffi_impl(
     wallet_id: *const c_char,
     target_height: u64,
 ) -> c_int {
@@ -4194,6 +4361,14 @@ pub extern "C" fn wallet_rewind_scan_cursor_to_height(
 
 #[no_mangle]
 pub extern "C" fn wallet_force_rescan_from_height(
+    wallet_id: *const c_char,
+    new_restore_height: u64,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_force_rescan_from_height", || wallet_force_rescan_from_height_ffi_impl(wallet_id, new_restore_height))
+}
+
+
+fn wallet_force_rescan_from_height_ffi_impl(
     wallet_id: *const c_char,
     new_restore_height: u64,
 ) -> c_int {
@@ -4294,6 +4469,11 @@ pub use crate::ffi::history::wallet_query_transfers_json;
 
 #[no_mangle]
 pub extern "C" fn wallet_reset_tracked_outputs(wallet_id: *const c_char) -> c_int {
+    crate::ffi::boundary::guard("wallet_reset_tracked_outputs", || wallet_reset_tracked_outputs_ffi_impl(wallet_id))
+}
+
+
+fn wallet_reset_tracked_outputs_ffi_impl(wallet_id: *const c_char) -> c_int {
     clear_last_error();
 
     if wallet_id.is_null() {

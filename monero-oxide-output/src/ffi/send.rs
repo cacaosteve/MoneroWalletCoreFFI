@@ -96,7 +96,7 @@ fn is_double_spend_tagged_broadcast_error(s: &str) -> bool {
 ///
 /// Note: this is **not** a JSON-RPC method. It must be called via the regular RPC route, not
 /// `/json_rpc`.
-fn rpc_is_key_image_spent(
+pub(crate) fn rpc_is_key_image_spent(
     rpc_client: &RpcClient,
     key_images: &[[u8; 32]],
 ) -> Result<Vec<u8>, String> {
@@ -280,6 +280,15 @@ fn relay_result_json(txid: &str, status: &str) -> *mut c_char {
 /// blob and therefore its transaction hash are immutable.
 #[no_mangle]
 pub extern "C" fn wallet_relay_prepared(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    prepared_json: *const c_char,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_relay_prepared", || wallet_relay_prepared_ffi_impl(wallet_id, node_url, prepared_json))
+}
+
+
+fn wallet_relay_prepared_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     prepared_json: *const c_char,
@@ -483,6 +492,17 @@ pub extern "C" fn wallet_send(
     amount_piconero: u64,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_send", || wallet_send_ffi_impl(wallet_id, node_url, to_address, amount_piconero, ring_len))
+}
+
+
+fn wallet_send_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    amount_piconero: u64,
+    ring_len: u8,
+) -> *mut c_char {
     run_while_refresh_stopped(wallet_id, "wallet_send", || {
         wallet_send_impl(
             wallet_id,
@@ -498,6 +518,17 @@ pub extern "C" fn wallet_send(
 /// Build and sign a single-destination transaction without broadcasting it.
 #[no_mangle]
 pub extern "C" fn wallet_prepare_send(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    amount_piconero: u64,
+    ring_len: u8,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_prepare_send", || wallet_prepare_send_ffi_impl(wallet_id, node_url, to_address, amount_piconero, ring_len))
+}
+
+
+fn wallet_prepare_send_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     to_address: *const c_char,
@@ -711,107 +742,12 @@ fn wallet_send_impl(
             );
         }
 
-        // Choose spendable outputs (unspent and unlocked), excluding quarantined outpoints.
-        let mut spendable = snapshot
-            .tracked_outputs
-            .iter()
-            .cloned()
-            .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
-            .filter(|o| {
-                !snapshot
-                    .invalid_input_quarantine
-                    .contains(&(o.tx_hash, o.index_in_tx))
-            })
-            .collect::<Vec<_>>();
-
-        // Preflight: ask daemon whether these key images are already spent (chain or pool).
-        //
-        // If spend detection is lagging or cache is stale, this prevents constructing/broadcasting
-        // a tx which the daemon rejects with `invalid_input`.
-        if !spendable.is_empty() {
-            let key_images: Vec<[u8; 32]> = spendable.iter().map(|o| o.key_image).collect();
-            match rpc_is_key_image_spent(&rpc_client, &key_images) {
-                Ok(statuses) => {
-                    // quarantine spent ones and exclude them from spendable
-                    let mut newly_quarantined: usize = 0;
-                    for (o, st) in spendable.iter().zip(statuses.iter()) {
-                        if *st != 0 {
-                            newly_quarantined += 1;
-                            let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
-                            if let Some(state) = map.get_mut(id) {
-                                state
-                                    .invalid_input_quarantine
-                                    .insert((o.tx_hash, o.index_in_tx));
-                            }
-                        }
-                    }
-
-                    if newly_quarantined > 0 {
-                        // Log which outputs were quarantined by preflight so we can correlate with
-                        // later `invalid_input` failures.
-                        if walletcore_decoy_probe_enabled() {
-                            for (o, st) in spendable.iter().zip(statuses.iter()) {
-                                if *st != 0 {
-                                    walletcore_log_line(
-                                        id,
-                                        snapshot.network,
-                                        &format!(
-                                            "🧪 preflight is_key_image_spent: quarantining wallet_id={} out={} key_image={} spent_status={}",
-                                            id,
-                                            format!(
-                                                "{}:{}",
-                                                hex_dump_prefix(&o.tx_hash, 32),
-                                                o.index_in_tx
-                                            ),
-                                            hex_dump_prefix(&o.key_image, 32),
-                                            st
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-
-                        quarantined_this_call =
-                            quarantined_this_call.saturating_add(newly_quarantined);
-                        // Re-pull snapshot so we use the updated quarantine set, then rebuild spendable list.
-                        snapshot = {
-                            let map = WALLET_STORE.lock().expect("wallet store poisoned");
-                            match map.get(id) {
-                                Some(state) => state.clone(),
-                                None => {
-                                    record_error(
-                                        -13,
-                                        format!("wallet_send: wallet '{id}' not registered"),
-                                    );
-                                    return ptr::null_mut();
-                                }
-                            }
-                        };
-                        spendable = snapshot
-                            .tracked_outputs
-                            .iter()
-                            .cloned()
-                            .filter(|o| {
-                                !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp)
-                            })
-                            .filter(|o| {
-                                !snapshot
-                                    .invalid_input_quarantine
-                                    .contains(&(o.tx_hash, o.index_in_tx))
-                            })
-                            .collect::<Vec<_>>();
-                    }
-                }
-                Err(e) => {
-                    // Don't hard-fail send if daemon doesn't support it; just log for debugging.
-                    walletcore_log_line(
-                        id,
-                        snapshot.network,
-                        &format!("🧪 preflight is_key_image_spent unavailable/failed: wallet_id={} err={}", id, e),
-                    );
-                }
-            }
-        }
+        // Shared preflight and quarantine policy; retries cannot release newly rejected inputs.
+        let mut spendable = match super::input_policy::spendable(id, &mut snapshot,
+            &rpc_client, daemon.height, daemon.top_block_timestamp, attempt == 0) {
+            Ok(outputs) => outputs,
+            Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+        };
 
         // Input selection order
         match walletcore_input_select_mode() {
@@ -2202,6 +2138,17 @@ pub extern "C" fn wallet_send_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_send_with_filter", || wallet_send_with_filter_ffi_impl(wallet_id, node_url, destinations_json, filter_json, ring_len))
+}
+
+
+fn wallet_send_with_filter_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     run_while_refresh_stopped(wallet_id, "wallet_send_with_filter", || {
         wallet_send_with_filter_impl(
             wallet_id,
@@ -2218,6 +2165,17 @@ pub extern "C" fn wallet_send_with_filter(
 /// Returns the same prepare payload shape as `wallet_prepare_send`.
 #[no_mangle]
 pub extern "C" fn wallet_prepare_send_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_prepare_send_with_filter", || wallet_prepare_send_with_filter_ffi_impl(wallet_id, node_url, destinations_json, filter_json, ring_len))
+}
+
+
+fn wallet_prepare_send_with_filter_ffi_impl(
     wallet_id: *const c_char,
     node_url: *const c_char,
     destinations_json: *const c_char,
@@ -2318,7 +2276,7 @@ fn wallet_send_with_filter_impl(
         _ => None,
     };
 
-    let snapshot = {
+    let mut snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get(id) {
             Some(state) => state.clone(),
@@ -2432,18 +2390,12 @@ fn wallet_send_with_filter_impl(
         destinations.push((addr, p.amount));
     }
 
-    // Filter spendable outputs
-    let mut spendable: Vec<TrackedOutput> = snapshot
-        .tracked_outputs
-        .iter()
-        .cloned()
-        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
-        .filter(|o| {
-            !snapshot
-                .invalid_input_quarantine
-                .contains(&(o.tx_hash, o.index_in_tx))
-        })
-        .collect();
+    // Shared preflight and quarantine policy; retries cannot release newly rejected inputs.
+    let mut spendable = match super::input_policy::spendable(id, &mut snapshot,
+        &rpc_client, daemon.height, daemon.top_block_timestamp, true) {
+        Ok(outputs) => outputs,
+        Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+    };
 
     if let Some(f) = &filter {
         if let Some(minor) = f.subaddress_minor {

@@ -17,6 +17,11 @@ use std::ffi::{CStr, CString};
 
 #[no_mangle]
 pub extern "C" fn wallet_export_outputs_json(wallet_id: *const c_char) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_export_outputs_json", || wallet_export_outputs_json_ffi_impl(wallet_id))
+}
+
+
+fn wallet_export_outputs_json_ffi_impl(wallet_id: *const c_char) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() {
@@ -86,6 +91,11 @@ pub extern "C" fn wallet_export_outputs_json(wallet_id: *const c_char) -> *mut c
 
 #[no_mangle]
 pub extern "C" fn wallet_list_transfers_json(wallet_id: *const c_char) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_list_transfers_json", || wallet_list_transfers_json_ffi_impl(wallet_id))
+}
+
+
+fn wallet_list_transfers_json_ffi_impl(wallet_id: *const c_char) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() {

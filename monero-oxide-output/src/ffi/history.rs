@@ -234,6 +234,14 @@ pub extern "C" fn wallet_query_transfers_json(
     wallet_id: *const c_char,
     query_json: *const c_char,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_query_transfers_json", || wallet_query_transfers_json_ffi_impl(wallet_id, query_json))
+}
+
+
+fn wallet_query_transfers_json_ffi_impl(
+    wallet_id: *const c_char,
+    query_json: *const c_char,
+) -> *mut c_char {
     clear_last_error();
     let result = (|| -> Result<String, String> {
         if wallet_id.is_null() || query_json.is_null() {

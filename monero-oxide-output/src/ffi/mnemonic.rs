@@ -56,6 +56,15 @@ pub extern "C" fn wallet_generate_mnemonic_english(
     out_buf_len: usize,
     out_written: *mut usize,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_generate_mnemonic_english", || wallet_generate_mnemonic_english_ffi_impl(out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_generate_mnemonic_english_ffi_impl(
+    out_buf: *mut c_char,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
     if out_buf.is_null() || out_buf_len == 0 {
         return -11;
     }

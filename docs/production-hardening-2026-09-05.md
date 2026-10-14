@@ -1,5 +1,29 @@
 # Production hardening follow-up — 2026-09-05
 
+## Pending October 13 quarantine and FFI corrections
+
+All exported C entry points now catch unwinding Rust panics and return a sanitized native-failure
+error (-19, or a null result). The release profile explicitly requires `panic=unwind`; an abort
+profile is rejected at compilation. Poisoned registries are not recovered for further mutation:
+restart is required. This does not catch allocation aborts, signals, invalid caller pointers or
+stack overflow. Tests poison the actual registry only in an isolated subprocess, then exercise
+real exported balance/history/seal calls without aborting the caller.
+
+Exact sends, previews and both sweep paths share quarantine eligibility. Reported pool/chain
+spends reduce available (unlocked) funds, not canonical ownership or historical ledger entries.
+An entry can be released by a fresh unspent response only after the local scan catches up to the
+queried node height; same-call hard-rejection retries cannot re-enable it. Unsupported/failed
+spent-status endpoints preserve quarantine. Refresh rechecks only existing quarantined inputs,
+adding no spent-status request to ordinary refreshes with an empty quarantine. Cache encoding is
+unchanged; cache, fee, timestamp, ledger and filtered-balance round trips are covered synthetically.
+Node spent-status reports remain untrusted hints, not cryptographic proof or authorization.
+
+Local library tests: 108 passed, six opt-in fixtures ignored. A local HTTP fixture also checks
+pool-spend exclusion and dropped-pool release through the actual spent-status RPC transport.
+No personal wallet, funded send or
+live-node benchmark was used. Native release/consumer-pin rollout and signed-device QA remain
+required; the currently published v0.1.17 artifacts do not contain these changes.
+
 ## Status
 
 Local implementation and synthetic verification, not a production certification or published

@@ -1,6 +1,6 @@
 [package]
 name = "walletcore"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 
 [lib]
@@ -72,6 +72,7 @@ linker = "aarch64-linux-gnu-gcc"
 
 [profile.release]
 overflow-checks = false
+panic = "unwind"
 
 [profile.dev]
 overflow-checks = true

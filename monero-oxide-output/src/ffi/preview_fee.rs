@@ -67,6 +67,16 @@ pub extern "C" fn wallet_preview_fee(
     destinations_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_preview_fee", || wallet_preview_fee_ffi_impl(wallet_id, node_url, destinations_json, ring_len))
+}
+
+
+fn wallet_preview_fee_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     run_while_refresh_stopped(wallet_id, "wallet_preview_fee", || {
         wallet_preview_fee_impl(wallet_id, node_url, destinations_json, ring_len)
     })
@@ -122,7 +132,7 @@ fn wallet_preview_fee_impl(
         return ptr::null_mut();
     }
 
-    let snapshot = {
+    let mut snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get(id) {
             Some(state) => state.clone(),
@@ -224,18 +234,12 @@ fn wallet_preview_fee_impl(
         destinations.push((addr, p.amount));
     }
 
-    // Gather unlocked, unspent outputs (excluding quarantined).
-    let mut spendable = snapshot
-        .tracked_outputs
-        .iter()
-        .cloned()
-        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
-        .filter(|o| {
-            !snapshot
-                .invalid_input_quarantine
-                .contains(&(o.tx_hash, o.index_in_tx))
-        })
-        .collect::<Vec<_>>();
+    // Shared preflight and quarantine policy; retries cannot release newly rejected inputs.
+    let mut spendable = match super::input_policy::spendable(id, &mut snapshot,
+        &rpc_client, daemon.height, daemon.top_block_timestamp, true) {
+        Ok(outputs) => outputs,
+        Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+    };
 
     // Input selection order for preview fee: match send defaults (smallest_first unless overridden).
     match walletcore_input_select_mode() {
@@ -650,6 +654,17 @@ pub extern "C" fn wallet_preview_fee_with_filter(
     filter_json: *const c_char,
     ring_len: u8,
 ) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_preview_fee_with_filter", || wallet_preview_fee_with_filter_ffi_impl(wallet_id, node_url, destinations_json, filter_json, ring_len))
+}
+
+
+fn wallet_preview_fee_with_filter_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    destinations_json: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
     run_while_refresh_stopped(wallet_id, "wallet_preview_fee_with_filter", || {
         wallet_preview_fee_with_filter_impl(
             wallet_id,
@@ -751,7 +766,7 @@ fn wallet_preview_fee_with_filter_impl(
     // NOTE: We intentionally do not share code between the two functions yet to keep the
     // extraction low-risk; later, we can refactor into shared helpers.
 
-    let snapshot = {
+    let mut snapshot = {
         let map = WALLET_STORE.lock().expect("wallet store poisoned");
         match map.get(id) {
             Some(state) => state.clone(),
@@ -863,18 +878,12 @@ fn wallet_preview_fee_with_filter_impl(
         destinations.push((addr, p.amount));
     }
 
-    // Gather spendable outputs (unspent + unlocked), excluding quarantined, then apply filter.
-    let mut spendable: Vec<TrackedOutput> = snapshot
-        .tracked_outputs
-        .iter()
-        .cloned()
-        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
-        .filter(|o| {
-            !snapshot
-                .invalid_input_quarantine
-                .contains(&(o.tx_hash, o.index_in_tx))
-        })
-        .collect();
+    // Shared preflight and quarantine policy; retries cannot release newly rejected inputs.
+    let mut spendable = match super::input_policy::spendable(id, &mut snapshot,
+        &rpc_client, daemon.height, daemon.top_block_timestamp, true) {
+        Ok(outputs) => outputs,
+        Err(error) => { record_error(-16, error); return ptr::null_mut(); }
+    };
 
     if let Some(f) = &filter {
         if let Some(minor) = f.subaddress_minor {

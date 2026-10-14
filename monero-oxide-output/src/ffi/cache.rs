@@ -39,6 +39,15 @@ pub extern "C" fn wallet_import_cache(
     cache_ptr: *const u8,
     cache_len: usize,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_import_cache", || wallet_import_cache_ffi_impl(wallet_id, cache_ptr, cache_len))
+}
+
+
+fn wallet_import_cache_ffi_impl(
+    wallet_id: *const c_char,
+    cache_ptr: *const u8,
+    cache_len: usize,
+) -> c_int {
     clear_last_error();
 
     if wallet_id.is_null() || cache_ptr.is_null() || cache_len == 0 {
@@ -170,6 +179,16 @@ pub extern "C" fn wallet_import_cache(
 
 #[no_mangle]
 pub extern "C" fn wallet_export_cache(
+    wallet_id: *const c_char,
+    out_buf: *mut u8,
+    out_buf_len: usize,
+    out_written: *mut usize,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_export_cache", || wallet_export_cache_ffi_impl(wallet_id, out_buf, out_buf_len, out_written))
+}
+
+
+fn wallet_export_cache_ffi_impl(
     wallet_id: *const c_char,
     out_buf: *mut u8,
     out_buf_len: usize,

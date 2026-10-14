@@ -1496,6 +1496,15 @@ pub extern "C" fn wallet_refresh(
     node_url: *const c_char,
     out_last_scanned: *mut u64,
 ) -> c_int {
+    crate::ffi::boundary::guard("wallet_refresh", || wallet_refresh_ffi_impl(wallet_id, node_url, out_last_scanned))
+}
+
+
+fn wallet_refresh_ffi_impl(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    out_last_scanned: *mut u64,
+) -> c_int {
     let id = if wallet_id.is_null() {
         None
     } else {
@@ -1526,29 +1535,9 @@ fn wallet_refresh_caught(
     node_url: *const c_char,
     out_last_scanned: *mut u64,
 ) -> c_int {
-    // NOTE:
-    // Android builds often end up with panic=abort, which turns Rust panics into SIGABRT with no
-    // useful message in logcat. Wrap the entire implementation so we can surface panics via
-    // walletcore lastError + logcat.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::ffi::boundary::guard("wallet_refresh", || {
         wallet_refresh_impl(wallet_id, node_url, out_last_scanned)
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(panic_payload) => {
-            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                format!("wallet_refresh panic: {s}")
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                format!("wallet_refresh panic: {s}")
-            } else {
-                "wallet_refresh panic: <non-string payload>".to_string()
-            };
-
-            wc_log_line_android_or_stdout(&format!("🧨 {msg}"));
-            record_error(-16, msg)
-        }
-    }
+    })
 }
 
 fn wallet_refresh_impl(
@@ -4089,6 +4078,9 @@ fn wallet_refresh_impl(
         return code;
     }
 
+    // No extra request on normal refreshes: only existing blocked outputs are revalidated.
+    let _ = super::input_policy::revalidate_after_refresh(id, &rpc_client, daemon.height);
+
     if !out_last_scanned.is_null() {
         unsafe {
             *out_last_scanned = scan_cursor.max(snapshot.restore_height);
@@ -5151,6 +5143,11 @@ mod tests {
 
 #[no_mangle]
 pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *const c_char) -> c_int {
+    crate::ffi::boundary::guard("wallet_refresh_async", || wallet_refresh_async_ffi_impl(wallet_id, node_url))
+}
+
+
+fn wallet_refresh_async_ffi_impl(wallet_id: *const c_char, node_url: *const c_char) -> c_int {
     clear_last_error();
 
     if wallet_id.is_null() {
@@ -5274,6 +5271,11 @@ fn reconcile_replayed_height(height: u64, transactions: &HashSet<[u8; 32]>, spen
 /// slot, a failed state remains attached to this wallet until its next refresh starts.
 #[no_mangle]
 pub extern "C" fn wallet_refresh_job_status_json(wallet_id: *const c_char) -> *mut c_char {
+    crate::ffi::boundary::guard("wallet_refresh_job_status_json", || wallet_refresh_job_status_json_ffi_impl(wallet_id))
+}
+
+
+fn wallet_refresh_job_status_json_ffi_impl(wallet_id: *const c_char) -> *mut c_char {
     clear_last_error();
 
     if wallet_id.is_null() {
@@ -5313,6 +5315,18 @@ pub extern "C" fn wallet_refresh_job_status_json(wallet_id: *const c_char) -> *m
 
 #[no_mangle]
 pub extern "C" fn wallet_sync_status(
+    wallet_id: *const c_char,
+    out_chain_height: *mut u64,
+    out_chain_time: *mut u64,
+    out_last_refresh_timestamp: *mut u64,
+    out_last_scanned: *mut u64,
+    out_restore_height: *mut u64,
+) -> c_int {
+    crate::ffi::boundary::guard("wallet_sync_status", || wallet_sync_status_ffi_impl(wallet_id, out_chain_height, out_chain_time, out_last_refresh_timestamp, out_last_scanned, out_restore_height))
+}
+
+
+fn wallet_sync_status_ffi_impl(
     wallet_id: *const c_char,
     out_chain_height: *mut u64,
     out_chain_time: *mut u64,
