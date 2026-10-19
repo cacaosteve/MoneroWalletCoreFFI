@@ -33,7 +33,7 @@ let package = Package(
             // SwiftPM dependency resolution much smaller while preserving the
             // no-Rust-required Apple consumer experience.
             url: "https://github.com/cacaosteve/MoneroWalletCoreFFI/releases/download/walletcore-v0.1.19/MoneroWalletCore.xcframework.zip",
-            checksum: "5d7e4ac26dbc7a69c987d00b59df256aefcb7eacbf00097b16f34dfed90d902d"
+            checksum: "4585ccb12a120a0acbade9b745d4ab202c22143a18a5feda7bcb276a56e080a9"
         ),
         clibTarget,
         .target(
