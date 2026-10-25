@@ -271,7 +271,7 @@ fn rebuild_rpc_client_if_channel_closed(base_url: &str, err: &str) -> Option<Rpc
     }
 }
 
-/// Cuprate public RPC (`rpc.nexatrode.com`) rejects JSON-RPC *batches* with HTTP 422.
+/// Cuprate public RPC (`rpc.nexawal.com`) rejects JSON-RPC *batches* with HTTP 422.
 /// Binary `/getblocks.bin` can also come back as a JSON error body. Retrying the same
 /// 25-block call does not help; one `get_block` at a time does.
 fn is_json_batch_or_shape_error(err: &str) -> bool {
@@ -4583,7 +4583,7 @@ mod tests {
     #[ignore = "requires a live wallet RPC node"]
     fn live_parallel_scan_matches_serial_and_reports_speedup() {
         let base_url = std::env::var("WALLETCORE_TEST_NODE")
-            .unwrap_or_else(|_| "https://rpc.nexatrode.com".to_string());
+            .unwrap_or_else(|_| "https://rpc.nexawal.com".to_string());
         let start = std::env::var("WALLETCORE_TEST_START_HEIGHT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
