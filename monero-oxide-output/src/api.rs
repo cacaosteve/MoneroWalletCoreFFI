@@ -54,6 +54,12 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Sets only the I2P route. Clearnet RPC is always direct; no proxy env mutation.
+pub fn set_i2p_http_proxy(proxy: Option<&str>) -> Result<()> {
+    crate::support::routing::configure_i2p_proxy(proxy)
+        .map_err(|message| Error { code: -14, message })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Balance {
     pub total_piconero: u64,

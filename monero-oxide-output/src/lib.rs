@@ -66,6 +66,7 @@ mod support;
 // Keeping these at crate root ensures they are visible to consumers linking against
 // the cdylib/staticlib, even as we continue extracting FFI into `src/ffi/*`.
 pub use crate::ffi::mnemonic::wallet_generate_mnemonic_english;
+pub use crate::ffi::routing::wallet_set_i2p_http_proxy;
 
 // Bulk binary (EPEE / portable_storage) decoding helpers extracted from this file.
 // Kept reachable via `crate::support::*` for FFI submodules.
@@ -184,18 +185,16 @@ struct BinDecoyProvider {
 
 /// Construct a daemon interface which supports binary RPC (bin_rpc) decoy selection.
 ///
-/// NOTE: `monero-simple-request-rpc`'s `SimpleRequestTransport::new(url)` returns a fully constructed
-/// `MoneroDaemon<SimpleRequestTransport>`, not the transport itself. That `MoneroDaemon` is the type
-/// which implements `ProvidesUnvalidatedDecoys` (thus `ProvidesDecoys`) via bin RPC:
+/// The explicitly routed daemon implements `ProvidesUnvalidatedDecoys` via bin RPC:
 /// - get_output_distribution.bin
 /// - get_outs.bin
 async fn make_bin_decoy_daemon(
     base_url: &str,
 ) -> Result<
-    monero_daemon_rpc::MoneroDaemon<monero_simple_request_rpc::SimpleRequestTransport>,
+    crate::support::rpc::RpcClient,
     monero_interface::InterfaceError,
 > {
-    monero_simple_request_rpc::SimpleRequestTransport::new(base_url.to_string()).await
+    crate::support::rpc::RpcTransport::new(base_url.to_string()).await
 }
 
 /// Query `get_output_histogram` (JSON-RPC) and return `total_instances` for `amount=0` (RingCT).
@@ -206,7 +205,7 @@ async fn make_bin_decoy_daemon(
 /// Expected response shape:
 /// `{ "histogram": [ { "amount": 0, "total_instances": N, ... } ], ... }`
 async fn ringct_total_instances_via_histogram(
-    daemon: &monero_daemon_rpc::MoneroDaemon<monero_simple_request_rpc::SimpleRequestTransport>,
+    daemon: &crate::support::rpc::RpcClient,
 ) -> Result<u64, monero_interface::InterfaceError> {
     #[derive(serde::Deserialize)]
     struct HistogramEntry {
@@ -1947,9 +1946,7 @@ fn network_from_flag(is_mainnet: u8) -> MoneroNetwork {
 }
 
 #[derive(Clone)]
-// NOTE: Migrating to upstream daemon RPC (monero-daemon-rpc + monero-simple-request-rpc).
-// Keep the old transport code in place for now, but stop constructing/using it in walletcore
-// entrypoints. We'll delete this once the migration is complete.
+// Bulk/metadata companion to the async daemon. Both share the same routed agent factory.
 struct BlockingRpcTransport {
     agent: Arc<ureq::Agent>,
     base_url: String,
@@ -1982,20 +1979,8 @@ impl BlockingRpcTransport {
             return Err(-14);
         }
 
-        // Build an HTTP client, optionally honoring proxy env vars (HTTP_PROXY/http_proxy/ALL_PROXY/all_proxy)
-        let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(120));
-
-        if let Ok(proxy) = std::env::var("HTTP_PROXY")
-            .or_else(|_| std::env::var("http_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .or_else(|_| std::env::var("all_proxy"))
-        {
-            if let Ok(px) = ureq::Proxy::new(&proxy) {
-                builder = builder.proxy(px);
-            }
-        }
-
-        let agent = Arc::new(builder.build());
+        let agent = Arc::new(crate::support::routing::agent_for_url(&base_url)
+            .map_err(|message| record_error(-14, message))?);
 
         Ok(Self {
             agent,

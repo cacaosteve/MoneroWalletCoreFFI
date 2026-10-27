@@ -54,6 +54,11 @@ int32_t wallet_generate_mnemonic_english(
 /* Returns a newly-allocated NUL-terminated version string; free with walletcore_free_cstr. */
 char* walletcore_version(void);
 
+/* Explicit I2P-only HTTP proxy. NULL/empty disables I2P, never enables direct
+ * fallback. Invalid settings invalidate new I2P clients and return an error.
+ * Existing clients retain their captured route; clearnet clients are unaffected. */
+int32_t wallet_set_i2p_http_proxy(const char* proxy);
+
 /* Returns the last error message as a newly-allocated string, or NULL if none; free with walletcore_free_cstr. */
 char* walletcore_last_error_message(void);
 

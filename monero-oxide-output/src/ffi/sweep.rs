@@ -297,7 +297,7 @@ fn wallet_preview_sweep_with_filter_impl(
     );
 
     let rpc_client: RpcClient = match TOKIO_RUNTIME.block_on(
-        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+        crate::support::rpc::RpcTransport::new(base_url.clone()),
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -1017,7 +1017,7 @@ fn wallet_sweep_with_filter_impl(
     };
 
     let rpc_client: RpcClient = match TOKIO_RUNTIME.block_on(
-        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+        crate::support::rpc::RpcTransport::new(base_url.clone()),
     ) {
         Ok(c) => c,
         Err(e) => {

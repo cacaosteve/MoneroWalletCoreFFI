@@ -1,6 +1,6 @@
 [package]
 name = "walletcore"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 
 [lib]
@@ -31,13 +31,12 @@ monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "34
 monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "34201e58bf008f5ae66a2393d164837ec54b3405", package = "monero-ed25519", features = ["std"] }
 monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "34201e58bf008f5ae66a2393d164837ec54b3405", package = "monero-interface", features = ["std"] }
 
-# Upstream daemon RPC implementation + recommended HTTP transport (simple-request)
+# Upstream daemon RPC implementation; HTTP transport/routing is owned by walletcore.
 monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "34201e58bf008f5ae66a2393d164837ec54b3405", package = "monero-daemon-rpc", features = ["std"] }
-monero-simple-request-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "34201e58bf008f5ae66a2393d164837ec54b3405", package = "monero-simple-request-rpc", features = ["webpki-roots"] }
 
 # Required because we construct a lightweight runtime (Runtime::new + block_on) around upstream async daemon RPC.
 # NOTE: `tokio::time::timeout` requires the time driver; without it, calling time APIs can panic/abort at runtime.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync"] }
 
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
@@ -60,6 +59,8 @@ ureq = { version = "2", features = ["tls", "json"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+url = "2"
+digest_auth = "0.3"
 bincode = "1.3"
 rand = "0.8"
 rayon = "1.12"

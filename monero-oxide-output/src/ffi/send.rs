@@ -238,7 +238,7 @@ fn daemon_knows_tx(base_url: &str, txid: &str) -> Result<bool, String> {
     }
 
     let rpc_client: RpcClient = TOKIO_RUNTIME
-        .block_on(monero_simple_request_rpc::SimpleRequestTransport::new(
+        .block_on(crate::support::rpc::RpcTransport::new(
             base_url.to_string(),
         ))
         .map_err(|error| format!("failed to connect daemon '{base_url}': {error}"))?;
@@ -618,7 +618,7 @@ fn wallet_send_impl(
 
     // Build daemon RPC client (upstream)
     let rpc_client: RpcClient = match TOKIO_RUNTIME.block_on(
-        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+        crate::support::rpc::RpcTransport::new(base_url.clone()),
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -2305,7 +2305,7 @@ fn wallet_send_with_filter_impl(
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
     let rpc_client: RpcClient = match TOKIO_RUNTIME.block_on(
-        monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()),
+        crate::support::rpc::RpcTransport::new(base_url.clone()),
     ) {
         Ok(d) => d,
         Err(e) => {

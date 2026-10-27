@@ -231,7 +231,7 @@ mod tests {
             }
         });
         let rpc = crate::TOKIO_RUNTIME
-            .block_on(monero_simple_request_rpc::SimpleRequestTransport::new(
+            .block_on(crate::support::rpc::RpcTransport::new(
                 endpoint,
             ))
             .unwrap();

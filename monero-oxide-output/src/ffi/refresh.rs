@@ -244,7 +244,7 @@ fn is_transient_block_fetch_error(err: &str) -> bool {
 
 fn connect_rpc_client(base_url: &str) -> Result<RpcClient, String> {
     TOKIO_RUNTIME
-        .block_on(monero_simple_request_rpc::SimpleRequestTransport::new(
+        .block_on(crate::support::rpc::RpcTransport::new(
             base_url.to_string(),
         ))
         .map_err(|e| e.to_string())
@@ -1317,7 +1317,7 @@ impl AndroidContiguousFetchWorker {
         let thread = std::thread::spawn(move || {
             fn build_client(base_url: &str) -> Result<RpcClient, RpcError> {
                 TOKIO_RUNTIME.block_on(async {
-                    monero_simple_request_rpc::SimpleRequestTransport::new(base_url.to_string())
+                    crate::support::rpc::RpcTransport::new(base_url.to_string())
                         .await
                         .map_err(Into::into)
                 })
@@ -4595,7 +4595,7 @@ mod tests {
             .clamp(2, 500);
         let client: RpcClient = crate::TOKIO_RUNTIME
             .block_on(async {
-                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()).await
+                crate::support::rpc::RpcTransport::new(base_url.clone()).await
             })
             .expect("failed to build rpc client");
         let blocks = fetch_scannable_blocks_range_bin(
@@ -4865,7 +4865,7 @@ mod tests {
             .unwrap_or_else(|_| "http://127.0.0.1:18092".to_string());
         let client: RpcClient = crate::TOKIO_RUNTIME
             .block_on(async {
-                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.clone()).await
+                crate::support::rpc::RpcTransport::new(base_url.clone()).await
             })
             .expect("failed to build rpc client");
 
@@ -4883,7 +4883,7 @@ mod tests {
         let base_url = "http://127.0.0.1:18092";
         let client: RpcClient = crate::TOKIO_RUNTIME
             .block_on(async {
-                monero_simple_request_rpc::SimpleRequestTransport::new(base_url.to_string()).await
+                crate::support::rpc::RpcTransport::new(base_url.to_string()).await
             })
             .expect("failed to build rpc client");
 
