@@ -5,7 +5,7 @@
 - Swift package / product name: `MoneroWalletCoreFFI`
 - Repository: `https://github.com/cacaosteve/MoneroWalletCoreFFI`
 - **Active consumer branch:** `main` (source-first; Apple release assets are fetched by SwiftPM)
-- Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) `perf/scanner-hotpath-only` (pinned rev in `monero-oxide-output/Cargo.toml`)
+- Rust wallet core: built from [`cacaosteve/monero-oxide`](https://github.com/cacaosteve/monero-oxide) `fix/constant-time-hash-to-point`, based on `perf/scanner-hotpath-only` (exact pinned rev in `monero-oxide-output/Cargo.toml`)
 - Consumers: [nexawal](https://github.com/cacaosteve/nexawal) (SPM), [nexawal-android](https://github.com/cacaosteve/nexawal-android) (git submodule)
 - License: [MIT](LICENSE)
 
@@ -53,6 +53,12 @@ documented, time-bounded maintenance exceptions in `deny.toml`. The script/CI fa
 on 2027-01-12 unless that decision is reviewed again; new vulnerability advisories
 are not exempted. Changing the cache codec requires a compatible migration and
 cross-platform cache regression tests, not a blind dependency replacement.
+
+The v0.1.20 source updates Monero hash-to-point arithmetic to `crypto-bigint`
+0.7.10, resolving RUSTSEC-2026-0387 without changing the protocol algorithm.
+The fork's Monero vectors and fixed 4,610-input pre-upgrade corpus check byte
+compatibility. WalletCore's production dependency graph must not retain the
+affected 0.5.x crate; run the advisory gate on the locked graph before publishing.
 
 Apple release finalization: build native assets from the source revision, publish
 the immutable assets, then commit their URL/checksum into `Package.swift` and

@@ -10,6 +10,21 @@ permissions:
   contents: write
 
 jobs:
+  release-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install pinned advisory checker
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check locked dependencies before building release binaries
+        run: bash Scripts/check-advisories.sh
+      - name: Wallet and fail-closed routing regressions
+        working-directory: monero-oxide-output
+        run: cargo test --locked --lib --features compile-time-generators
+
   preflight:
     runs-on: ubuntu-24.04
     outputs:
@@ -30,7 +45,7 @@ jobs:
           echo "build=${build}" >> "$GITHUB_OUTPUT"
 
   apple:
-    needs: preflight
+    needs: [preflight, release-gate]
     if: needs.preflight.outputs.build == 'true'
     runs-on: macos-14
     steps:
@@ -66,7 +81,7 @@ jobs:
             dist/SHA256SUMS.txt
 
   android:
-    needs: preflight
+    needs: [preflight, release-gate]
     if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
     steps:
