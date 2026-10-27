@@ -7,30 +7,83 @@ pub(crate) const MAX_BINARY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) const MAX_BINARY_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct ResponseReadFailure {
+    pub(crate) kind: io::ErrorKind,
+    pub(crate) bytes_read: usize,
+    pub(crate) message: String,
+}
+
 fn too_large() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "daemon response exceeds byte limit; try a smaller scan batch")
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "daemon response exceeds byte limit; try a smaller scan batch",
+    )
 }
 
 /// Read at most limit + 1 bytes, even without a Content-Length (e.g. chunked transfer).
 /// The extra byte distinguishes a complete, exactly-at-limit body from truncation.
 pub(crate) fn read_limited(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    read_limited_detailed(reader, limit)
+        .map_err(|failure| io::Error::new(failure.kind, failure.message))
+}
+
+fn read_limited_detailed(reader: impl Read, limit: usize) -> Result<Vec<u8>, ResponseReadFailure> {
     let mut bytes = Vec::new();
-    reader.take((limit as u64).saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() > limit { return Err(too_large()); }
+    if let Err(failure) = reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        return Err(ResponseReadFailure {
+            kind: failure.kind(),
+            bytes_read: bytes.len(),
+            message: failure.to_string(),
+        });
+    }
+    if bytes.len() > limit {
+        let failure = too_large();
+        return Err(ResponseReadFailure {
+            kind: failure.kind(),
+            bytes_read: bytes.len(),
+            message: failure.to_string(),
+        });
+    }
     Ok(bytes)
 }
 
 pub(crate) fn read_response(response: ureq::Response, limit: usize) -> io::Result<Vec<u8>> {
-    // This is only an early rejection; never rely on the peer's advertised length.
-    if response.header("Content-Length")
+    if response
+        .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|length| length > limit as u64)
     {
         return Err(too_large());
     }
+    read_limited(response.into_reader(), limit)
+}
+
+/// Read a response while retaining enough safe metadata to diagnose a failed body read.
+/// The response body itself is never included in diagnostics.
+pub(crate) fn read_response_detailed(
+    response: ureq::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ResponseReadFailure> {
+    // This is only an early rejection; never rely on the peer's advertised length.
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+    {
+        let failure = too_large();
+        return Err(ResponseReadFailure {
+            kind: failure.kind(),
+            bytes_read: 0,
+            message: failure.to_string(),
+        });
+    }
     // ureq's reader also handles decompression. The streaming bound therefore applies
     // to the bytes consumed by the decoder, not just compressed network bytes.
-    read_limited(response.into_reader(), limit)
+    read_limited_detailed(response.into_reader(), limit)
 }
 
 #[cfg(test)]

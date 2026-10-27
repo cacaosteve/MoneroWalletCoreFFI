@@ -2,7 +2,9 @@
 //!
 //! All daemon HTTP calls share the same explicit, fail-closed routing policy.
 
-use super::response_limits::{read_response, MAX_BINARY_RESPONSE_BYTES, MAX_JSON_RESPONSE_BYTES};
+use super::response_limits::{
+    read_response, read_response_detailed, MAX_BINARY_RESPONSE_BYTES, MAX_JSON_RESPONSE_BYTES,
+};
 use monero_daemon_rpc::{HttpTransport, MoneroDaemon};
 use monero_interface::InterfaceError;
 use std::sync::Arc;
@@ -103,8 +105,31 @@ impl RpcTransport {
         if response.status() == 401 {
             return Err(error("Daemon authentication failed"));
         }
-        read_response(response, limit)
-            .map_err(|_| error("Invalid or oversized daemon HTTP response"))
+        let status = response.status();
+        let content_length = response
+            .header("Content-Length")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map(|length| length.to_string())
+                    .unwrap_or_else(|_| "invalid".to_owned())
+            })
+            .unwrap_or_else(|| "absent".to_owned());
+        let response_read_started = std::time::Instant::now();
+        read_response_detailed(response, limit).map_err(|failure| {
+            walletcore_diagnostic!(
+                "❌ daemon response read failed route={} status={} content_length={} bytes_read={} limit={} elapsed_ms={} kind={:?} error={}",
+                route,
+                status,
+                content_length,
+                failure.bytes_read,
+                limit,
+                response_read_started.elapsed().as_millis(),
+                failure.kind,
+                failure.message,
+            );
+            error("Invalid or oversized daemon HTTP response")
+        })
     }
 }
 
