@@ -25,14 +25,14 @@ compile-time-generators = ["monero-wallet/compile-time-generators"]
 # the whole point of having `Cargo.fork.toml` is that it's only used in fork mode.
 
 [dependencies]
-monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-wallet", features = ["std"] }
+monero-wallet = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-wallet", features = ["std"] }
 monero-seed = { git = "https://github.com/monero-oxide/monero-wallet-util", rev = "420570cf6dfa9c1cd1c6c8230eb6dbe9b8569a0f", package = "monero-seed", features = ["std"] }
-monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-address", features = ["std"] }
-monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-ed25519", features = ["std"] }
-monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-interface", features = ["std"] }
+monero-address = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-address", features = ["std"] }
+monero-ed25519 = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-ed25519", features = ["std"] }
+monero-interface = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-interface", features = ["std"] }
 
 # Upstream daemon RPC implementation; HTTP transport/routing is owned by walletcore.
-monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-daemon-rpc", features = ["std"] }
+monero-daemon-rpc = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-daemon-rpc", features = ["std"] }
 
 # Required because we construct a lightweight runtime (Runtime::new + block_on) around upstream async daemon RPC.
 # NOTE: `tokio::time::timeout` requires the time driver; without it, calling time APIs can panic/abort at runtime.
@@ -41,8 +41,8 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
-monero-io = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-io", features = ["std"] }
-monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "8ab8e692c9d3f7ad76020e657a6160de7363130b", package = "monero-epee" }
+monero-io = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-io", features = ["std"] }
+monero-epee = { git = "https://github.com/cacaosteve/monero-oxide", rev = "106b439309917795784cc51d0016dce6d5d11bed", package = "monero-epee" }
 
 # Locate Application Support / data directory for per-wallet log file writing
 dirs = "5"
